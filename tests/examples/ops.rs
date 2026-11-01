@@ -119,8 +119,11 @@ impl Operation {
                 assert_eq!(listing.entries.len(), LISTED);
             }
             Operation::Put => {
+                // Each run names its own files, and a put that finds one
+                // there fails.
+                let path = format!("c{client}/run{clients}-f{index}");
                 let commit = db
-                    .commit([Op::put(format!("c{client}/f{index}"), vec![7u8; 100])])
+                    .commit([Op::put(path, vec![7u8; 100]).create()])
                     .await
                     .expect("commits");
                 assert!(commit.all_applied());

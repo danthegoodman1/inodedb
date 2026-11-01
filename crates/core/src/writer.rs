@@ -48,6 +48,10 @@ const EXPIRE_PER_GROUP: usize = 256;
 pub const MAX_GROUP_BYTES: usize = 9_000_000;
 /// The most lease records one commit writes; the rest go with later ones.
 const LEASE_BYTES: usize = 512 * 1024;
+/// The most ops the writer runs ahead of a batch waiting on reads, to find
+/// what the batches behind it lack: a queue of small batches fits, and
+/// batches that hit the cache cost each round of reads a bounded stall.
+const READ_AHEAD_OPS: usize = 1_024;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -438,6 +442,8 @@ pub struct Writer {
     /// and its top, with the directories above the top as it detached.
     detached: BTreeMap<(Version, Ino), Vec<Ino>>,
     reaping: bool,
+    /// Ops run ahead of a waiting batch, for tests and metrics.
+    read_ahead_ops: u64,
     /// When a freeing of a detached subtree last went into the queue.
     reaped_at: Millis,
     chore: Option<Chore>,
@@ -502,6 +508,7 @@ impl Writer {
             claiming: BTreeMap::new(),
             detached: BTreeMap::new(),
             reaping: false,
+            read_ahead_ops: 0,
             reaped_at: 0,
             chore: None,
             chored_at: now,
@@ -929,6 +936,11 @@ impl Writer {
         self.detached.len()
     }
 
+    /// Ops run ahead of batches waiting on reads, for tests and metrics.
+    pub fn read_ahead_ops(&self) -> u64 {
+        self.read_ahead_ops
+    }
+
     fn issue_read(&mut self, reads: Vec<Read>, purpose: Purpose) -> u64 {
         let id = self.id();
         let mut kv = Vec::with_capacity(reads.len() + 1);
@@ -1012,17 +1024,18 @@ impl Writer {
     }
 
     /// `reads`, which the batch at the queue's front needs, and what the
-    /// batches queued behind it lack, so a queue of batches that each miss
-    /// the cache costs a round of reads rather than one per batch. Those
-    /// behind run here against state without the batches before them, so
-    /// they may need other reads once those apply; what they fetch now is
-    /// current all the same.
-    fn read_ahead(&self, mut reads: Vec<Read>) -> Vec<Read> {
+    /// batches queued behind it lack, up to `READ_AHEAD_OPS`, so a queue of
+    /// batches that each miss the cache costs a round of reads rather than
+    /// one per batch. Those behind run here against state without the
+    /// batches before them, so they may need other reads once those apply;
+    /// what they fetch now is current all the same.
+    fn read_ahead(&mut self, mut reads: Vec<Read>) -> Vec<Read> {
         let view = Overlaid {
             overlay: &self.overlay,
             base: &self.cache,
         };
         let mut wanted: BTreeSet<Read> = reads.iter().cloned().collect();
+        let mut ran = 0;
         for sub in self.queue.iter().skip(1) {
             if wanted.len() >= exec::MAX_READS {
                 break;
@@ -1030,6 +1043,11 @@ impl Writer {
             let Work::Batch(batch) = &sub.work else {
                 continue;
             };
+            let cost = batch.ops.len().max(1);
+            if ran + cost > READ_AHEAD_OPS {
+                break;
+            }
+            ran += cost;
             let Ok(scope) = auth::authorize(&view, &sub.caller, self.now, Grant::Write) else {
                 continue;
             };
@@ -1059,6 +1077,7 @@ impl Writer {
                 }
             }
         }
+        self.read_ahead_ops += ran as u64;
         reads
     }
 

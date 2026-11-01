@@ -84,6 +84,22 @@ impl Driver {
         })
     }
 
+    /// Submits a batch without carrying out what the writer asks for, so
+    /// batches queue behind one that waits on reads.
+    fn queue(&mut self, ops: Vec<OpSpec>) -> Token {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.writer.submit(
+            token,
+            inodedb_core::auth::Caller::Trusted(inodedb_core::types::ROOT),
+            Batch {
+                ops,
+                ..Batch::default()
+            },
+        );
+        token
+    }
+
     fn submit_batch(&mut self, batch: Batch) -> Token {
         let token = self.next_token;
         self.next_token += 1;
@@ -498,19 +514,7 @@ fn rounds_for(batches: usize) -> usize {
     let mut d = Driver::new(storage, Config::default(), 2);
     let before = d.reads;
     let tokens: Vec<Token> = (0..batches)
-        .map(|index| {
-            let token = d.next_token;
-            d.next_token += 1;
-            d.writer.submit(
-                token,
-                inodedb_core::auth::Caller::Trusted(inodedb_core::types::ROOT),
-                Batch {
-                    ops: vec![put(&format!("d/f{index}"), "v")],
-                    ..Batch::default()
-                },
-            );
-            token
-        })
+        .map(|index| d.queue(vec![put(&format!("d/f{index}"), "v")]))
         .collect();
     d.pump();
     let rounds = d.reads - before;
@@ -534,4 +538,47 @@ fn queued_batches_that_miss_the_cache_read_together() {
         queued <= alone + 1,
         "one batch takes {alone} rounds, and 32 take {queued}"
     );
+}
+
+/// Running ahead of a batch that waits on reads costs each round a bounded
+/// number of ops, however much cached work queues behind it.
+#[test]
+fn reading_ahead_runs_a_bounded_number_of_ops_a_round() {
+    let storage = Memory::new();
+    let deep: Vec<String> = (0..20).map(|level| format!("p{level}")).collect();
+    let deep = deep.join("/");
+    let mut first = Driver::new(storage.clone(), Config::default(), 1);
+    first.submit([mkdir_p(&deep)]);
+    first.settle(true, CommitOutcome::Committed);
+    let mut d = Driver::new(storage, Config::default(), 2);
+    // A directory this writer creates stays cached.
+    d.submit([mkdir("hot"), put("hot/f", "v")]);
+    d.settle(true, CommitOutcome::Committed);
+    let before = d.reads;
+    let mut tokens = vec![d.queue(vec![put(&format!("{deep}/f"), "v")])];
+    for batch in 0..64 {
+        tokens.push(
+            d.queue(
+                (0..100)
+                    .map(|op| set_mtime("hot/f", batch * 100 + op))
+                    .collect(),
+            ),
+        );
+    }
+    d.pump();
+    let rounds = (d.reads - before) as u64;
+    assert!(rounds >= 20, "a round for each level: {rounds}");
+    // READ_AHEAD_OPS a round, where the queue behind holds 6,400.
+    assert!(
+        d.writer.read_ahead_ops() <= rounds * 1_024,
+        "{} ops ahead over {rounds} rounds",
+        d.writer.read_ahead_ops()
+    );
+    while !d.commits.is_empty() {
+        d.settle(true, CommitOutcome::Committed);
+    }
+    for token in tokens {
+        assert!(d.committed(token).committed);
+    }
+    assert!(d.fsck().is_empty(), "{:?}", d.fsck());
 }

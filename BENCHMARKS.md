@@ -16,27 +16,27 @@ One client, p50 ms:
 
 | Operation | memory | SQLite | RocksDB | FoundationDB |
 | --- | ---: | ---: | ---: | ---: |
-| stat | 0.078 | 0.078 | 0.079 | 0.080 |
-| read a 100-byte value | 0.079 | 0.080 | 0.081 | 0.080 |
-| list 100 entries | 0.147 | 0.144 | 0.145 | 0.148 |
-| put a new 100-byte file | 0.108 | 0.503 | 0.376 | 6.471 |
-| rename a file | 0.096 | 0.452 | 0.351 | 4.681 |
+| stat | 0.078 | 0.074 | 0.078 | 0.078 |
+| read a 100-byte value | 0.081 | 0.079 | 0.079 | 0.079 |
+| list 100 entries | 0.144 | 0.141 | 0.139 | 0.144 |
+| put a new 100-byte file | 0.107 | 0.490 | 0.366 | 6.907 |
+| rename a file | 0.096 | 0.450 | 0.350 | 4.715 |
 
 Operations a second, with 16 clients on a cold cache and 64 on a warm one:
 
 | Operation | Clients | memory | SQLite | RocksDB | FoundationDB |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| stat, cold cache | 16 | 79,712 | 23,441 | 23,816 | 8,669 |
-| read a value, cold cache | 16 | 97,772 | 40,756 | 41,324 | 24,865 |
-| stat | 64 | 190,879 | 191,414 | 189,888 | 190,273 |
-| read a 100-byte value | 64 | 184,974 | 186,313 | 176,103 | 186,373 |
-| list 100 entries | 64 | 40,341 | 46,474 | 46,814 | 45,089 |
-| put a new 100-byte file | 64 | 45,947 | 15,492 | 30,991 | 5,660 |
-| rename a file | 64 | 47,543 | 15,466 | 31,197 | 5,565 |
+| stat, cold cache | 16 | 81,829 | 23,354 | 23,994 | 7,835 |
+| read a value, cold cache | 16 | 98,799 | 40,164 | 42,508 | 24,578 |
+| stat | 64 | 190,601 | 192,004 | 192,836 | 190,346 |
+| read a 100-byte value | 64 | 186,794 | 187,687 | 188,317 | 186,097 |
+| list 100 entries | 64 | 33,752 | 46,242 | 46,640 | 45,650 |
+| put a new 100-byte file | 64 | 46,371 | 15,738 | 31,238 | 6,072 |
+| rename a file | 64 | 48,027 | 15,762 | 30,228 | 5,558 |
 
 - The writer answers reads from its cache, so a warm read costs the same on every backend: about 80 µs, nearly all of it the gRPC round trip, and 190,000 a second once 64 clients share the 16 CPUs. Its p99 stays under 1 ms.
 - A cold read costs a storage read, about 1 ms on FoundationDB. Each query reads on its own, so throughput rises with clients.
-- A write costs a durable commit: about 0.4 ms on the local backends, whose `fsync` here flushes the VM's disk, and 4 to 5 ms on FoundationDB. A put first reads storage to learn its new name is absent, one more round trip. A round sends its keys at once, and batches queued behind one that misses share its round, so with 64 clients groups of about 25 batches commit together and FoundationDB reaches 5,600 writes a second at an 11 ms p50.
+- A write costs a durable commit: about 0.4 ms on the local backends, whose `fsync` here flushes the VM's disk, and 4 to 5 ms on FoundationDB. A put first reads storage to learn its new name is absent, one more round trip. A round sends its keys at once, and batches queued behind one that misses share its round, so with 64 clients groups of about 25 batches commit together and FoundationDB reaches about 6,000 writes a second at an 11 ms p50.
 
 ## Group commit
 

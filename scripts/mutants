@@ -495,6 +495,10 @@ MUTANTS = [
         [(WRITER, "let reads = self.read_ahead(reads);", "")],
     ),
     (
+        "reading ahead runs the whole queue every round",
+        [(WRITER, "if ran + cost > READ_AHEAD_OPS {\n                break;\n            }", "")],
+    ),
+    (
         "accepted connections wait on Nagle's algorithm",
         [(SERVER, "TcpIncoming::from(listener).with_nodelay(Some(true))", "TcpIncoming::from(listener)")],
     ),
