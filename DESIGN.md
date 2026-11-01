@@ -267,7 +267,7 @@ The log is keyed by version, so `truncate_log` is one range delete, and the engi
 | Backend | Use | How it keeps the contract |
 |---|---|---|
 | **memory** | Simulator, unit tests | An ordered map under one lock, with optimistic conflict checks. Hooks inject unknown outcomes, applied or not, and outages; the simulator adds latency and writer crashes around it. |
-| **SQLite** | Local development, tests, small single-server deployments | rusqlite with SQLite bundled, WAL mode, `synchronous = FULL`. Its file lock admits one writing process. |
+| **SQLite** | Local development, tests, small single-server deployments | rusqlite with SQLite bundled, WAL mode, `synchronous = FULL`. A thread of the store's own copies the WAL into the database file, so commits never wait on a checkpoint. Its file lock admits one writing process. |
 | **RocksDB** | Single-server deployments | The log in its own column family, the WAL synced on each commit, and its lock file admitting one process. Behind the `rocksdb` feature. |
 | **FoundationDB** | Replicated deployments, with standbys | A store under one key prefix: the tree beneath `<prefix> 00`, the log beneath `<prefix> 01` in chunks of up to 100,000 bytes keyed by version and chunk number, and the newest logged version at `<prefix> 02`, which `wait_past` watches. Stores share a cluster without touching. Behind the `fdb` feature. |
 

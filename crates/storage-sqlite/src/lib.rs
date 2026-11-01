@@ -2,7 +2,8 @@
 //! `synchronous = FULL`, so a commit is on disk before it returns. A lock
 //! file admits one process. Commits apply one at a time under a mutex and
 //! are validated optimistically; snapshot reads run in one read
-//! transaction on a pooled connection.
+//! transaction on a pooled connection. A thread of the store's own copies
+//! the WAL into the database file, so commits never wait on a checkpoint.
 
 use inodedb_core::keys::{KeyRange, KvRead, KvResult, KvWrite, Pairs};
 use inodedb_core::types::Version;
@@ -12,8 +13,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 use tokio::sync::watch;
+
+/// How often the checkpointing thread looks for new commits.
+const CHECKPOINT_EVERY: Duration = Duration::from_millis(100);
 
 struct Shared {
     path: PathBuf,
@@ -21,6 +27,8 @@ struct Shared {
     validator: Mutex<Validator>,
     readers: Mutex<Vec<Connection>>,
     latest: watch::Sender<Version>,
+    /// Commits so far, which the checkpointing thread watches.
+    commits: AtomicU64,
     _lock: File,
 }
 
@@ -108,6 +116,9 @@ impl Sqlite {
         })?;
         let writer = connect(&path)?;
         writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .map_err(unavailable)?;
+        writer
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB NOT NULL) WITHOUT ROWID;
                  CREATE TABLE IF NOT EXISTS log (version INTEGER PRIMARY KEY, entry BLOB NOT NULL);",
@@ -116,16 +127,22 @@ impl Sqlite {
         let latest: Option<i64> = writer
             .query_row("SELECT max(version) FROM log", [], |row| row.get(0))
             .map_err(unavailable)?;
-        Ok(Sqlite {
-            shared: Arc::new(Shared {
-                path,
-                writer: Mutex::new(writer),
-                validator: Mutex::new(Validator::default()),
-                readers: Mutex::new(Vec::new()),
-                latest: watch::Sender::new(latest.unwrap_or(0) as Version),
-                _lock: lock,
-            }),
-        })
+        let checkpoints = connect(&path)?;
+        let shared = Arc::new(Shared {
+            path,
+            writer: Mutex::new(writer),
+            validator: Mutex::new(Validator::default()),
+            readers: Mutex::new(Vec::new()),
+            latest: watch::Sender::new(latest.unwrap_or(0) as Version),
+            commits: AtomicU64::new(0),
+            _lock: lock,
+        });
+        let weak = Arc::downgrade(&shared);
+        std::thread::Builder::new()
+            .name("sqlite-checkpoint".into())
+            .spawn(move || checkpoint(weak, checkpoints))
+            .map_err(unavailable)?;
+        Ok(Sqlite { shared })
     }
 
     fn validator(&self) -> MutexGuard<'_, Validator> {
@@ -323,6 +340,25 @@ impl Txn for SqliteTxn {
     }
 }
 
+/// Copies committed pages from the WAL into the database file while the
+/// store lives, without blocking commits or readers.
+fn checkpoint(shared: Weak<Shared>, conn: Connection) {
+    let mut seen = 0;
+    loop {
+        std::thread::sleep(CHECKPOINT_EVERY);
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let commits = shared.commits.load(Ordering::Relaxed);
+        drop(shared);
+        if commits != seen {
+            seen = commits;
+            // A busy or failed checkpoint leaves the WAL for the next one.
+            let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+        }
+    }
+}
+
 fn apply(
     shared: &Shared,
     start: u64,
@@ -379,6 +415,7 @@ fn apply(
     let committed = txn.commit();
     shared.validator.lock().expect("validator").record(written);
     committed.map_err(|_| CommitError::Unknown)?;
+    shared.commits.fetch_add(1, Ordering::Relaxed);
     if let Some(latest) = latest {
         shared.latest.send_if_modified(|current| {
             let advanced = latest > *current;
@@ -387,4 +424,39 @@ fn apply(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Commits leave their pages in the WAL, and the store's own thread
+    /// copies them into the database file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_checkpoints_the_wal() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("store.db");
+        let store = Sqlite::open(&path).expect("opens");
+        let inline: i64 = store
+            .shared
+            .writer
+            .lock()
+            .expect("the writer")
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .expect("reads the pragma");
+        assert_eq!(inline, 0, "commits never checkpoint");
+        for index in 0..100u32 {
+            let mut txn = store.begin().await.expect("begins");
+            txn.set(&index.to_be_bytes(), &[7; 4_096]);
+            txn.commit().await.expect("commits");
+        }
+        let checkpointed = async {
+            while std::fs::metadata(&path).expect("the database file").len() < 400_000 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), checkpointed)
+            .await
+            .expect("the database file takes the WAL's pages");
+    }
 }

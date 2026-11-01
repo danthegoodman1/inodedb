@@ -8,7 +8,7 @@ Notation:
 - `api::` is `tests/src/lib.rs` through `api_conformance!`, run on memory, SQLite and RocksDB, and on FoundationDB by `scripts/fdb`. `api-sb::` is `standby_conformance!`, on memory and FoundationDB.
 - `sc::` is `crates/storage-conformance/src/lib.rs`, on every backend.
 - `cli::` and `mount::` are `crates/cli/tests/*.rs`; `init_key::` is `crates/server/tests/init_key.rs`.
-- `core/<module>::` and `server/<module>::` are unit tests in that crate's module.
+- `core/<module>::` and `server/<module>::` are unit tests in that crate's module; `sqlite::` is the SQLite backend's.
 - P*n* is simulator property *n* (`DESIGN.md`, "Simulator"); M"…" is a planted bug.
 
 ## Simulator properties
@@ -77,6 +77,7 @@ Faults the simulator injects: unknown outcomes, storage latency and stalls, an o
 | Group commit, one transaction in flight, answers after commit | `groups::*`, `api::concurrent_commits_all_apply`, P2; M"a batch hears back before its group commits" |
 | Batches queued behind a miss read in its round, up to 1,024 ops | `groups::{queued_batches_that_miss_the_cache_read_together, reading_ahead_runs_a_bounded_number_of_ops_a_round}`; M"batches queued behind a miss read one at a time", M"reading ahead runs the whole queue every round" |
 | A writer's handle reads from its latest commit until one of its commits fails; standbys read the latest | `sc::a_writers_handle_reads_its_commits` on every backend, `sc::a_writers_handle_reads_from_its_latest_commit` on FoundationDB (`scripts/fdb`), P1 and P4 with the simulator's pinned reads; M"a writer answers reads after its lease" |
+| SQLite checkpoints on a thread of its own, never in a commit | `sqlite::a_thread_checkpoints_the_wal`; M"commits checkpoint the WAL themselves", M"commits never wake the checkpointing thread" |
 | Unknown outcomes resolve through the head | `groups::{an_unknown_commit_that_applied_is_answered_as_committed, an_unknown_commit_that_did_not_apply_runs_again}`; M"an unknown outcome counts as a failure" |
 | Renewal, takeover after lease and margin, drifting clocks | `standby::*`, `core/standby::a_standby_waits_for_the_head_to_go_unchanged`, P4; M"a takeover waits without the margin", M"a writer answers reads after its lease" |
 | Standbys: `AtLeast` reads, unknown keys to the writer, warm takeover, small caches, value versions ahead of the log | `standby::{a_standby_with_a_small_cache_answers_under_steady_writes, a_standby_waits_for_a_value_version_it_hasnt_reached}` and the rest of `standby::*`, `api-sb::*`, P1 and P5 through standbys in the swarm; M"a standby refuses a key newer than the log it has read", M"a standby evicts what its reads fetched before their queries run", M"a cache takes a value under a version it hasn't reached as absent" |

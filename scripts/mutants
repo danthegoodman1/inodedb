@@ -264,6 +264,16 @@ MUTANTS = [
         [(CORE_AUTH, "if !record.live(now) {", "if false {")],
     ),
     (
+        "commits checkpoint the WAL themselves",
+        [(SQLITE, """writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .map_err(unavailable)?;""", "")],
+    ),
+    (
+        "commits never wake the checkpointing thread",
+        [(SQLITE, "shared.commits.fetch_add(1, Ordering::Relaxed);", "")],
+    ),
+    (
         "a handle's MAC goes unchecked",
         [(AUTH, "if same {", "if true {")],
     ),
@@ -566,6 +576,7 @@ MUTANTS = [
 LAYERS = [
     ("core unit tests", "inodedb-core", "crates/core", []),
     ("storage tests", "inodedb-storage", "crates/storage", []),
+    ("SQLite tests", "inodedb-storage-sqlite", "crates/storage-sqlite", []),
     ("storage conformance", "inodedb-storage-conformance", "crates/storage-conformance", []),
     ("server tests", "inodedb-server", "crates/server", []),
     ("client tests", "inodedb-client", "crates/client", []),
