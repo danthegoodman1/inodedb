@@ -173,14 +173,16 @@ pub fn kind(kind: Kind) -> pb::Kind {
 }
 
 pub fn inode(ino: u64, inode: &Inode, scope: &Scope) -> pb::Inode {
-    inode_with(scope.handle(ino), inode)
+    pb::Inode {
+        handle: Some(scope.handle(ino)),
+        ..attributes(inode)
+    }
 }
 
-/// An inode under a handle already made for it, since each handle costs a
-/// MAC.
-fn inode_with(handle: pb::Handle, inode: &Inode) -> pb::Inode {
+/// An inode without its handle, for a message that already carries it.
+fn attributes(inode: &Inode) -> pb::Inode {
     pb::Inode {
-        handle: Some(handle),
+        handle: None,
         kind: kind(inode.kind) as i32,
         version: inode.version,
         mtime: inode.mtime,
@@ -226,16 +228,12 @@ pub fn read_result(result: &QueryResult, scope: &Scope) -> pb::ReadResult {
 }
 
 pub fn listed(listed: Listed, scope: &Scope) -> pb::Listed {
-    let handle = scope.handle(listed.entry.child);
     pb::Listed {
         name: listed.name.into_vec().into(),
         kind: kind(listed.entry.kind) as i32,
+        handle: Some(scope.handle(listed.entry.child)),
         entry_version: listed.entry.version,
-        inode: listed
-            .inode
-            .as_ref()
-            .map(|found| inode_with(handle.clone(), found)),
-        handle: Some(handle),
+        inode: listed.inode.as_ref().map(attributes),
         value: listed.value,
     }
 }
@@ -292,24 +290,15 @@ pub fn change(change: &inodedb_core::feed::Change, scope: &Scope) -> pb::Change 
         inodes: change
             .inodes
             .iter()
-            .map(|effect| {
-                let handle = scope.handle(effect.ino);
-                pb::InodeChange {
-                    before: effect
-                        .before
-                        .as_ref()
-                        .map(|found| inode_with(handle.clone(), found)),
-                    after: effect
-                        .after
-                        .as_ref()
-                        .map(|found| inode_with(handle.clone(), found)),
-                    handle: Some(handle),
-                    holders: effect
-                        .holders
-                        .iter()
-                        .map(|dir| scope.handle(*dir))
-                        .collect(),
-                }
+            .map(|effect| pb::InodeChange {
+                handle: Some(scope.handle(effect.ino)),
+                before: effect.before.as_ref().map(attributes),
+                after: effect.after.as_ref().map(attributes),
+                holders: effect
+                    .holders
+                    .iter()
+                    .map(|dir| scope.handle(*dir))
+                    .collect(),
             })
             .collect(),
         entered: change

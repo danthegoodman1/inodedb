@@ -14,8 +14,8 @@ rocksdb = ["dep:inodedb-storage-rocksdb"]
 fdb = ["dep:inodedb-storage-fdb", "inodedb-storage-fdb/fdb"]
 
 [dependencies]
+aes.workspace = true
 getrandom.workspace = true
-hmac.workspace = true
 inodedb-core.workspace = true
 inodedb-proto.workspace = true
 inodedb-storage.workspace = true

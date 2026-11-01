@@ -31,7 +31,7 @@ macro_rules! api_conformance {
             responses_fit_default_limits, lost_answers_apply_once, cut_listings_resume,
             floors_past_the_store_fail_fast, watch_streams_a_subtree, watch_replays_from_a_version,
             watch_reports_compaction, caches_follow_the_feed, keys_bound_their_reach,
-            watch_ends_with_its_key, listings_follow_their_directory, shutdown_ends_streams,
+            watch_ends_with_its_key, listings_follow_their_directory, inodes_share_their_handle, shutdown_ends_streams,
             watch_stays_in_its_keys_tree, caches_stop_with_their_key, leases_hold_freed_records,
             leases_hold_the_log, caches_hold_a_lease, snapshots_hold_their_version,
             snapshots_hold_what_they_read, caches_start_under_steady_writes,
@@ -1775,6 +1775,72 @@ pub async fn listings_follow_their_directory<B: Backend>(backend: &mut B) {
     assert_eq!(rest.dir, first.dir);
     let listing = db.list("d").await.expect("lists");
     assert_ne!(Some(listing.dir.ino), first.dir.map(|dir| dir.ino));
+}
+
+/// A listed or changed inode leaves its handle out on the wire, since the
+/// entry or change around it carries the same handle; the client fills it in.
+pub async fn inodes_share_their_handle<B: Backend>(backend: &mut B) {
+    let Fixture { db, server, .. } = fresh(backend).await;
+    db.commit([Op::mkdir("h")]).await.expect("commits");
+    let mut changes = watch(&server, "h", 0).await;
+    let mut watched = db.watch("h", 0).await.expect("watches");
+    db.commit([Op::put("h/f", "1")]).await.expect("commits");
+    let mut rpc = pb::inode_db_client::InodeDbClient::connect(server.endpoint())
+        .await
+        .expect("connects");
+    let page = rpc
+        .list(keyed(pb::ListRequest {
+            path: Bytes::from_static(b"h"),
+            attrs: true,
+            ..pb::ListRequest::default()
+        }))
+        .await
+        .expect("lists")
+        .into_inner()
+        .message()
+        .await
+        .expect("a page")
+        .expect("a page");
+    assert!(page.entries[0].handle.is_some());
+    assert_eq!(
+        page.entries[0].inode.as_ref().expect("attributes").handle,
+        None
+    );
+    let change = next_change(&mut changes).await;
+    assert!(!change.inodes.is_empty());
+    for effect in &change.inodes {
+        assert!(effect.handle.is_some());
+        assert!(
+            effect
+                .before
+                .iter()
+                .chain(&effect.after)
+                .all(|inode| inode.handle.is_none())
+        );
+    }
+
+    let listing = db.list_with_values("h").await.expect("lists");
+    let inode = listing.entries[0].inode.clone().expect("attributes");
+    assert_eq!(inode.handle, listing.entries[0].handle);
+    let read = db
+        .read(Target::Handle(inode.handle))
+        .await
+        .expect("reads by handle");
+    assert_eq!(&read.value[..], b"1");
+    let changed = loop {
+        let changed = watched.next().await.expect("watches").expect("a change");
+        if !changed.inodes.is_empty() {
+            break changed;
+        }
+    };
+    for effect in changed.inodes {
+        let inode = effect.after.expect("the inode after");
+        let stat = db
+            .stat(Target::Handle(inode.handle.clone()))
+            .await
+            .expect("stats by handle");
+        assert_eq!(stat.handle, inode.handle);
+    }
 }
 
 /// Shutdown ends open streams instead of waiting out its grace.

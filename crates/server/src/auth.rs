@@ -7,7 +7,10 @@
 //! the key's id and the inode, under a secret kept in storage, so it works
 //! only with the key it was issued to.
 
-use hmac::{Hmac, KeyInit, Mac};
+use std::sync::Arc;
+
+use aes::Aes256;
+use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 use inodedb_core::auth::{Caller, Denied, KeyId};
 use inodedb_core::types::Ino;
 use inodedb_proto as pb;
@@ -57,13 +60,13 @@ pub fn denied(denied: Denied) -> Status {
 
 /// Reads requests' keys, under the store's handle secret.
 pub struct Auth {
-    handles: Hmac<Sha256>,
+    handles: Arc<Aes256>,
 }
 
 impl Auth {
     pub fn new(handle_secret: [u8; 32]) -> Auth {
         Auth {
-            handles: Hmac::new_from_slice(&handle_secret).expect("HMAC takes any key length"),
+            handles: Arc::new(Aes256::new(&handle_secret.into())),
         }
     }
 
@@ -77,14 +80,15 @@ impl Auth {
             .ok_or_else(|| Status::unauthenticated("no key"))?;
         let (id, secret) = parse(presented)
             .ok_or_else(|| Status::unauthenticated("a key is <16 hex digits>.<secret>"))?;
-        let mut handles = self.handles.clone();
-        handles.update(&id.to_be_bytes());
         Ok((
             Caller::Key {
                 id,
                 hash: hash(secret),
             },
-            Scope { handles },
+            Scope {
+                handles: self.handles.clone(),
+                id,
+            },
         ))
     }
 }
@@ -92,18 +96,19 @@ impl Auth {
 /// Makes and checks one key's handles.
 #[derive(Clone)]
 pub struct Scope {
-    /// The MAC, already fed the key's id.
-    handles: Hmac<Sha256>,
+    handles: Arc<Aes256>,
+    id: KeyId,
 }
 
 impl Scope {
+    /// AES-256 of the one block `id ‖ ino`. The input is a single block of
+    /// fixed length, so the block cipher is itself a MAC.
     fn mac(&self, ino: Ino) -> [u8; MAC_BYTES] {
-        let mut mac = self.handles.clone();
-        mac.update(&ino.to_be_bytes());
-        let full = mac.finalize().into_bytes();
-        let mut short = [0; MAC_BYTES];
-        short.copy_from_slice(&full[..MAC_BYTES]);
-        short
+        let mut block = Array::default();
+        block[..8].copy_from_slice(&self.id.to_be_bytes());
+        block[8..].copy_from_slice(&ino.to_be_bytes());
+        self.handles.encrypt_block(&mut block);
+        block.into()
     }
 
     pub fn handle(&self, ino: Ino) -> pb::Handle {
@@ -174,5 +179,21 @@ mod tests {
             mac: handle.mac.clone(),
         };
         assert!(mine.check(&forged).is_err());
+    }
+
+    /// A handle's MAC is AES-256 of `id ‖ ino`, checked against OpenSSL:
+    /// `openssl enc -aes-256-ecb -nopad -K 0303…03` of
+    /// `0000000000000001000000000000002a`.
+    #[test]
+    fn a_handle_mac_is_one_aes_block() {
+        let scope = Scope {
+            handles: Arc::new(Aes256::new(&[3; 32].into())),
+            id: 1,
+        };
+        let expected: [u8; MAC_BYTES] = [
+            0xad, 0xef, 0x76, 0x1e, 0x27, 0xdb, 0x73, 0x9c, 0x14, 0x06, 0x02, 0xa8, 0x32, 0x5a,
+            0x05, 0xe7,
+        ];
+        assert_eq!(scope.mac(42), expected);
     }
 }

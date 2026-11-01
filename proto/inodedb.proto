@@ -270,6 +270,7 @@ message Listed {
   Handle handle = 3;
   // The version that created the entry.
   uint64 entry_version = 4;
+  // The child's inode, without a handle: its handle is `handle`.
   optional Inode inode = 5;
   optional bytes value = 6;
 }
@@ -300,6 +301,8 @@ message EntryChange {
 
 message InodeChange {
   Handle handle = 1;
+  // The inode before and after the change, without handles: theirs is
+  // `handle`.
   optional Inode before = 2;
   optional Inode after = 3;
   repeated Handle holders = 4;

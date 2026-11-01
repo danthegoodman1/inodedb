@@ -163,9 +163,9 @@ A six-level path, every level a directory of 1,001 cached entries, resolved thro
 | Resolve the path to its inode | 197 ns |
 | `Stat` through the query engine | 194 ns |
 | `Stat` by handle under a key rooted five levels up | 75 ns |
-| Make a handle's MAC and check it | 146 ns |
+| Make a handle's MAC and check it | 30 ns |
 
-Resolution walks one map per level, so its cost grows with depth and the logarithm of each directory's size, and a rename costs the same whatever lies beneath. A read by handle skips resolution and follows the file's back-pointer and its directories' parents up to the key's root instead, well under the design's estimate of a microsecond. The server makes a MAC for each handle it sends and checks one for each it receives: HMAC-SHA256, keyed once per request.
+Resolution walks one map per level, so its cost grows with depth and the logarithm of each directory's size, and a rename costs the same whatever lies beneath. A read by handle skips resolution and follows the file's back-pointer and its directories' parents up to the key's root instead, well under the design's estimate of a microsecond. The server makes a MAC for each handle it sends and checks one for each it receives: one AES-256 block.
 
 ## Revocation
 

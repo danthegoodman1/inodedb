@@ -175,9 +175,16 @@ pub struct Inode {
 }
 
 impl Inode {
-    pub(crate) fn from_pb(inode: pb::Inode) -> Inode {
+    pub(crate) fn from_pb(mut inode: pb::Inode) -> Inode {
+        let handle = Handle::from_pb(inode.handle.take());
+        Inode::under(handle, inode)
+    }
+
+    /// An inode the server sent without its handle, inside a message that
+    /// carries it.
+    pub(crate) fn under(handle: Handle, inode: pb::Inode) -> Inode {
         Inode {
-            handle: Handle::from_pb(inode.handle),
+            handle,
             kind: Kind::from_pb(inode.kind),
             version: inode.version,
             mtime: inode.mtime,
@@ -219,12 +226,15 @@ pub struct Entry {
 
 impl Entry {
     pub(crate) fn from_pb(listed: pb::Listed) -> Entry {
+        let handle = Handle::from_pb(listed.handle);
         Entry {
             name: listed.name,
             kind: Kind::from_pb(listed.kind),
-            handle: Handle::from_pb(listed.handle),
+            inode: listed
+                .inode
+                .map(|inode| Inode::under(handle.clone(), inode)),
+            handle,
             entry_version: listed.entry_version,
-            inode: listed.inode.map(Inode::from_pb),
             value: listed.value,
         }
     }
@@ -442,9 +452,14 @@ impl Changed {
             inodes: change
                 .inodes
                 .into_iter()
-                .map(|effect| InodeChanged {
-                    before: effect.before.map(Inode::from_pb),
-                    after: effect.after.map(Inode::from_pb),
+                .map(|effect| {
+                    let handle = Handle::from_pb(effect.handle);
+                    InodeChanged {
+                        before: effect
+                            .before
+                            .map(|inode| Inode::under(handle.clone(), inode)),
+                        after: effect.after.map(|inode| Inode::under(handle, inode)),
+                    }
                 })
                 .collect(),
             entered: change

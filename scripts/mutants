@@ -42,6 +42,8 @@ QUERY = "crates/core/src/query.rs"
 FEED = "crates/core/src/feed.rs"
 SERVER_FEED = "crates/server/src/feed.rs"
 AUTH = "crates/server/src/auth.rs"
+CONVERT = "crates/server/src/convert.rs"
+CLIENT_TYPES = "crates/client/src/types.rs"
 CORE_AUTH = "crates/core/src/auth.rs"
 CLIENT_CACHE = "crates/client/src/cache.rs"
 CLIENT_LEASE = "crates/client/src/lease.rs"
@@ -264,6 +266,25 @@ MUTANTS = [
     (
         "a handle's MAC goes unchecked",
         [(AUTH, "if same {", "if true {")],
+    ),
+    (
+        "a handle's MAC leaves out the key's id",
+        [(AUTH, "block[..8].copy_from_slice(&self.id.to_be_bytes());", "")],
+    ),
+    (
+        "a listed inode repeats its entry's handle on the wire",
+        [(CONVERT, "inode: listed.inode.as_ref().map(attributes),",
+          "inode: listed.inode.as_ref().map(|found| inode(listed.entry.child, found, scope)),")],
+    ),
+    (
+        "a listed inode takes its handle from the wire",
+        [(CLIENT_TYPES, "inode: listed.inode.map(|inode| Inode::under(handle.clone(), inode)),",
+          "inode: listed.inode.map(Inode::from_pb),")],
+    ),
+    (
+        "a changed inode takes its handle from the wire",
+        [(CLIENT_TYPES, "after: effect.after.map(|inode| Inode::under(handle, inode)),",
+          "after: effect.after.map(Inode::from_pb),")],
     ),
     (
         "a read by handle skips the scope check",
