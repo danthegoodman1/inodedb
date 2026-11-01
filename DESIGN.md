@@ -511,11 +511,11 @@ Each default, and the measurement it rests on (`BENCHMARKS.md`; rates are batche
 
 | Setting | Default | Basis |
 | --- | --- | --- |
-| `writer.lease_ms`, `renew_every_ms`, `takeover_margin_ms` | 5 s, 1 s, 1 s | Failover takes 6.1 s. A FoundationDB commit's p99 under load is 72 ms, well inside the lease, and an idle writer commits once a second. The margin covers clocks drifting apart by up to a fifth of the lease. |
+| `writer.lease_ms`, `renew_every_ms`, `takeover_margin_ms` | 5 s, 1 s, 1 s | Failover takes 6.1 s. A grouped FoundationDB commit's p99 at 128 clients is 12 ms on EC2, local NVMe or gp3, well inside the lease, and an idle writer commits once a second. The margin covers clocks drifting apart by up to a fifth of the lease. |
 | `writer.lease_ttl_ms` | 30 s | Heartbeats go every 10 seconds, so a reader rides out two lost ones; a dead reader holds the horizon back 30 seconds. |
 | `writer.claim_ttl_ms` | 60 s | A consumer deletes a claim's blobs well within it; one that dies returns its entries a minute later. |
 | `log.min_retention_ms`, `max_retention_ms` | 5 min, 1 h | A log entry takes 43 to 74 bytes: 18 MB for five minutes at 1,000, and 216 MB for an hour. |
 | `request_ttl` | 10 min, 5 at least | Five times the client's two-minute retry deadline. A live record takes about 100 bytes of the writer's memory and a little more in storage: 60 MB of memory at 1,000. |
-| `group_max_bytes` | 9 MB | FoundationDB's 10,000,000-byte transactions, less the head, expiry deletions and up to 512 KiB of lease heartbeats. Grouping multiplies FoundationDB throughput 46 times at 128 clients. |
+| `group_max_bytes` | 9 MB | FoundationDB's 10,000,000-byte transactions, less the head, expiry deletions and up to 512 KiB of lease heartbeats. At 128 clients, grouping multiplies FoundationDB throughput 30 times on local NVMe and 49 times on gp3. |
 | `undo_bytes` | 64 MiB | A replaced value's undo takes 160 bytes, so a snapshot outlasts about 400,000 changes in its subtree. |
 | `cache.dirs`, `inodes`, `value_bytes` | 256 Ki directories, 1 Mi inodes, 256 MiB of values | About 830 bytes per cached file: 0.8 GB of tree. |

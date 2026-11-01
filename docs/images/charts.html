@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InodeDB charts</title>
+<!-- Source of the README charts. render.mjs screenshots each chart in light and dark. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  --bg: #f3f4f2;
+  --surface: #fcfcfb;
+  --ink: #101315;
+  --ink-2: #4a5056;
+  --muted: #7f858a;
+  --grid: #e3e5e2;
+  --axis: #c3c7c3;
+  --ring: rgba(16, 19, 21, 0.10);
+  --memory: #2a78d6;
+  --sqlite: #eb6834;
+  --rocksdb: #1baf7a;
+  --fdb: #eda100;
+  /* The devices, in the chart that compares them. */
+  --nvme: #008300;
+  --gp3: #e87ba4;
+  /* The headline's accent, apart from every series' color. */
+  --accent: #6250d6;
+  --font-display: "Archivo", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1012; --surface: #15181a; --ink: #eef0ef; --ink-2: #b8bec2; --muted: #868c91;
+    --grid: #25292c; --axis: #3a3f43; --ring: rgba(255, 255, 255, 0.10);
+    --memory: #3987e5; --sqlite: #d95926; --rocksdb: #199e70; --fdb: #c98500; --accent: #9085e9;
+    --nvme: #008300; --gp3: #d55181;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1012; --surface: #15181a; --ink: #eef0ef; --ink-2: #b8bec2; --muted: #868c91;
+  --grid: #25292c; --axis: #3a3f43; --ring: rgba(255, 255, 255, 0.10);
+  --memory: #3987e5; --sqlite: #d95926; --rocksdb: #199e70; --fdb: #c98500; --accent: #9085e9;
+  --nvme: #008300; --gp3: #d55181;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font-family: var(--font-body); font-size: 16px; line-height: 1.55;
+  padding: 32px 16px 64px;
+}
+.wrap { max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 48px; }
+h1 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 14px; }
+.key { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.82rem; color: var(--ink-2); }
+.key span { display: inline-flex; align-items: center; gap: 7px; }
+.sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.foot { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 24px; font-size: 0.8rem; color: var(--muted); }
+
+/* Operations a second: one row per operation, a bar per backend on a shared linear axis */
+.hero { padding: 40px; display: flex; flex-direction: column; gap: 22px; }
+.hero-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 12px 32px; }
+.hero h1 { font-size: 3.1rem; font-weight: 780; font-stretch: 80%; line-height: 1.02; letter-spacing: -0.015em; max-width: 18ch; }
+.hero h1 em { font-style: normal; color: var(--accent); }
+.hero-meta { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: var(--ink-2); }
+.hero-meta b { color: var(--ink); font-weight: 600; }
+.hero .foot { border-top: 1px solid var(--grid); padding-top: 14px; }
+.ops { display: grid; grid-template-columns: 13rem minmax(0, 1fr); column-gap: 18px; }
+.colhead { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); padding-bottom: 4px; border-bottom: 1px solid var(--grid); }
+.row-label { padding: 12px 0; align-self: center; }
+.row-label .name { font-weight: 600; font-size: 0.95rem; line-height: 1.25; }
+.row-label .sub { font-size: 0.8rem; color: var(--muted); line-height: 1.3; }
+.track { position: relative; padding: 12px 0; display: flex; flex-direction: column; justify-content: center; gap: 3px; }
+.track .gl { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid); }
+.track .gl.zero { background: var(--axis); }
+.b { position: relative; display: flex; align-items: center; height: 13px; }
+.bar { height: 13px; border-radius: 0 4px 4px 0; flex: none; }
+.v { margin-left: 4px; padding: 1px 3px; background: var(--surface); font-family: var(--font-mono); font-size: 0.72rem; line-height: 1; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.axis { grid-column: 2; position: relative; height: 22px; border-top: 1px solid var(--axis); }
+.axis span { position: absolute; top: 4px; transform: translateX(-50%); font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.axis-cap { grid-column: 2; font-size: 0.76rem; color: var(--muted); }
+
+/* Latency: reads and writes, at one client's p50 and 64 clients' p99, each panel on its own linear axis */
+.multiples { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px 36px; }
+.panel { display: flex; flex-direction: column; gap: 6px; }
+.panel h3 { font-family: var(--font-display); font-size: 1.05rem; font-weight: 650; margin: 0; }
+.panel h3 span { color: var(--muted); font-weight: 500; }
+.panel .ops { grid-template-columns: 4.5rem minmax(0, 1fr); column-gap: 12px; }
+.panel .ops.wide { grid-template-columns: 7.5rem minmax(0, 1fr); }
+/* Room right of each panel's axis for the longest bar's label. */
+.panel .track, .panel .axis, .panel .axis-cap { margin-right: 4.5rem; }
+
+/* Capture mode, set by a URL hash such as #ops-dark: one chart on GitHub's page color */
+html.capture body { padding-block: 24px; }
+html.capture[data-theme="light"] { --bg: #ffffff; }
+html.capture[data-theme="dark"] { --bg: #0d1117; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="card hero" id="ops">
+    <div class="hero-head">
+      <h1>InodeDB reads <em>230k</em> times a second from memory on every backend</h1>
+      <div class="hero-meta">
+        <span><b>gRPC</b> · 64 clients, each on its own connection</span>
+        <span>10,000 files of 100 bytes · a warm cache</span>
+        <span>EC2 i7ie.6xlarge · every store on local NVMe</span>
+      </div>
+    </div>
+    <div class="ops" id="ops-chart" role="img"></div>
+    <div class="foot">
+      <div class="key">
+        <span><i class="sw" style="background:var(--memory)"></i>memory</span>
+        <span><i class="sw" style="background:var(--sqlite)"></i>SQLite</span>
+        <span><i class="sw" style="background:var(--rocksdb)"></i>RocksDB</span>
+        <span><i class="sw" style="background:var(--fdb)"></i>FoundationDB</span>
+      </div>
+      <span>Writes wait for a durable commit, which batches share. FoundationDB runs as one process.</span>
+    </div>
+  </div>
+
+  <div class="card hero" id="latency">
+    <div class="hero-head">
+      <h1>Reads take <em>0.3 ms</em> on every backend, and writes take a commit</h1>
+      <div class="hero-meta">
+        <span><b>gRPC</b> · each client on its own connection</span>
+        <span>10,000 files of 100 bytes · a warm cache</span>
+        <span>EC2 i7ie.6xlarge · every store on local NVMe</span>
+      </div>
+    </div>
+    <div class="multiples" id="latency-panels"></div>
+    <div class="foot">
+      <div class="key">
+        <span><i class="sw" style="background:var(--memory)"></i>memory</span>
+        <span><i class="sw" style="background:var(--sqlite)"></i>SQLite</span>
+        <span><i class="sw" style="background:var(--rocksdb)"></i>RocksDB</span>
+        <span><i class="sw" style="background:var(--fdb)"></i>FoundationDB</span>
+      </div>
+      <span>Each panel has its own scale. A put also reads storage once, to find its new name absent.</span>
+    </div>
+  </div>
+
+  <div class="card hero" id="devices">
+    <div class="hero-head">
+      <h1>gp3 syncs <em>7×</em> slower than local NVMe, and grouping keeps puts within 2.4×</h1>
+      <div class="hero-meta">
+        <span><b>gp3</b> at its maximum: 80,000 IOPS, 2,000 MiB/s</span>
+        <span>A 4 KiB write and <b>fsync</b>: 322 µs on NVMe, 2,179 µs on gp3</span>
+        <span>EC2 i7ie.6xlarge · each store on the device</span>
+      </div>
+    </div>
+    <div class="multiples" id="device-panels"></div>
+    <div class="foot">
+      <div class="key">
+        <span><i class="sw" style="background:var(--nvme)"></i>local NVMe</span>
+        <span><i class="sw" style="background:var(--gp3)"></i>gp3</span>
+      </div>
+      <span>A put creates a new 100-byte file. FoundationDB runs as one process, its data on the device.</span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const D = {
+  // BENCHMARKS.md, "Operations", local NVMe: operations a second at 64 clients for memory, SQLite, RocksDB, FoundationDB
+  ops: [
+    ["Stat", "by path", 236623, 239433, 237995, 229883],
+    ["Read", "a 100-byte value", 229966, 236875, 236487, 233663],
+    ["List", "100 entries with attributes", 40120, 43614, 43360, 40122],
+    ["Put", "a new 100-byte file", 34881, 13612, 18476, 7310],
+    ["Rename", "a file", 38516, 15289, 20788, 8313],
+  ],
+  backends: [["memory", "memory"], ["sqlite", "SQLite"], ["rocksdb", "RocksDB"], ["fdb", "FoundationDB"]],
+  // BENCHMARKS.md, "Operations", local NVMe: latency in ms for memory, SQLite, RocksDB, FoundationDB
+  latency: [
+    ["Reads", "one client, p50", 0.6, [0, 0.2, 0.4, 0.6], [
+      ["Stat", 0.316, 0.318, 0.130, 0.318],
+      ["Read", 0.338, 0.312, 0.316, 0.333],
+      ["List", 0.458, 0.419, 0.439, 0.465],
+    ]],
+    ["Reads", "64 clients, p99", 3, [0, 1, 2, 3], [
+      ["Stat", 0.498, 0.500, 0.559, 0.684],
+      ["Read", 0.604, 0.475, 0.469, 0.497],
+      ["List", 2.254, 1.977, 2.061, 2.238],
+    ]],
+    ["Writes", "one client, p50", 5, [0, 1, 2, 3, 4, 5], [
+      ["Put", 0.408, 1.941, 1.701, 3.933],
+      ["Rename", 0.361, 1.581, 1.499, 3.186],
+    ]],
+    ["Writes", "64 clients, p99", 15, [0, 5, 10, 15], [
+      ["Put", 2.835, 8.299, 5.061, 12.174],
+      ["Rename", 2.465, 7.418, 4.626, 11.848],
+    ]],
+  ],
+  // BENCHMARKS.md, "Operations": puts on local NVMe and on gp3, by backend
+  devices: [
+    ["Puts a second", "64 clients", 25000, [0, 5000, 10000, 15000, 20000, 25000], [
+      ["SQLite", 13612, 5718],
+      ["RocksDB", 18476, 10582],
+      ["FoundationDB", 7310, 6052],
+    ]],
+    ["Put latency", "one client, p50", 8, [0, 2, 4, 6, 8], [
+      ["SQLite", 1.941, 3.747],
+      ["RocksDB", 1.701, 3.342],
+      ["FoundationDB", 3.933, 5.767],
+    ]],
+  ],
+};
+
+const [view, theme] = location.hash.slice(1).split("-");
+if (theme) document.documentElement.dataset.theme = theme;
+if (view) {
+  document.documentElement.classList.add("capture");
+  for (const c of document.querySelector(".wrap").children) c.hidden = c.id !== view;
+}
+
+const fmt = n => n.toLocaleString("en-US");
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+// A row label, then a bar per series on a linear axis from zero to max.
+function rows(host, data, max, ticks, show, series = D.backends.map(([key]) => key)) {
+  const pos = v => (v / max) * 100;
+  for (const [name, sub, values] of data) {
+    const lab = el("div", "row-label");
+    lab.append(el("div", "name", name));
+    if (sub) lab.append(el("div", "sub", sub));
+    const tr = el("div", "track");
+    for (const t of ticks) { const g = el("i", t ? "gl" : "gl zero"); g.style.left = pos(t) + "%"; tr.append(g); }
+    values.forEach((v, i) => {
+      const b = el("div", "b"), bar = el("span", "bar");
+      bar.style.width = pos(v) + "%"; bar.style.background = `var(--${series[i]})`;
+      b.append(bar, el("span", "v", show(v)));
+      tr.append(b);
+    });
+    host.append(lab, tr);
+  }
+}
+
+function axis(host, max, ticks, show, caption) {
+  const a = el("div", "axis");
+  for (const t of ticks) { const s = el("span", null, show(t)); s.style.left = (t / max) * 100 + "%"; a.append(s); }
+  host.append(a, el("div", "axis-cap", caption));
+}
+
+(function ops() {
+  const host = document.getElementById("ops-chart");
+  const MAX = 250000, ticks = [0, 50000, 100000, 150000, 200000, 250000];
+  host.append(el("div", "colhead", "Operation"), el("div", "colhead", "Operations a second"));
+  rows(host, D.ops.map(([n, s, ...v]) => [n, s, v]), MAX, ticks, fmt);
+  axis(host, MAX, ticks, t => t ? t / 1000 + "k" : "0", "Operations a second at 64 clients");
+  host.setAttribute("aria-label", "Operations a second at 64 clients for memory, SQLite, RocksDB and FoundationDB: " +
+    D.ops.map(([n, s, ...v]) => `${n} ${s} ${v.map(fmt).join(", ")}`).join("; ") + ".");
+})();
+
+(function latency() {
+  const host = document.getElementById("latency-panels");
+  const ms = v => v < 1 ? v.toFixed(3) : v < 10 ? v.toFixed(2) : v.toFixed(1);
+  for (const [kind, when, max, ticks, data] of D.latency) {
+    const panel = el("div", "panel"), h = el("h3", null, kind + " · ");
+    h.append(el("span", null, when));
+    const chart = el("div", "ops");
+    chart.setAttribute("role", "img");
+    chart.setAttribute("aria-label", `${kind}, ${when}, in ms for memory, SQLite, RocksDB and FoundationDB: ` +
+      data.map(([n, ...v]) => `${n} ${v.map(ms).join(", ")}`).join("; ") + ".");
+    rows(chart, data.map(([n, ...v]) => [n, null, v]), max, ticks, ms);
+    axis(chart, max, ticks, t => String(t), "Milliseconds");
+    panel.append(h, chart);
+    host.append(panel);
+  }
+})();
+
+(function devices() {
+  const host = document.getElementById("device-panels");
+  const ms = v => v.toFixed(2);
+  for (const [kind, when, max, ticks, data] of D.devices) {
+    const panel = el("div", "panel"), h = el("h3", null, kind + " · ");
+    h.append(el("span", null, when));
+    const chart = el("div", "ops wide");
+    const latency = kind.includes("latency");
+    const show = latency ? ms : fmt;
+    chart.setAttribute("role", "img");
+    chart.setAttribute("aria-label", `${kind}, ${when}, on local NVMe and gp3: ` +
+      data.map(([n, a, b]) => `${n} ${show(a)} and ${show(b)}`).join("; ") + ".");
+    rows(chart, data.map(([n, ...v]) => [n, null, v]), max, ticks, show, ["nvme", "gp3"]);
+    axis(chart, max, ticks, t => latency ? String(t) : t ? t / 1000 + "k" : "0", latency ? "Milliseconds" : "Puts a second");
+    panel.append(h, chart);
+    host.append(panel);
+  }
+})();
+</script>
+</body>
+</html>

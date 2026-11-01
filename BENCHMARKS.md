@@ -2,76 +2,105 @@
 
 Measurements that guide InodeDB's design. Each names its command, so it can be run again after a change.
 
-Machine: Apple M3 Max (16 cores, 128 GB), macOS 26.6, internal SSD, release build.
+Two machines:
+
+- **EC2,** for "Operations" and "Group commit": an i7ie.6xlarge (Intel Xeon Platinum 8559C, 24 vCPUs, 192 GiB) on Ubuntu 24.04 with Linux 7.0, with every store on one device at a time: one of its local NVMe drives, or a 500 GiB gp3 volume provisioned at gp3's maximum of 80,000 IOPS and 2,000 MiB/s. Each device holds an XFS file system. FoundationDB 7.3.79 runs one process on the `ssd-2` engine, with its data on the same device. `scripts/ec2/setup` prepares the instance, and `scripts/ec2/bench` runs both benchmarks on each device.
+- **A Mac** for the rest, which measure CPU, memory and failover: an Apple M3 Max (16 cores, 128 GB) on macOS 26.6, with FoundationDB in a Linux container (`scripts/fdb`).
+
+Every run uses a release build.
+
+## Devices
+
+A 4 KiB write followed by `fsync`, one at a time, with `fio` for 15 seconds: the least each durable commit pays.
+
+| Device | Synced writes a second | `fsync` p50 | `fsync` p99 |
+| --- | ---: | ---: | ---: |
+| Local NVMe | 2,680 | 322 µs | 725 µs |
+| gp3, 80,000 IOPS and 2,000 MiB/s | 456 | 2,179 µs | 2,540 µs |
+
+Provisioned IOPS set how many writes a gp3 volume takes at once, and each still crosses the network: a sync costs about 7 times what it costs on local NVMe.
 
 ## Operations
 
 ```console
-scripts/fdb cargo run --release -p inodedb-tests --example ops --features rocksdb,fdb -- 3
+scripts/ec2/bench
+cargo run --release -p inodedb-tests --example ops --features rocksdb,fdb -- 5 memory,sqlite,rocksdb,fdb
 ```
 
-Each operation through the gRPC API on Linux: Docker Desktop's VM on the machine above (16 CPUs, 32 GB, Linux 6.10), with each store on the VM's disk and FoundationDB as one process on its memory engine. The server runs on 8 threads and the clients on 8 more, each client on its own connection, waiting for each answer before sending the next. The tree holds 10,000 files of 100 bytes, and a directory of 100 for listings. A server restarted over the store starts cold: 16 clients stat each file once, then read each value once. A put names a new file.
-
-One client, p50 ms:
-
-| Operation | memory | SQLite | RocksDB | FoundationDB |
-| --- | ---: | ---: | ---: | ---: |
-| stat | 0.078 | 0.074 | 0.078 | 0.078 |
-| read a 100-byte value | 0.081 | 0.079 | 0.079 | 0.079 |
-| list 100 entries | 0.144 | 0.141 | 0.139 | 0.144 |
-| put a new 100-byte file | 0.107 | 0.490 | 0.366 | 6.907 |
-| rename a file | 0.096 | 0.450 | 0.350 | 4.715 |
+Each operation through the gRPC API. The server runs on 8 threads and the clients on 8 more, each client on its own connection, waiting for each answer before sending the next. The tree holds 10,000 files of 100 bytes, and a directory of 100 for listings. A server restarted over the store starts cold: 16 clients stat each file once, then read each value once. A put creates a new file. Reads come from the run on local NVMe; on gp3, warm reads ran within 11% of these.
 
 Operations a second, with 16 clients on a cold cache and 64 on a warm one:
 
-| Operation | Clients | memory | SQLite | RocksDB | FoundationDB |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| stat, cold cache | 16 | 81,829 | 23,354 | 23,994 | 7,835 |
-| read a value, cold cache | 16 | 98,799 | 40,164 | 42,508 | 24,578 |
-| stat | 64 | 190,601 | 192,004 | 192,836 | 190,346 |
-| read a 100-byte value | 64 | 186,794 | 187,687 | 188,317 | 186,097 |
-| list 100 entries | 64 | 33,752 | 46,242 | 46,640 | 45,650 |
-| put a new 100-byte file | 64 | 46,371 | 15,738 | 31,238 | 6,072 |
-| rename a file | 64 | 48,027 | 15,762 | 30,228 | 5,558 |
+| Operation | Device | Clients | memory | SQLite | RocksDB | FoundationDB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| stat, cold cache | NVMe | 16 | 31,425 | 70,615 | 79,307 | 7,229 |
+| read a value, cold cache | NVMe | 16 | 44,001 | 96,099 | 117,773 | 11,820 |
+| stat | NVMe | 64 | 236,623 | 239,433 | 237,995 | 229,883 |
+| read a 100-byte value | NVMe | 64 | 229,966 | 236,875 | 236,487 | 233,663 |
+| list 100 entries | NVMe | 64 | 40,120 | 43,614 | 43,360 | 40,122 |
+| put a new 100-byte file | NVMe | 64 | 34,881 | 13,612 | 18,476 | 7,310 |
+| put a new 100-byte file | gp3 | 64 | 35,101 | 5,718 | 10,582 | 6,052 |
+| rename a file | NVMe | 64 | 38,516 | 15,289 | 20,788 | 8,313 |
+| rename a file | gp3 | 64 | 39,053 | 6,387 | 10,664 | 5,570 |
 
-- The writer answers reads from its cache, so a warm read costs the same on every backend: about 80 µs, nearly all of it the gRPC round trip, and 190,000 a second once 64 clients share the 16 CPUs. Its p99 stays under 1 ms.
-- A cold read costs a storage read, about 1 ms on FoundationDB. Each query reads on its own, so throughput rises with clients.
-- A write costs a durable commit: about 0.4 ms on the local backends, whose `fsync` here flushes the VM's disk, and 4 to 5 ms on FoundationDB. A put first reads storage to learn its new name is absent, one more round trip. A round sends its keys at once, and batches queued behind one that misses share its round, so with 64 clients groups of about 25 batches commit together and FoundationDB reaches about 6,000 writes a second at an 11 ms p50.
+Latency in ms, p50 for one client and p99 for 64:
+
+| Operation | Device | Latency | memory | SQLite | RocksDB | FoundationDB |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| stat | NVMe | one client, p50 | 0.316 | 0.318 | 0.130 | 0.318 |
+| read a 100-byte value | NVMe | one client, p50 | 0.338 | 0.312 | 0.316 | 0.333 |
+| list 100 entries | NVMe | one client, p50 | 0.458 | 0.419 | 0.439 | 0.465 |
+| put a new 100-byte file | NVMe | one client, p50 | 0.408 | 1.941 | 1.701 | 3.933 |
+| put a new 100-byte file | gp3 | one client, p50 | 0.415 | 3.747 | 3.342 | 5.767 |
+| rename a file | NVMe | one client, p50 | 0.361 | 1.581 | 1.499 | 3.186 |
+| rename a file | gp3 | one client, p50 | 0.372 | 3.356 | 3.073 | 4.749 |
+| stat | NVMe | 64 clients, p99 | 0.498 | 0.500 | 0.559 | 0.684 |
+| read a 100-byte value | NVMe | 64 clients, p99 | 0.604 | 0.475 | 0.469 | 0.497 |
+| list 100 entries | NVMe | 64 clients, p99 | 2.254 | 1.977 | 2.061 | 2.238 |
+| put a new 100-byte file | NVMe | 64 clients, p99 | 2.835 | 8.299 | 5.061 | 12.174 |
+| put a new 100-byte file | gp3 | 64 clients, p99 | 2.854 | 22.224 | 7.060 | 12.816 |
+| rename a file | NVMe | 64 clients, p99 | 2.465 | 7.418 | 4.626 | 11.848 |
+| rename a file | gp3 | 64 clients, p99 | 2.448 | 21.045 | 6.990 | 15.584 |
+
+- The writer answers warm reads from its cache, so they cost the same on every backend and device: 230,000 to 240,000 a second at 64 clients, with p99 under 0.7 ms. One client's read takes about 0.3 ms, nearly all of it the gRPC round trip. Two runs measured 0.11 to 0.13 ms, and the Mac's Linux VM 0.08 ms, so the round trip on this instance varies from run to run.
+- A cold read costs a storage read. SQLite and RocksDB answer from the page cache, 70,000 to 118,000 a second; FoundationDB's reads cross to its server process, 6,700 to 11,800. The memory backend, built for tests, varied most between runs: its cold reads ran 44,001 a second in one and 108,367 in the other.
+- A write costs a durable commit, and a put first reads storage to learn its new name is absent. At one client, a put takes 1.7 to 1.9 ms on SQLite and RocksDB and 3.9 ms on FoundationDB on local NVMe, and about 1.5 to 2 times that on gp3. At 64 clients, writes gather into groups, so gp3's slower syncs cost RocksDB 43% of its rate, SQLite 58%, and FoundationDB 17%.
+- Listings run within 10% of each other on every backend, whether memory runs first or last.
 
 ## Group commit
 
 ```console
-cargo run --release -p inodedb-tests --example commits --features rocksdb -- 3
-scripts/fdb cargo run --release -p inodedb-tests --example commits --features fdb -- 3
+scripts/ec2/bench
+cargo run --release -p inodedb-tests --example commits --features rocksdb,fdb -- 3
 ```
 
-Each client commits one 100-byte file per batch into its own directory, waiting for each answer before sending the next. "One per group" caps every group at one batch; "grouped" uses the default cap of 9 MB.
+Each client commits one 100-byte file per batch into its own directory, waiting for each answer before sending the next. "One per group" caps every group at one batch; "grouped" uses the default cap of 9 MB. Batches a second, with p50 and p99 in ms:
 
-| Backend | Commit | Clients | Batches/s | p50 ms | p99 ms |
-| --- | --- | ---: | ---: | ---: | ---: |
-| SQLite | one per group | 1 | 6,851 | 0.13 | 0.39 |
-| SQLite | grouped | 1 | 5,539 | 0.16 | 0.46 |
-| SQLite | one per group | 16 | 7,684 | 1.81 | 4.07 |
-| SQLite | grouped | 16 | 16,285 | 0.75 | 5.83 |
-| SQLite | one per group | 128 | 8,048 | 15.98 | 21.43 |
-| SQLite | grouped | 128 | 20,149 | 4.85 | 15.24 |
-| RocksDB | one per group | 1 | 8,742 | 0.12 | 0.15 |
-| RocksDB | grouped | 1 | 8,393 | 0.12 | 0.15 |
-| RocksDB | one per group | 16 | 14,786 | 1.07 | 1.34 |
-| RocksDB | grouped | 16 | 31,514 | 0.49 | 0.84 |
-| RocksDB | one per group | 128 | 14,966 | 7.75 | 26.81 |
-| RocksDB | grouped | 128 | 38,765 | 3.31 | 5.10 |
-| FoundationDB | one per group | 1 | 202 | 4.84 | 8.68 |
-| FoundationDB | grouped | 1 | 216 | 4.75 | 7.01 |
-| FoundationDB | one per group | 16 | 221 | 72.68 | 91.54 |
-| FoundationDB | grouped | 16 | 1,470 | 9.77 | 72.26 |
-| FoundationDB | one per group | 128 | 212 | 493.69 | 1,121.39 |
-| FoundationDB | grouped | 128 | 9,737 | 11.17 | 44.42 |
+| Backend | Commit | Clients | NVMe | p50 | p99 | gp3 | p50 | p99 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| SQLite | one per group | 1 | 641 | 1.60 | 2.19 | 291 | 3.40 | 5.88 |
+| SQLite | grouped | 1 | 649 | 1.57 | 2.14 | 291 | 3.40 | 5.85 |
+| SQLite | one per group | 16 | 1,050 | 15.60 | 19.83 | 335 | 47.61 | 54.22 |
+| SQLite | grouped | 16 | 6,309 | 2.56 | 4.35 | 2,126 | 7.28 | 14.40 |
+| SQLite | one per group | 128 | 967 | 131.03 | 158.43 | 343 | 382.42 | 400.78 |
+| SQLite | grouped | 128 | 19,309 | 6.29 | 11.55 | 9,335 | 11.74 | 24.93 |
+| RocksDB | one per group | 1 | 749 | 1.39 | 1.96 | 333 | 3.01 | 3.59 |
+| RocksDB | grouped | 1 | 776 | 1.35 | 1.86 | 330 | 3.05 | 3.58 |
+| RocksDB | one per group | 16 | 1,207 | 14.00 | 17.69 | 397 | 41.34 | 43.69 |
+| RocksDB | grouped | 16 | 7,346 | 2.24 | 3.52 | 2,993 | 5.35 | 6.16 |
+| RocksDB | one per group | 128 | 1,887 | 47.74 | 140.78 | 384 | 334.28 | 341.64 |
+| RocksDB | grouped | 128 | 25,287 | 4.96 | 8.21 | 17,773 | 7.17 | 9.73 |
+| FoundationDB | one per group | 1 | 316 | 3.18 | 3.91 | 205 | 4.88 | 5.60 |
+| FoundationDB | grouped | 1 | 336 | 3.01 | 3.82 | 207 | 4.84 | 5.63 |
+| FoundationDB | one per group | 16 | 479 | 33.45 | 38.12 | 224 | 71.57 | 75.71 |
+| FoundationDB | grouped | 16 | 3,361 | 4.77 | 5.88 | 1,751 | 9.14 | 10.57 |
+| FoundationDB | one per group | 128 | 457 | 280.73 | 295.77 | 285 | 399.53 | 576.19 |
+| FoundationDB | grouped | 128 | 13,636 | 9.40 | 11.30 | 14,085 | 8.64 | 11.89 |
 
-- Grouping changes nothing for one client, which never has a second batch waiting, and multiplies throughput by 2.1 to 2.6 on the local backends once batches queue behind a commit.
-- With one batch per group, throughput stops rising past 16 clients: every batch waits for its own durable commit.
-- macOS `fsync` returns before the drive's cache reaches flash, so each commit here costs far less than on a server whose drive honors flushes.
-- FoundationDB here is one process on its memory engine in a Linux container on the same machine (`scripts/fdb`). A commit takes about 5 ms, so one batch per group caps throughput near 200 batches a second whatever the load, and grouping multiplies it by 46 at 128 clients. A replicated cluster's commits cost more, and grouping gains more.
+- Grouping changes nothing for one client, which never has a second batch waiting.
+- With one batch per group, every batch waits for its own durable commit, so 128 clients get at most 2.5 times one client's throughput, and on gp3 under 400 batches a second.
+- At 128 clients, grouping multiplies throughput by 13 to 30 on local NVMe and by 27 to 49 on gp3, where each sync costs more.
+- FoundationDB groups reach about 14,000 batches a second on both devices, which suggests its one process, not the device, sets that limit.
 
 ## Failover
 

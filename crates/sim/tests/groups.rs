@@ -627,3 +627,32 @@ fn a_detached_subtree_stays_within_the_directories_above_it_as_it_detached() {
         "q came above p only after the subtree detached"
     );
 }
+
+/// A starting writer keeps the request records it finds for a whole
+/// lifetime by its own clock, however far ahead of the clocks that stamped
+/// them it runs, so a retry still gets its first answer.
+#[test]
+fn a_starting_writer_keeps_records_a_lifetime_by_its_own_clock() {
+    let ttl: Millis = 10_000;
+    let config = Config {
+        request_ttl: ttl,
+        ..Config::default()
+    };
+    let mut first = Harness::with(Memory::new(), config.clone());
+    let batch = Batch {
+        ops: vec![put_mode("once", "1", PutMode::Create)],
+        request_id: 74,
+        ..Batch::default()
+    };
+    assert!(first.commit(batch.clone()).committed);
+    let ino = h_ino(&mut first, "once");
+    // The next writer's clock runs two lifetimes ahead of the first's.
+    let writer = Writer::new(config, Harness::writer_id(), 1_000 + 2 * ttl, [7; 32]);
+    let mut second = Harness::with_writer(first.storage.clone(), writer);
+    second.ops([mkdir("a")]);
+    assert!(
+        records(&second.storage).contains_key(&74),
+        "the record outlives the new writer's first commit"
+    );
+    assert_eq!(second.commit(batch).outcomes[0], Outcome::Applied { ino });
+}

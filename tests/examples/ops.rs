@@ -1,6 +1,6 @@
 //! Operations per second through the server's gRPC API, by backend.
 //!
-//!     cargo run --release -p inodedb-tests --example ops --features rocksdb,fdb [-- SECONDS]
+//!     cargo run --release -p inodedb-tests --example ops --features rocksdb,fdb [-- SECONDS [BACKENDS]]
 //!
 //! The server runs on a runtime of its own with `SERVER_THREADS` workers,
 //! as a separate process would, and each client opens its own connection.
@@ -280,27 +280,37 @@ async fn bench<S: Storage + Clone>(backend: &str, storage: S, seconds: u64) {
 
 #[tokio::main(worker_threads = 8)]
 async fn main() {
-    let seconds = std::env::args()
-        .nth(1)
-        .and_then(|arg| arg.parse().ok())
-        .unwrap_or(3);
+    let mut args = std::env::args().skip(1);
+    let seconds = args.next().and_then(|arg| arg.parse().ok()).unwrap_or(3);
+    // The backends to run, in order: memory, sqlite, rocksdb, fdb.
+    let order = args
+        .next()
+        .unwrap_or_else(|| "memory,sqlite,rocksdb,fdb".to_string());
     println!("| Backend | Operation | Clients | Ops/s | p50 ms | p99 ms |");
     println!("| --- | --- | ---: | ---: | ---: | ---: |");
-    bench("memory", inodedb_storage::Memory::new(), seconds).await;
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let storage =
-        inodedb_storage_sqlite::Sqlite::open(dir.path().join("db.sqlite")).expect("opens");
-    bench("SQLite", storage, seconds).await;
-    #[cfg(feature = "rocksdb")]
-    {
-        let dir = tempfile::tempdir().expect("a scratch directory");
-        let storage = inodedb_storage_rocksdb::Rocks::open(dir.path().join("db")).expect("opens");
-        bench("RocksDB", storage, seconds).await;
-    }
-    #[cfg(feature = "fdb")]
-    {
-        use inodedb_storage_conformance::Backend;
-        let mut fdb = inodedb_storage_conformance::backends::Fdb::new();
-        bench("FoundationDB", fdb.fresh(), seconds).await;
+    for backend in order.split(',') {
+        match backend {
+            "memory" => bench("memory", inodedb_storage::Memory::new(), seconds).await,
+            "sqlite" => {
+                let dir = tempfile::tempdir().expect("a scratch directory");
+                let path = dir.path().join("db.sqlite");
+                let storage = inodedb_storage_sqlite::Sqlite::open(path).expect("opens");
+                bench("SQLite", storage, seconds).await;
+            }
+            #[cfg(feature = "rocksdb")]
+            "rocksdb" => {
+                let dir = tempfile::tempdir().expect("a scratch directory");
+                let storage =
+                    inodedb_storage_rocksdb::Rocks::open(dir.path().join("db")).expect("opens");
+                bench("RocksDB", storage, seconds).await;
+            }
+            #[cfg(feature = "fdb")]
+            "fdb" => {
+                use inodedb_storage_conformance::Backend;
+                let mut fdb = inodedb_storage_conformance::backends::Fdb::new();
+                bench("FoundationDB", fdb.fresh(), seconds).await;
+            }
+            other => eprintln!("skipping {other}: unknown, or built without its feature"),
+        }
     }
 }

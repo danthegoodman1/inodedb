@@ -1,0 +1,50 @@
+#!/bin/bash
+# Runs InodeDB's benchmarks with every store on one device at a time: the
+# local NVMe drive, then the gp3 volume, as scripts/ec2/setup mounted them.
+# Run from the instance with the repository at ~/inodedb; results go to
+# ~/results/<device>.
+set -euo pipefail
+source ~/.cargo/env
+cd ~/inodedb
+cargo build -q --release -p inodedb-tests --examples --features rocksdb,fdb
+ops=target/release/examples/ops
+commits=target/release/examples/commits
+
+# Points FoundationDB at a fresh data directory on $1 with the ssd engine.
+fdb_on() {
+  sudo systemctl stop foundationdb
+  sudo rm -rf "$1/fdb"
+  sudo mkdir -p "$1/fdb/data" "$1/fdb/log"
+  sudo chown -R foundationdb:foundationdb "$1/fdb"
+  sudo sed -i "s#^datadir = .*#datadir = $1/fdb/data/\$ID#; s#^logdir = .*#logdir = $1/fdb/log#" /etc/foundationdb/foundationdb.conf
+  sudo systemctl start foundationdb
+  sleep 3
+  fdbcli --exec "configure new single ssd" --timeout 60
+  until fdbcli --exec "status minimal" --timeout 10 | grep -q "is available"; do sleep 1; done
+}
+
+# A 4 KiB write followed by fsync, one at a time: what each durable commit pays at least.
+fio_sync() {
+  fio --name=sync --filename="$1/fio.dat" --size=1G --rw=randwrite --bs=4k --ioengine=psync \
+    --fsync=1 --runtime=15 --time_based --output-format=json > "$2/fio.json"
+  python3 - "$2/fio.json" <<'PY'
+import json, sys
+job = json.load(open(sys.argv[1]))["jobs"][0]["write"]
+sync = json.load(open(sys.argv[1]))["jobs"][0]["sync"]
+print(f"write+fsync: {job['iops']:.0f}/s, fsync p50 {sync['lat_ns']['percentile']['50.000000']/1000:.0f} us, p99 {sync['lat_ns']['percentile']['99.000000']/1000:.0f} us")
+PY
+  rm -f "$1/fio.dat"
+}
+
+run() { # device mount order
+  local device=$1 mount=$2 order=$3 out=~/results/$1
+  mkdir -p "$out" "$mount/tmp"
+  fdb_on "$mount"
+  fio_sync "$mount" "$out" | tee "$out/fio.txt"
+  TMPDIR="$mount/tmp" "$ops" 5 "$order" 2>/dev/null | grep '^|' | tee "$out/ops.md"
+  TMPDIR="$mount/tmp" "$commits" 3 2>/dev/null | grep '^|' | tee "$out/commits.md"
+}
+
+run nvme /mnt/nvme memory,sqlite,rocksdb,fdb
+run ebs /mnt/ebs fdb,rocksdb,sqlite,memory
+touch ~/results/done
