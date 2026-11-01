@@ -1002,12 +1002,64 @@ impl Writer {
                     self.queue.push_front(sub);
                     let mark = self.cache.mark();
                     self.blocked_since.get_or_insert(mark);
+                    let reads = self.read_ahead(reads);
                     let id = self.issue_read(reads, Purpose::Batch);
                     self.blocked = Some(id);
                 }
             }
         }
         self.send();
+    }
+
+    /// `reads`, which the batch at the queue's front needs, and what the
+    /// batches queued behind it lack, so a queue of batches that each miss
+    /// the cache costs a round of reads rather than one per batch. Those
+    /// behind run here against state without the batches before them, so
+    /// they may need other reads once those apply; what they fetch now is
+    /// current all the same.
+    fn read_ahead(&self, mut reads: Vec<Read>) -> Vec<Read> {
+        let view = Overlaid {
+            overlay: &self.overlay,
+            base: &self.cache,
+        };
+        let mut wanted: BTreeSet<Read> = reads.iter().cloned().collect();
+        for sub in self.queue.iter().skip(1) {
+            if wanted.len() >= exec::MAX_READS {
+                break;
+            }
+            let Work::Batch(batch) = &sub.work else {
+                continue;
+            };
+            let Ok(scope) = auth::authorize(&view, &sub.caller, self.now, Grant::Write) else {
+                continue;
+            };
+            if batch.validate().is_err() {
+                continue;
+            }
+            let mut needs = Vec::new();
+            let request = scoped_request(batch.request_id, scope.key);
+            if request != 0
+                && let Err(read) = view.request(request)
+            {
+                needs.push(read);
+            }
+            let input = Input {
+                batch,
+                root: scope.root,
+                now: self.now,
+                version: self.next_version,
+                next_ino: self.next_ino,
+            };
+            if let Err(more) = exec::execute(input, &view) {
+                needs.extend(more);
+            }
+            for read in needs {
+                if wanted.insert(read.clone()) {
+                    reads.push(read);
+                }
+            }
+        }
+        reads
     }
 
     /// The latest version a batch run now sees.

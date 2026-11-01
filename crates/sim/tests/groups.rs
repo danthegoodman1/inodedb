@@ -26,6 +26,8 @@ struct Driver {
     commits: VecDeque<Pending>,
     answers: BTreeMap<Token, Answer>,
     next_token: Token,
+    /// Rounds of reads the writer has sent.
+    reads: usize,
 }
 
 impl Driver {
@@ -36,6 +38,7 @@ impl Driver {
             commits: VecDeque::new(),
             answers: BTreeMap::new(),
             next_token: 1,
+            reads: 0,
         };
         driver.pump();
         // A fresh store's first commit is the root.
@@ -55,6 +58,7 @@ impl Driver {
             for action in actions {
                 match action {
                     Action::Read { id, reads } => {
+                        self.reads += 1;
                         let results = self.storage.read_now(&reads);
                         self.writer.read_done(id, results);
                     }
@@ -481,5 +485,53 @@ fn a_lease_reopened_after_it_ran_out_stays_stored() {
             .iter()
             .any(|(key, _)| *key == keys::lease(granted.lease)),
         "the second run's record stays"
+    );
+}
+
+/// Rounds of reads a restarted writer sends to run `batches` puts into a
+/// directory it didn't create, all queued at once.
+fn rounds_for(batches: usize) -> usize {
+    let storage = Memory::new();
+    let mut first = Driver::new(storage.clone(), Config::default(), 1);
+    first.submit([mkdir("d")]);
+    first.settle(true, CommitOutcome::Committed);
+    let mut d = Driver::new(storage, Config::default(), 2);
+    let before = d.reads;
+    let tokens: Vec<Token> = (0..batches)
+        .map(|index| {
+            let token = d.next_token;
+            d.next_token += 1;
+            d.writer.submit(
+                token,
+                inodedb_core::auth::Caller::Trusted(inodedb_core::types::ROOT),
+                Batch {
+                    ops: vec![put(&format!("d/f{index}"), "v")],
+                    ..Batch::default()
+                },
+            );
+            token
+        })
+        .collect();
+    d.pump();
+    let rounds = d.reads - before;
+    while !d.commits.is_empty() {
+        d.settle(true, CommitOutcome::Committed);
+    }
+    for token in tokens {
+        assert!(d.committed(token).committed);
+    }
+    assert!(d.fsck().is_empty(), "{:?}", d.fsck());
+    rounds
+}
+
+/// Batches queued behind one that misses the cache read what they lack in
+/// the same round.
+#[test]
+fn queued_batches_that_miss_the_cache_read_together() {
+    let alone = rounds_for(1);
+    let queued = rounds_for(32);
+    assert!(
+        queued <= alone + 1,
+        "one batch takes {alone} rounds, and 32 take {queued}"
     );
 }

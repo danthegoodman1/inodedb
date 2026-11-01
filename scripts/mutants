@@ -491,6 +491,14 @@ MUTANTS = [
         [(STANDBY, "Err(Denied::Unknown) => Answer::NotWriter {\n                address: self.address(),\n            },", "")],
     ),
     (
+        "batches queued behind a miss read one at a time",
+        [(WRITER, "let reads = self.read_ahead(reads);", "")],
+    ),
+    (
+        "accepted connections wait on Nagle's algorithm",
+        [(SERVER, "TcpIncoming::from(listener).with_nodelay(Some(true))", "TcpIncoming::from(listener)")],
+    ),
+    (
         "any admin key checks the whole store",
         [(SERVICE, "if scope.root != inodedb_core::types::ROOT {", "if false {")],
     ),

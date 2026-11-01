@@ -75,6 +75,7 @@ Faults the simulator injects: unknown outcomes, storage latency and stalls, writ
 | --- | --- |
 | Contract: order, isolation, conflicts, log, unknown outcomes, durability | `sc::*` on every backend; M"a scan misses an insert into its range", M"a commit skips the head check" |
 | Group commit, one transaction in flight, answers after commit | `groups::*`, `api::concurrent_commits_all_apply`, P2; M"a batch hears back before its group commits" |
+| Batches queued behind a miss read in its round | `groups::queued_batches_that_miss_the_cache_read_together`; M"batches queued behind a miss read one at a time" |
 | Unknown outcomes resolve through the head | `groups::{an_unknown_commit_that_applied_is_answered_as_committed, an_unknown_commit_that_did_not_apply_runs_again}`; M"an unknown outcome counts as a failure" |
 | Renewal, takeover after lease and margin, drifting clocks | `standby::*`, `core/standby::a_standby_waits_for_the_head_to_go_unchanged`, P4; M"a takeover waits without the margin", M"a writer answers reads after its lease" |
 | Standbys: `AtLeast` reads, unknown keys to the writer, warm takeover, small caches, value versions ahead of the log | `standby::{a_standby_with_a_small_cache_answers_under_steady_writes, a_standby_waits_for_a_value_version_it_hasnt_reached}` and the rest of `standby::*`, `api-sb::*`, P1 and P5 through standbys in the swarm; M"a standby refuses a key newer than the log it has read", M"a standby evicts what its reads fetched before their queries run", M"a cache takes a value under a version it hasn't reached as absent" |
@@ -85,6 +86,7 @@ Faults the simulator injects: unknown outcomes, storage latency and stalls, writ
 | Behavior | Evidence |
 | --- | --- |
 | Listing pages, limits, resumption | `api::{listings_page_by_count, listings_page_by_bytes, cut_listings_resume, listings_follow_their_directory, responses_fit_default_limits}` |
+| Replies sent at once, with `TCP_NODELAY` on accepted connections | `server/lib::accepted_connections_send_at_once`; M"accepted connections wait on Nagle's algorithm" |
 | Error mapping, redirects, retries | `api::{refuses_bad_requests, keys_bound_their_reach}`, `api-sb::*`; M"a retried commit takes a new request id" |
 | `Check`: root admin keys only, tree and log | `api::checks_take_a_root_admin_key`, `cli::{fsck_finds_a_planted_corruption, fsck_reads_a_sqlite_store_directly}`, `fsck::*`; M"any admin key checks the whole store", M"fsck misses a gap in the log" |
 | CLI commands | `cli::*` |

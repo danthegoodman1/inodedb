@@ -900,6 +900,7 @@ name = "inodedb-storage-fdb"
 version = "0.1.0"
 dependencies = [
  "foundationdb",
+ "futures-util",
  "inodedb-core",
  "inodedb-storage",
  "tokio",

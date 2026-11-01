@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::server::TcpIncoming;
 
 /// The largest message either side sends: a full batch plus framing.
 pub const MAX_MESSAGE: usize = 16 * 1024 * 1024;
@@ -134,11 +134,10 @@ pub async fn serve<S: Storage + Clone>(
     let (ended, why) = oneshot::channel();
     let fired = Arc::new(Notify::new());
     let server = tonic::transport::Server::builder()
-        .tcp_nodelay(true)
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(Duration::from_secs(20)))
         .add_service(service)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), {
+        .serve_with_incoming_shutdown(incoming(listener), {
             let (watcher, fired) = (watcher.clone(), fired.clone());
             async move {
                 let _ = ended.send(tokio::select! {
@@ -168,6 +167,15 @@ pub async fn serve<S: Storage + Clone>(
     }
     served?;
     Ok(why.await.unwrap_or(Ended::Shutdown))
+}
+
+/// Connections as the listener accepts them, each sending its writes at
+/// once. A reply goes out as several writes, such as a listing's messages
+/// and trailers, and Nagle's algorithm would hold each for the client's
+/// delayed acknowledgment, 40 ms on Linux. The server builder's own
+/// setting covers only listeners it binds.
+fn incoming(listener: TcpListener) -> TcpIncoming {
+    TcpIncoming::from(listener).with_nodelay(Some(true))
 }
 
 /// A server on a free local port, for tests and tools. It runs on a
@@ -254,5 +262,27 @@ pub async fn start_with<S: Storage + Clone>(
         shutdown: Some(shutdown),
         task,
         runtime: Some(runtime),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn accepted_connections_send_at_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let addr = listener.local_addr().expect("bound");
+        let mut accepted = incoming(listener);
+        let _client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connects");
+        let stream = accepted
+            .next()
+            .await
+            .expect("a connection")
+            .expect("accepts");
+        assert!(stream.nodelay().expect("reads the option"));
     }
 }

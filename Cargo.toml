@@ -47,6 +47,7 @@ bytes = "1.10.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 fuser = "0.18.0"
 foundationdb = { version = "0.11.0", default-features = false, features = ["fdb-7_3", "embedded-fdb-include"] }
+futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.4.3"
 hmac = "0.13.0"
 prost = "0.14.4"
@@ -56,7 +57,7 @@ serde = "1.0.229"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 tokio = "1.53.1"
-tokio-stream = { version = "0.1.19", features = ["net"] }
+tokio-stream = "0.1.19"
 toml = "1.1.8"
 tonic = "0.14.9"
 tonic-prost = "0.14.9"

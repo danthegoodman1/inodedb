@@ -4,6 +4,40 @@ Measurements that guide InodeDB's design. Each names its command, so it can be r
 
 Machine: Apple M3 Max (16 cores, 128 GB), macOS 26.6, internal SSD, release build.
 
+## Operations
+
+```console
+scripts/fdb cargo run --release -p inodedb-tests --example ops --features rocksdb,fdb -- 3
+```
+
+Each operation through the gRPC API on Linux: Docker Desktop's VM on the machine above (16 CPUs, 32 GB, Linux 6.10), with each store on the VM's disk and FoundationDB as one process on its memory engine. The server runs on 8 threads and the clients on 8 more, each client on its own connection, waiting for each answer before sending the next. The tree holds 10,000 files of 100 bytes, and a directory of 100 for listings. A server restarted over the store starts cold: 16 clients stat each file once, then read each value once. A put names a new file.
+
+One client, p50 ms:
+
+| Operation | memory | SQLite | RocksDB | FoundationDB |
+| --- | ---: | ---: | ---: | ---: |
+| stat | 0.078 | 0.078 | 0.079 | 0.080 |
+| read a 100-byte value | 0.079 | 0.080 | 0.081 | 0.080 |
+| list 100 entries | 0.147 | 0.144 | 0.145 | 0.148 |
+| put a new 100-byte file | 0.108 | 0.503 | 0.376 | 6.471 |
+| rename a file | 0.096 | 0.452 | 0.351 | 4.681 |
+
+Operations a second, with 16 clients on a cold cache and 64 on a warm one:
+
+| Operation | Clients | memory | SQLite | RocksDB | FoundationDB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| stat, cold cache | 16 | 79,712 | 23,441 | 23,816 | 8,669 |
+| read a value, cold cache | 16 | 97,772 | 40,756 | 41,324 | 24,865 |
+| stat | 64 | 190,879 | 191,414 | 189,888 | 190,273 |
+| read a 100-byte value | 64 | 184,974 | 186,313 | 176,103 | 186,373 |
+| list 100 entries | 64 | 40,341 | 46,474 | 46,814 | 45,089 |
+| put a new 100-byte file | 64 | 45,947 | 15,492 | 30,991 | 5,660 |
+| rename a file | 64 | 47,543 | 15,466 | 31,197 | 5,565 |
+
+- The writer answers reads from its cache, so a warm read costs the same on every backend: about 80 µs, nearly all of it the gRPC round trip, and 190,000 a second once 64 clients share the 16 CPUs. Its p99 stays under 1 ms.
+- A cold read costs a storage read, about 1 ms on FoundationDB. Each query reads on its own, so throughput rises with clients.
+- A write costs a durable commit: about 0.4 ms on the local backends, whose `fsync` here flushes the VM's disk, and 4 to 5 ms on FoundationDB. A put first reads storage to learn its new name is absent, one more round trip. A round sends its keys at once, and batches queued behind one that misses share its round, so with 64 clients groups of about 25 batches commit together and FoundationDB reaches 5,600 writes a second at an 11 ms p50.
+
 ## Group commit
 
 ```console

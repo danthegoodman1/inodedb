@@ -8,7 +8,7 @@
 
 use inodedb_core::Bytes;
 use inodedb_core::ops::{Op, OpSpec, Outcome, PutMode, RenameFlag, Skip};
-use inodedb_core::query::{Query, QueryResult};
+use inodedb_core::query::{Query, QueryResult, Target};
 use inodedb_core::types::{Error, Kind, Path};
 use inodedb_sim::harness::Harness;
 use inodedb_sim::prng::Prng;

@@ -8,10 +8,11 @@ publish.workspace = true
 # Linking needs FoundationDB's client library, so the backend builds only
 # with the `fdb` feature; without it the crate is empty.
 [features]
-fdb = ["dep:foundationdb"]
+fdb = ["dep:foundationdb", "dep:futures-util"]
 
 [dependencies]
 foundationdb = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 inodedb-core.workspace = true
 inodedb-storage.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }

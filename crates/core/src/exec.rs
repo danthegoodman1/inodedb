@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 /// The most reads one run asks for.
-const MAX_READS: usize = 1024;
+pub(crate) const MAX_READS: usize = 1024;
 /// The deepest ancestry a cycle check follows.
 const MAX_DEPTH: usize = 1 << 16;
 

@@ -17,7 +17,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get install -y protobuf-compiler
+      # RocksDB's bindings build against libclang.
+      - run: sudo apt-get install -y protobuf-compiler libclang-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --features rocksdb -- -D warnings
       # Memory, SQLite and RocksDB, for storage and API conformance alike.

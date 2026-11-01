@@ -23,7 +23,7 @@ inodedb-sim = { path = "../crates/sim" }
 inodedb-storage.workspace = true
 inodedb-storage-conformance.workspace = true
 inodedb-storage-rocksdb = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic.workspace = true
 
 [dev-dependencies]

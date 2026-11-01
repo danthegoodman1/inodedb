@@ -14,6 +14,7 @@
 use foundationdb::api::NetworkAutoStop;
 use foundationdb::options::StreamingMode;
 use foundationdb::{Database, FdbError, RangeOption, Transaction};
+use futures_util::future::try_join_all;
 use inodedb_core::keys::{KeyRange, KvRead, KvResult, Pairs};
 use inodedb_core::types::Version;
 use inodedb_storage::{
@@ -216,9 +217,10 @@ impl Storage for Fdb {
 
     async fn snapshot_read(&self, reads: Vec<KvRead>) -> Result<Vec<KvResult>, StorageError> {
         let trx = self.trx()?;
-        let mut results = Vec::with_capacity(reads.len());
-        for read in &reads {
-            results.push(match read {
+        // Every read goes out at once, so a round costs one trip to the
+        // cluster rather than one per key.
+        try_join_all(reads.iter().map(|read| async {
+            Ok(match read {
                 KvRead::Get(key) => KvResult::Get(
                     trx.get(&self.tree(key), true)
                         .await
@@ -228,9 +230,9 @@ impl Storage for Fdb {
                 KvRead::Scan { range, limit } => {
                     KvResult::Scan(self.scan(&trx, range, *limit, true).await?)
                 }
-            });
-        }
-        Ok(results)
+            })
+        }))
+        .await
     }
 
     async fn begin(&self) -> Result<FdbTxn, StorageError> {
