@@ -16,7 +16,7 @@ use inodedb_proto::inode_db_server::InodeDb;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -209,6 +209,65 @@ fn too_many(count: usize, max: usize) -> Result<(), Status> {
 }
 
 type ListStream = Pin<Box<dyn Stream<Item = Result<pb::ListPage, Status>> + Send>>;
+
+/// Where a listing has reached: each page asks the writer for the entries
+/// after the last one sent, at least as new as the page before, in the
+/// directory the first page found, wherever renames take it.
+struct Pages {
+    request: pb::ListRequest,
+    target: Target,
+    after: Option<Vec<u8>>,
+    at: Option<pb::ReadAt>,
+    sent: usize,
+    total: usize,
+}
+
+impl Pages {
+    async fn next(
+        &mut self,
+        engine: &Engine,
+        caller: Caller,
+        scope: &auth::Scope,
+    ) -> Result<pb::ListPage, Status> {
+        let want = PAGE_ENTRIES.min(self.total - self.sent);
+        let query = convert::list_query(
+            &self.request,
+            self.target.clone(),
+            self.after.clone(),
+            want,
+            PAGE_BYTES,
+        )?;
+        let (version, result) = ask(engine, caller, query, self.at).await?;
+        self.at = Some(pb::ReadAt { at_least: version });
+        match result {
+            QueryResult::List { dir, entries, more } => {
+                self.target = Target::Ino(dir);
+                self.sent += entries.len();
+                if let Some(last) = entries.last() {
+                    self.after = Some(last.name.to_vec());
+                }
+                Ok(pb::ListPage {
+                    version,
+                    entries: entries
+                        .into_iter()
+                        .map(|listed| convert::listed(listed, scope))
+                        .collect(),
+                    more: more && self.sent < self.total,
+                    error: None,
+                    dir: Some(scope.handle(dir)),
+                })
+            }
+            QueryResult::Failed(error) => Ok(pb::ListPage {
+                version,
+                entries: Vec::new(),
+                more: false,
+                error: Some(convert::error(error) as i32),
+                dir: None,
+            }),
+            other => Err(Status::internal(format!("unexpected {other:?}"))),
+        }
+    }
+}
 type WatchStream = Pin<Box<dyn Stream<Item = Result<pb::Change, Status>> + Send>>;
 type LeaseStream = Pin<Box<dyn Stream<Item = Result<pb::LeaseState, Status>> + Send>>;
 
@@ -298,7 +357,7 @@ impl InodeDb for Service {
     ) -> Result<Response<ListStream>, Status> {
         let (caller, scope) = self.auth.caller(&request)?;
         let request = request.into_inner();
-        let mut target = match &request.dir {
+        let target = match &request.dir {
             Some(handle) => Target::Ino(scope.check(handle)?),
             None => Target::Path(convert::path(&request.path)?),
         };
@@ -306,81 +365,48 @@ impl InodeDb for Service {
             0 => usize::MAX,
             limit => usize::try_from(limit).unwrap_or(usize::MAX),
         };
-        let (pages, stream) = tokio::sync::mpsc::channel(2);
-        let engine = self.engine.clone();
         let cut = Faults::take(&self.faults.cut_listings);
+        let mut listing = Pages {
+            after: request.after.as_ref().map(|after| after.to_vec()),
+            at: request.at,
+            request,
+            target,
+            sent: 0,
+            total,
+        };
+        // The first page goes out with the response's headers, and a
+        // listing that fits in it, as most do, needs nothing more.
+        let first = listing.next(&self.engine, caller, &scope).await;
+        let more = matches!(&first, Ok(page) if page.more);
+        let first = tokio_stream::once(first);
+        if !more {
+            return Ok(Response::new(Box::pin(first)));
+        }
+        let (pages, rest) = tokio::sync::mpsc::channel(2);
+        let engine = self.engine.clone();
         tokio::spawn(async move {
-            let mut after = request.after.as_ref().map(|after| after.to_vec());
-            let mut sent = 0usize;
-            let mut at = request.at;
+            if cut {
+                let _ = pages
+                    .send(Err(Status::unavailable(
+                        "the listing was cut, as a test asked",
+                    )))
+                    .await;
+                return;
+            }
             loop {
-                let want = PAGE_ENTRIES.min(total - sent);
-                let query =
-                    convert::list_query(&request, target.clone(), after.clone(), want, PAGE_BYTES);
-                let page = match query {
-                    Ok(query) => tokio::select! {
-                        // The client left; stop asking the writer.
-                        () = pages.closed() => return,
-                        answer = ask(&engine, caller, query, at) => answer,
-                    },
-                    Err(status) => Err(status),
+                let page = tokio::select! {
+                    // The client left; stop asking the writer.
+                    () = pages.closed() => return,
+                    page = listing.next(&engine, caller, &scope) => page,
                 };
-                let (version, result) = match page {
-                    Ok(answer) => answer,
-                    Err(status) => {
-                        let _ = pages.send(Err(status)).await;
-                        return;
-                    }
-                };
-                // Later pages are at least as new as this one.
-                at = Some(pb::ReadAt { at_least: version });
-                let page = match result {
-                    QueryResult::List { dir, entries, more } => {
-                        // Later pages follow this directory wherever it goes.
-                        target = Target::Ino(dir);
-                        sent += entries.len();
-                        after = entries.last().map(|listed| listed.name.to_vec()).or(after);
-                        pb::ListPage {
-                            version,
-                            entries: entries
-                                .iter()
-                                .map(|listed| convert::listed(listed, &scope))
-                                .collect(),
-                            more: more && sent < total,
-                            error: None,
-                            dir: Some(scope.handle(dir)),
-                        }
-                    }
-                    QueryResult::Failed(error) => pb::ListPage {
-                        version,
-                        entries: Vec::new(),
-                        more: false,
-                        error: Some(convert::error(error) as i32),
-                        dir: None,
-                    },
-                    other => {
-                        let _ = pages
-                            .send(Err(Status::internal(format!("unexpected {other:?}"))))
-                            .await;
-                        return;
-                    }
-                };
-                let more = page.more;
-                if pages.send(Ok(page)).await.is_err() || !more {
-                    return;
-                }
-                if cut {
-                    let _ = pages
-                        .send(Err(Status::unavailable(
-                            "the listing was cut, as a test asked",
-                        )))
-                        .await;
+                let more = matches!(&page, Ok(page) if page.more);
+                if pages.send(page).await.is_err() || !more {
                     return;
                 }
             }
         });
         Ok(Response::new(Box::pin(
-            tokio_stream::wrappers::ReceiverStream::new(stream),
+            first.chain(tokio_stream::wrappers::ReceiverStream::new(rest)),
         )))
     }
 

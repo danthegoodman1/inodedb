@@ -238,8 +238,8 @@ MUTANTS = [
     ),
     (
         "a listing page drops its last entry",
-        [(SERVICE, "entries: entries\n                                .iter()\n                                .map(|listed| convert::listed(listed, &scope))",
-          "entries: entries\n                                .iter()\n                                .take(entries.len() - usize::from(more))\n                                .map(|listed| convert::listed(listed, &scope))")],
+        [(SERVICE, "entries: entries\n                        .into_iter()\n                        .map(|listed| convert::listed(listed, scope))",
+          "entries: entries\n                        .iter()\n                        .cloned()\n                        .take(entries.len() - usize::from(more))\n                        .map(|listed| convert::listed(listed, scope))")],
     ),
     (
         "a listing page outgrows gRPC's default message limit",
