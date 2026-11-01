@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y protobuf-compiler
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --features rocksdb -- -D warnings
+      # Memory, SQLite and RocksDB, for storage and API conformance alike.
+      - run: cargo test --workspace --features rocksdb
+
+  foundationdb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Storage, API and standby conformance against a FoundationDB server.
+      - run: scripts/fdb
+      # `idb mount` through the kernel's FUSE.
+      - run: scripts/fdb cargo test -p inodedb-cli --features mount --test mount
+
+  simulate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get install -y protobuf-compiler
+      - name: Simulate with the commit hash as the seed
+        run: cargo run --release -p inodedb-sim -- ${{ github.sha }}
+      - name: Sweep 2,000 seeds from the commit hash
+        run: cargo run --release -p inodedb-sim -- ${{ github.sha }} --seeds 2000

@@ -1,0 +1,12 @@
+[package]
+name = "inodedb-storage-sqlite"
+description = "InodeDB's SQLite backend, for development, tests and small single-server deployments."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+inodedb-core.workspace = true
+inodedb-storage.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+tokio = { workspace = true, features = ["sync", "rt"] }

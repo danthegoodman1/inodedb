@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""Plants known bugs, one at a time, in a scratch copy of the workspace and
+reports whether the core's unit tests, the storage conformance suite, the
+server's tests, the API conformance suite, the simulator's tests (scenarios
+and regression seeds) or a seed sweep catch each one.
+
+    scripts/mutants [--seeds N] [--only NAME]... [--check] [--no-baseline]
+
+A mutant is a list of replacements; each must match exactly once, ignoring
+whitespace, so formatting changes leave the mutants intact. The copy lives
+in target/mutants/src and shares one target directory: dependencies build
+once, and every workspace crate rebuilds for each mutant. First the
+unmutated code runs every layer, since a layer that fails without a mutant
+would claim to catch them all. A step that hangs counts as a catch, and is
+killed with every process it started. Exits non-zero if the unmutated code
+fails, or any mutant goes uncaught or fails to build.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+PRNG = "crates/sim/src/prng.rs"
+EXEC = "crates/core/src/exec.rs"
+CACHE = "crates/core/src/cache.rs"
+WRITER = "crates/core/src/writer.rs"
+OVERLAY = "crates/core/src/overlay.rs"
+MEMORY = "crates/storage/src/memory.rs"
+OCC = "crates/storage/src/occ.rs"
+STORAGE = "crates/storage/src/lib.rs"
+SQLITE = "crates/storage-sqlite/src/lib.rs"
+SERVICE = "crates/server/src/service.rs"
+CLIENT = "crates/client/src/lib.rs"
+VIEW = "crates/core/src/view.rs"
+QUERY = "crates/core/src/query.rs"
+FEED = "crates/core/src/feed.rs"
+SERVER_FEED = "crates/server/src/feed.rs"
+AUTH = "crates/server/src/auth.rs"
+CORE_AUTH = "crates/core/src/auth.rs"
+CLIENT_CACHE = "crates/client/src/cache.rs"
+CLIENT_LEASE = "crates/client/src/lease.rs"
+SERVER = "crates/server/src/lib.rs"
+LEASE = "crates/core/src/lease.rs"
+DELTA = "crates/core/src/delta.rs"
+SNAPSHOT = "crates/core/src/snapshot.rs"
+STANDBY = "crates/core/src/standby.rs"
+ENGINE = "crates/server/src/engine.rs"
+FSCK = "crates/core/src/fsck.rs"
+STEP_TIMEOUT = 900
+
+MUTANTS = [
+    (
+        "the PRNG ignores its bound",
+        [(PRNG, "return (product >> 64) as u64;", "return product as u64;")],
+    ),
+    (
+        "a rename skips the cycle check",
+        [(EXEC, "if source.kind == Kind::Dir && self.is_under(to_dir, source.child)? {\n            return fail(Error::Invalid);\n        }\n        // A target directory holding",
+          "// A target directory holding")],
+    ),
+    (
+        "an exchange skips the reverse cycle check",
+        [(EXEC, "if target.kind == Kind::Dir && self.is_under(from_dir, target.child)? {\n            return fail(Error::Invalid);\n        }", "")],
+    ),
+    (
+        "an unlink keeps the file's link count",
+        [(EXEC, "inode.nlink -= 1;\n        inode.version = self.version;\n        if inode.nlink == 0 {",
+          "inode.version = self.version;\n        if inode.nlink == 1 {")],
+    ),
+    (
+        "an op applies though the op it names was skipped",
+        [(EXEC, "Pred::Applied(index) => outcomes.get(*index).is_some_and(Outcome::applied),",
+          "Pred::Applied(index) => *index < outcomes.len(),")],
+    ),
+    (
+        "an all-or-nothing batch applies part of itself",
+        [(EXEC, "if batch.all_or_nothing\n        && let Some(skipped) = first_skip\n    {",
+          "if false\n        && let Some(skipped) = first_skip\n    {")],
+    ),
+    (
+        "a rename onto another link to the same file unlinks it",
+        [(EXEC, "(_, Some(target)) if target.child == source.child => Ok(Some(source.child)),", "")],
+    ),
+    (
+        "a replaced value never reaches the free queue",
+        [(EXEC, "self.free(Freed::Value(entry.child, inode.value), &holders)?;", "let _ = holders;")],
+    ),
+    (
+        "a read straddling commits isn't rebased",
+        [(CACHE, "if read_at == to {\n        return Some(fact);\n    }", "return Some(fact);")],
+    ),
+    (
+        "a batch that changed nothing answers before the groups it saw commit",
+        [(WRITER, "if until <= self.version && self.is_fresh() {\n            self.answer(sub.token, answer);",
+          "if true {\n            self.answer(sub.token, answer);")],
+    ),
+    (
+        "a batch hears back before its group commits",
+        [(WRITER, "self.forming_bytes += bytes;", "self.forming_bytes += bytes; self.answer(sub.token, answer.clone());"),
+         (WRITER, "self.answer(prepared.sub.token, prepared.answer);", "")],
+    ),
+    (
+        "a retry runs again although its record exists",
+        [(WRITER, "Ok(Some(result)) => {\n                    self.hold(result.version, sub.clone(), Answer::Commit(result));\n                    return Ok(());\n                }",
+          "Ok(Some(_)) => {}")],
+    ),
+    (
+        "a retry misses a record still in flight",
+        [(OVERLAY, "Some((_, result)) => Ok(Some(result.clone())),\n            None => self.base.request(id),",
+          "_ => self.base.request(id),")],
+    ),
+    (
+        "a retry of a batch that changed nothing runs again",
+        [(WRITER, "if let Some((_, result)) = self.unchanged.get(&id) {",
+          "if let Some((_, result)) = None::<&(Millis, CommitResult)> {")],
+    ),
+    (
+        "an unknown outcome counts as a failure",
+        [(WRITER, "if outcome == CommitOutcome::Unknown {\n            return self.actions.push(Action::Resolve { id });\n        }",
+          "let outcome = match outcome {\n            CommitOutcome::Unknown => CommitOutcome::Failed,\n            outcome => outcome,\n        };")],
+    ),
+    (
+        "a second transaction goes out while one is in flight",
+        [(WRITER, "if self.in_flight.is_some() {\n            return;\n        }\n        if self.groups.is_empty() {\n            self.close_group();", "if self.groups.is_empty() {\n            self.close_group();")],
+    ),
+    (
+        "a failed group's changes stay",
+        [(WRITER, "self.overlay.clear();\n        // Answers run against", "// Answers run against")],
+    ),
+    (
+        "a failed group drops the answers held behind it",
+        [(WRITER, "requeued.extend(\n            std::mem::take(&mut self.held)\n                .into_iter()\n                .map(|held| held.sub),\n        );", "")],
+    ),
+    (
+        "a resolve ignores which writer committed",
+        [(WRITER, "let outcome = if head.as_deref() == Some(&sending.head.encode()[..]) {",
+          "let outcome = if head.as_deref().map(Head::decode).and_then(Result::ok).is_some_and(|head| head.version == sending.head.version) {")],
+    ),
+    (
+        "request records never expire",
+        [(WRITER, ".take_while(|(at, _)| *at <= self.now)", ".take_while(|_| false)")],
+    ),
+    (
+        "expired records are deleted after the group's writes",
+        [(WRITER, "group.expiring = expiring;\n        for prepared in &group.batches {\n            writes.extend(prepared.writes.clone());\n        }",
+          "group.expiring = expiring;\n        let clears = std::mem::take(&mut writes);\n        for prepared in &group.batches {\n            writes.extend(prepared.writes.clone());\n        }\n        writes.extend(clears);")],
+    ),
+    (
+        "a rename onto a directory holding its source reports the kinds",
+        [(EXEC, "&& self.is_under(from_dir, target.child)?\n        {\n            return fail(Error::NotEmpty);", "&& false\n        {\n            return fail(Error::NotEmpty);")],
+    ),
+    (
+        "a retried commit takes a new request id",
+        [(CLIENT, "request.request_id = request_id();\n        let response = self\n            .retry(|mut rpc| {\n                let request = self.request(request.clone());",
+          "let response = self\n            .retry(|mut rpc| {\n                let mut request = request.clone();\n                request.request_id = request_id();\n                let request = self.request(request);")],
+    ),
+    (
+        "a resumed listing starts over",
+        [(CLIENT, "let after = entries\n                .last()\n                .map(|entry| entry.name.clone())\n                .or_else(|| options.after.clone());",
+          "let after = options.after.clone();")],
+    ),
+    (
+        "a query reads below the version it asked for",
+        [(WRITER, "if waiting.at_least > self.version {\n            let token = waiting.token;", "if false {\n            let token = waiting.token;")],
+    ),
+    (
+        "a listing's budget leaves out values",
+        [(QUERY, "Some(inode) if *values && inode.kind == Kind::File => inode.size as usize,", "Some(_) if false => 0,")],
+    ),
+    (
+        "a layered listing forgets that removals hide base entries",
+        [(VIEW, "let want = limit.saturating_add(removals);", "let want = limit.saturating_add(removals * 0);")],
+    ),
+    (
+        "a cache keeps a name a commit removed",
+        [(CACHE, "cached.entries.insert(name.clone(), change.after);",
+          "if change.after.is_some() { cached.entries.insert(name.clone(), change.after); }")],
+    ),
+    (
+        "a cache keeps a negative entry after a create",
+        [(CACHE, "cached.entries.insert(name.clone(), change.after);",
+          "cached.entries.entry(name.clone()).or_insert(change.after);")],
+    ),
+    (
+        "a directory entering a subtree isn't reported",
+        [(FEED, "entered.push(effect.ino);", "")],
+    ),
+    (
+        "a directory that leaves alive keeps what lies beneath it",
+        [(FEED, "prune = true;", "")],
+    ),
+    (
+        "what leaves a subtree stays cached",
+        [(FEED, "forgot.push((before.child, self.cache.forget_file(before.child)));\n                    if self.root != ROOT {\n                        self.last_forget = change.version;\n                    }", "")],
+    ),
+    (
+        "a read moves forward across a forget",
+        [(FEED, "} else if at >= self.recent_from && at >= self.last_forget {", "} else if at >= self.recent_from {")],
+    ),
+    (
+        "a read newer than the feed fills at once",
+        [(FEED, "if at > self.version {", "if false {")],
+    ),
+    (
+        "chains before a commit come from after it",
+        [(EXEC, "} else {\n                route(self.base, dir)\n            };", "} else {\n                route(&after, dir)\n            };")],
+    ),
+    (
+        "a watch past the truncated log never reports compaction",
+        [(SERVER_FEED, "None => from <= head,", "None => false,")],
+    ),
+    (
+        "eviction drops what a blocked batch read",
+        [(WRITER, ".chain(self.blocked_since)", "")],
+    ),
+    (
+        "a scan includes its end key",
+        [(MEMORY, "Bound::Excluded(range.end.as_slice()),", "Bound::Included(range.end.as_slice()),")],
+    ),
+    (
+        "SQLite reads the log newest first",
+        [(SQLITE, "WHERE version >= ?1 ORDER BY version LIMIT ?2", "WHERE version >= ?1 ORDER BY version DESC LIMIT ?2")],
+    ),
+    (
+        "a transaction over the size limit commits",
+        [(STORAGE, "if total > MAX_TRANSACTION {", "if false {")],
+    ),
+    (
+        "a scan misses an insert into its range",
+        [(OCC, "self.keys.contains(key) || self.ranges.iter().any(|range| range.contains(key))",
+          "self.keys.contains(key)")],
+    ),
+    (
+        "a listing page drops its last entry",
+        [(SERVICE, "entries: entries\n                                .iter()\n                                .map(|listed| convert::listed(listed, &scope))",
+          "entries: entries\n                                .iter()\n                                .take(entries.len() - usize::from(more))\n                                .map(|listed| convert::listed(listed, &scope))")],
+    ),
+    (
+        "a listing page outgrows gRPC's default message limit",
+        [(SERVICE, "const PAGE_BYTES: usize = 3 * 1024 * 1024;", "const PAGE_BYTES: usize = 12 * 1024 * 1024;")],
+    ),
+    (
+        "a read answers more targets than a default message holds",
+        [(SERVICE, "pub const MAX_READ_TARGETS: usize = 60;", "pub const MAX_READ_TARGETS: usize = 90;")],
+    ),
+    (
+        "a request without a key acts as the first admin key",
+        [(AUTH, '.ok_or_else(|| Status::unauthenticated("no key"))?;', '.unwrap_or("0000000000000001.0123456789abcdef");')],
+    ),
+    (
+        "a wrong secret is accepted",
+        [(CORE_AUTH, "if !same(&record.hash, &hash) {", "if false {")],
+    ),
+    (
+        "an expired key still works",
+        [(CORE_AUTH, "if !record.live(now) {", "if false {")],
+    ),
+    (
+        "a handle's MAC goes unchecked",
+        [(AUTH, "if same {", "if true {")],
+    ),
+    (
+        "a read by handle skips the scope check",
+        [(QUERY, "Some(inode) if within(view, root, *ino, &inode)? => Ok((*ino, inode)),", "Some(inode) => Ok((*ino, inode)),")],
+    ),
+    (
+        "Link resolves its target from the tree's root",
+        [(EXEC, "let to_dir = self.walk(to_parents)?;\n        if self.entry(to_dir, to_name)?.is_some() {",
+          "let to_dir = {\n            let mut dir = ROOT;\n            for name in to_parents {\n                match self.entry(dir, name)? {\n                    Some(entry) => dir = entry.child,\n                    None => return fail(Error::NotFound),\n                }\n            }\n            dir\n        };\n        if self.entry(to_dir, to_name)?.is_some() {")],
+    ),
+    (
+        "a minted key outlives its minter",
+        [(EXEC, "if scope.expires != 0 {\n                    expires = expires.min(scope.expires);\n                }", "")],
+    ),
+    (
+        "a key revokes keys it never minted",
+        [(EXEC, "if at == caller {\n                return true;\n            }", "return true;")],
+    ),
+    (
+        "revoking a key leaves the keys it minted",
+        [(EXEC, "stack.extend(self.base.keys_minted_by(id));", "")],
+    ),
+    (
+        "freeing a key's root leaves the key",
+        [(EXEC, "orphans.extend(self.delta.keys_rooted_at(self.base, *ino));", "")],
+    ),
+    (
+        "detaching a key's ancestor leaves the key",
+        [(EXEC, "Ok(true) => {\n                            orphans.insert(id);\n                            break;\n                        }", "Ok(true) => break,")],
+    ),
+    (
+        "a batch runs under a key revoked ahead of it",
+        [(WRITER, "auth::authorize(&view, &sub.caller, self.now, need)", "auth::authorize(&self.cache, &sub.caller, self.now, need)")],
+    ),
+    (
+        "a stream outlives its key",
+        [(SERVER_FEED, ".is_some_and(|key| entry.keys.contains(&(key, None)))", ".is_some_and(|_| false)")],
+    ),
+    (
+        "shutdown waits on open streams",
+        [(SERVER, "close.send_replace(true);", "std::mem::forget(close);")],
+    ),
+    (
+        "a resumed listing finds its directory by path again",
+        [(SERVICE, "Some(handle) => Target::Ino(scope.check(handle)?),", "Some(_) => Target::Path(convert::path(&request.path)?),")],
+    ),
+    (
+        "a watch starts past the version its key was checked at",
+        [(SERVICE, "at_least: request.from.saturating_sub(1).max(1),", "at_least: 1,")],
+    ),
+    (
+        "a stream follows its directory out of its key's tree",
+        [(FEED, "chain.contains(&root) && (scope == ROOT || chain.contains(&scope))", "chain.contains(&root)")],
+    ),
+    (
+        "a revoked key's id mints again",
+        [(EXEC, "base.key(*id).is_some() || base.key_retired(*id)", "base.key(*id).is_some()")],
+    ),
+    (
+        "a request id answers any key that sends it",
+        [(WRITER, "let id = scoped_request(batch.request_id, scope.key);", "let id = batch.request_id;")],
+    ),
+    (
+        "a cache answers after its key is refused",
+        [(CLIENT_CACHE, "state.failed = Some((status.code(), status.message().to_string()));\n    state.root = None;", "let _ = (&mut state, status);")],
+    ),
+    (
+        "an unreadable op is rejected untagged",
+        [(SERVICE, '.map_err(|status| tagged(status, "malformed"))?;', "?;")],
+    ),
+    (
+        "the horizon passes a live lease",
+        [(LEASE, "self.oldest.lowest().unwrap_or(committed).min(committed)", "committed")],
+    ),
+    (
+        "a heartbeat lowers the oldest version",
+        [(LEASE, "if record.oldest < held.record.oldest {", "if record.oldest < held.record.oldest && false {")],
+    ),
+    (
+        "a consumer claims outside its root",
+        [(LEASE, "&& entry.within(root)\n    }", "\n    }")],
+    ),
+    (
+        "a freed inode's record goes before its acknowledgement",
+        [(DELTA, "writes.set(keys::inode(*ino), after.to_bytes())", "if matches!(after.life, crate::types::Life::Freed(_)) { writes.clear(keys::inode(*ino)) } else { writes.set(keys::inode(*ino), after.to_bytes()) }")],
+    ),
+    (
+        "a detach leaves keys rooted inside it working",
+        [(EXEC, "if !self.delta.detached.is_empty() {", "if false {")],
+    ),
+    (
+        "the reaper frees a file linked outside its subtree",
+        [(EXEC, "inode.nlink -= 1;\n        inode.version = self.version;\n        if inode.nlink == 0 {", "inode.nlink -= 1;\n        inode.version = self.version;\n        if inode.nlink == 0 || dir != ROOT {")],
+    ),
+    (
+        "the reaper reads one fact per pass",
+        [(EXEC, "self.prefetch(&listing, needs)?;", "")],
+    ),
+    (
+        "evicting the whole cache drops reads in progress",
+        [(CACHE, "self.evict(spare);\n        self.budget = budget;", "self.evict(u64::MAX);\n        self.budget = budget;")],
+    ),
+    (
+        "truncation passes a live lease's position",
+        [(SERVER_FEED, "age < self.min || (age < self.max && position.is_some_and(|position| version > position))", "age < self.min")],
+    ),
+    (
+        "a lease holds the log past the maximum retention",
+        [(SERVER_FEED, "(age < self.max && position", "(position")],
+    ),
+    (
+        "a snapshot ignores its undo records",
+        [(SNAPSHOT, "let found = match self.undo.entry_at(dir, name, self.at, cut) {", "let found = match None::<Option<Entry>> {")],
+    ),
+    (
+        "a snapshot reads the current state beneath what left",
+        [(SNAPSHOT, "earliest(\n            self.cuts.borrow().get(&ino).copied(),\n            self.undo.left_after(ino, self.at),\n        )", "None")],
+    ),
+    (
+        "removing a directory keeps nothing beneath it for snapshots",
+        [(FEED, "forgot.extend(self.cache.forget_beneath(before.child));", "forgot.push((before.child, self.cache.forget_entries(before.child)));")],
+    ),
+    (
+        "a reopened lease keeps the deletion of its earlier run",
+        [(LEASE, "self.writes.remove(&id);\n            self.insert(", "self.insert(")],
+    ),
+    (
+        "a restarted writer reuses lease ids",
+        [(LEASE, "self.next = self.next.max(release.next_lease);", "")],
+    ),
+    (
+        "claims release past the stored horizon",
+        [(LEASE, "entry.version <= self.stored.horizon", "entry.version <= self.horizon")],
+    ),
+    (
+        "a retried acknowledgement of a whole claim fails",
+        [(LEASE, ".filter(|held| held.expires > now && held.root == root)\n        else {\n            return Err(ClaimError::Unknown);", ".filter(|held| held.expires > now && held.root == root && (keys.is_empty() || !held.entries.is_empty()))\n        else {\n            return Err(ClaimError::Unknown);")],
+    ),
+    (
+        "a claim reads a replaced value through its file",
+        [(QUERY, "Freed::Value(ino, version) => (ino, Some(version)),", "Freed::Value(ino, _) => (ino, None),")],
+    ),
+    (
+        "a starting writer opens leases",
+        [(WRITER, "if self.phase != Phase::Ready {\n            return self.answer(token, Answer::Unavailable);\n        }\n        let id = self.leases.reserve();", "let id = self.leases.reserve();")],
+    ),
+    (
+        "an ended snapshot stops holding its lease",
+        [(SNAPSHOT, "let ended = self.ended.keys().next().copied();", "let ended = None;")],
+    ),
+    (
+        "undo records outgrow their budget",
+        [(FEED, "self.undo.fit(self.budget.undo_bytes);", "")],
+    ),
+    (
+        "a subscriber's oldest version ignores its snapshots",
+        [(FEED, "self.undo.pinned().unwrap_or(self.version)", "self.version")],
+    ),
+    (
+        "the cache's heartbeat ignores its snapshots",
+        [(CLIENT_CACHE, "(state.subscriber.oldest(), state.subscriber.version())", "(state.subscriber.version(), state.subscriber.version())")],
+    ),
+    (
+        "a dropped lease is left to run out",
+        [(CLIENT_LEASE, "runtime.spawn(tokio::time::timeout(RELEASE_WAIT, async move {", "drop(tokio::time::timeout(RELEASE_WAIT, async move {")],
+    ),
+    (
+        "the reaper frees a directory its budget cut short",
+        [(EXEC, "None if freed == REAP_BUDGET => return Ok(()),", "")],
+    ),
+    (
+        "a reap routes to no one who saw its subtree",
+        [(EXEC, "if found.last() == Some(top) {\n                found.extend(above);\n            }", "")],
+    ),
+    (
+        "a reaped record names what lies above its top now",
+        [(EXEC, "if current == *top {\n                found.extend(above);\n                break;\n            }", "")],
+    ),
+    (
+        "a lease opens at the version the cache read",
+        [(CLIENT_CACHE, "Ok(root) => match client.lease_current().await {\n                    Ok(lease) => {\n                        let start = lease.oldest();", "Ok(root) => match client.lease(client.version(), client.version()).await {\n                    Ok(lease) => {\n                        let start = client.version().max(lease.oldest());")],
+    ),
+    (
+        "a commit skips the head check",
+        [(MEMORY, "if state.data.get(&keys::head()).map(Vec::as_slice) != expect {\n            return CommitOutcome::Fenced;\n        }", ""),
+         (STORAGE, "if head.as_deref() != expect {\n        return CommitOutcome::Fenced;\n    }", "")],
+    ),
+    (
+        "a writer answers reads after its lease",
+        [(WRITER, "if !self.is_fresh() {\n            self.stale.push(id);\n            return;\n        }", "")],
+    ),
+    (
+        "a writer answers batches that changed nothing after its lease",
+        [(WRITER, "if until <= self.version && self.is_fresh() {", "if until <= self.version {")],
+    ),
+    (
+        "a writer's lease runs from when its commit returns",
+        [(WRITER, "self.renewed(sending.at);\n        self.prune_acked();", "self.renewed(self.now);\n        self.prune_acked();")],
+    ),
+    (
+        "a takeover waits without the margin",
+        [(WRITER, "self.writer_lease + self.takeover_margin", "self.writer_lease")],
+    ),
+    (
+        "a standby's writer takes over from a head that changed",
+        [(WRITER, "if let Takeover::From(seen) = &self.takeover\n            && *seen != stored\n        {\n            self.stop();\n            return Ok(());\n        }", "")],
+    ),
+    (
+        "a standby answers the newest state",
+        [(STANDBY, "if at_least == 0 {", "if false {")],
+    ),
+    (
+        "a server of a store with standbys writes at once",
+        [(ENGINE, "let role = if standby {", "let role = if false {")],
+    ),
+    (
+        "a feed's changes leave cached links as they were",
+        [(CACHE, "relink(links, ino, *dir, name, change.before, change.after);", "let _ = (links, dir, name);")],
+    ),
+    (
+        "a writer whose lease lapsed answers the claim it scanned",
+        [(WRITER, "if !self.is_fresh() {\n            self.answer(waiting.token, Answer::Unavailable);\n            return Ok(());\n        }", "")]),
+    (
+        "a standby refuses a key newer than the log it has read",
+        [(STANDBY, "Err(Denied::Unknown) => Answer::NotWriter {\n                address: self.address(),\n            },", "")],
+    ),
+    (
+        "any admin key checks the whole store",
+        [(SERVICE, "if scope.root != inodedb_core::types::ROOT {", "if false {")],
+    ),
+    (
+        "a commit carries every pending heartbeat",
+        [(LEASE, "while bytes < budget\n            && let Some((id, record)) = self.writes.pop_first()", "while let Some((id, record)) = self.writes.pop_first()")],
+    ),
+    (
+        "a standby evicts what its reads fetched before their queries run",
+        [(FEED, "self.cache.evict(self.spare);", "self.cache.evict(u64::MAX);")],
+    ),
+    (
+        "a read by inode inside a removed subtree walks up through its old parent",
+        [(QUERY, "Some(Inode {\n                life: Life::Detached(version),\n                ..\n            }) => return detached_within(view, root, version, current),", "")],
+    ),
+    (
+        "a cache takes a value under a version it hasn't reached as absent",
+        [(FEED, "if let Fact::Value(_, version, None) = &fact\n            && *version > at\n        {\n            return;\n        }", ""),
+         (STANDBY, "if let Fact::Value(_, version, None) = &fact\n                && *version > at\n            {\n                after = after.max(*version);\n            }", "")],
+    ),
+    (
+        "a starting writer expires records by other writers' clocks",
+        [(WRITER, "if self.now < self.expiring_from {\n            return Vec::new();\n        }", "")],
+    ),
+    (
+        "a removed directory leaves what lies beneath it cached",
+        [(FEED, "} else {\n                            self.cache.forget_beneath(before.child);\n                        }", "} else {\n                            self.cache.forget_entries(before.child);\n                        }")],
+    ),
+    (
+        "fsck misses a gap in the log",
+        [(FSCK, "if let Some(last) = self.newest\n            && version != last + 1", "if let Some(last) = self.newest\n            && version == 0")],
+    ),
+    (
+        "fsck misses an entry newer than its directory",
+        [(FSCK, "if entry.version > parent.version {", "if false {")],
+    ),
+]
+
+# (layer, package, extra cargo test arguments). A layer runs once its crate exists.
+LAYERS = [
+    ("core unit tests", "inodedb-core", "crates/core", []),
+    ("storage tests", "inodedb-storage", "crates/storage", []),
+    ("storage conformance", "inodedb-storage-conformance", "crates/storage-conformance", []),
+    ("server tests", "inodedb-server", "crates/server", []),
+    ("client tests", "inodedb-client", "crates/client", []),
+    ("CLI tests", "inodedb-cli", "crates/cli", []),
+    ("API conformance", "inodedb-tests", "tests", []),
+    ("sim tests", "inodedb-sim", "crates/sim", []),
+]
+
+
+def main():
+    # SIGTERM unwinds like Ctrl-C, so each step's cleanup runs.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--seeds", type=int, default=300)
+    parser.add_argument("--only", action="append", help="run only this mutant; repeatable")
+    parser.add_argument("--check", action="store_true", help="only check that every mutant applies")
+    parser.add_argument("--no-baseline", action="store_true",
+                        help="skip checking that the unmutated code passes every layer")
+    args = parser.parse_args()
+
+    root = Path(__file__).resolve().parent.parent
+    work = root / "target" / "mutants"
+    copy = work / "src"
+    target = work / "target"
+    results = []
+    if args.check:
+        broken = 0
+        for name, replacements in MUTANTS:
+            if args.only and name not in args.only:
+                continue
+            for path, old, new in replacements:
+                count = len(list(re.finditer(pattern(old), (root / path).read_text())))
+                if count != 1:
+                    print(f"{name}: {count} matches in {path}")
+                    broken += 1
+        sys.exit(1 if broken else 0)
+    # A layer that fails without a mutant would claim to catch every one.
+    if not args.no_baseline:
+        print("== baseline", flush=True)
+        fresh_copy(root, copy)
+        outcome = catch(copy, target, args.seeds)
+        if outcome != "MISSED":
+            sys.exit(f"the unmutated code fails: {outcome}")
+    for name, replacements in MUTANTS:
+        if args.only and name not in args.only:
+            continue
+        print(f"== {name}", flush=True)
+        fresh_copy(root, copy)
+        for path, old, new in replacements:
+            file = copy / path
+            text = file.read_text()
+            matches = list(re.finditer(pattern(old), text))
+            if len(matches) != 1:
+                sys.exit(f"{name}: expected one match in {path}, found {len(matches)}, for:\n{old}")
+            match = matches[0]
+            file.write_text(text[: match.start()] + new + text[match.end() :])
+        outcome = catch(copy, target, args.seeds)
+        print(outcome, flush=True)
+        results.append((name, outcome))
+
+    print()
+    width = max((len(name) for name, _ in results), default=0)
+    for name, outcome in results:
+        print(f"{name:<{width}}  {outcome}")
+    caught = sum(1 for _, outcome in results if outcome.startswith("caught"))
+    print(f"{caught} of {len(results)} caught")
+    if any(outcome in ("MISSED", "did not build") for _, outcome in results):
+        sys.exit(1)
+
+
+def fresh_copy(root, copy):
+    """Copies the tree to `copy`. Fresh modification times make cargo
+    rebuild every workspace crate, so no crate keeps an earlier build."""
+    if copy.exists():
+        shutil.rmtree(copy)
+    shutil.copytree(root, copy, ignore=shutil.ignore_patterns("target", ".git"),
+                    copy_function=shutil.copy)
+
+
+def pattern(old):
+    """A regex for `old` that ignores whitespace."""
+    return r"\s*".join(re.escape(char) for char in old if not char.isspace())
+
+
+def catch(copy, target, seeds):
+    """Which layer catches the mutant, or MISSED."""
+    env = {"CARGO_TARGET_DIR": str(target)}
+    build = run(copy, env, ["cargo", "build", "-q", "--release", "--workspace", "--tests", "--bins"])
+    if build is None or build.returncode != 0:
+        print(build.stderr[-2000:] if build else "build timed out")
+        return "did not build"
+    metadata = run(copy, env, ["cargo", "metadata", "-q", "--format-version", "1", "--no-deps"])
+    if metadata is None or metadata.returncode != 0:
+        return "did not build"
+    members = {package["name"] for package in json.loads(metadata.stdout)["packages"]}
+    layers = [
+        (layer, ["cargo", "test", "-q", "--release", "-p", package, *extra])
+        for layer, package, directory, extra in LAYERS
+        if package in members
+    ]
+    layers.append(("seeds", ["cargo", "run", "-q", "--release", "-p", "inodedb-sim", "--", "0",
+                             "--seeds", str(seeds)]))
+    for layer, command in layers:
+        result = run(copy, env, command)
+        if result is None:
+            return f"caught by {layer} (hung)"
+        if result.returncode != 0:
+            if os.environ.get("MUTANTS_VERBOSE"):
+                print(result.stdout[-3000:], result.stderr[-3000:])
+            summary = next((line for line in result.stdout.splitlines() if " seeds from " in line), "")
+            return f"caught by {layer}" + (f" ({summary})" if summary else "")
+    return "MISSED"
+
+
+def run(cwd, env, command):
+    """The finished process, or None if it ran past the step timeout. The
+    step runs in its own process group, which is killed however the step
+    ends, so a hung test binary never outlives it."""
+    process = subprocess.Popen(command, cwd=cwd, env={**os.environ, **env},
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                               start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=STEP_TIMEOUT)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+if __name__ == "__main__":
+    main()

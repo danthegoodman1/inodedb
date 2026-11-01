@@ -1,0 +1,20 @@
+#!/bin/sh
+# Starts a one-process FoundationDB cluster on the memory engine, waits
+# until it serves, then runs the command it was given.
+set -eu
+mkdir -p /etc/foundationdb /var/fdb/data /var/fdb/logs
+echo "inodedb:test@127.0.0.1:4500" > /etc/foundationdb/fdb.cluster
+fdbserver --listen-address 127.0.0.1:4500 --public-address 127.0.0.1:4500 \
+  --datadir /var/fdb/data --logdir /var/fdb/logs >/var/fdb/server.log 2>&1 &
+fdbcli --exec "configure new single memory" --timeout 30 >/dev/null 2>&1 || true
+tries=0
+until fdbcli --exec status --timeout 5 2>/dev/null | grep -q "Healthy"; do
+  tries=$((tries + 1))
+  if [ "$tries" -gt 60 ]; then
+    echo "FoundationDB never became healthy" >&2
+    cat /var/fdb/server.log >&2
+    exit 1
+  fi
+  sleep 1
+done
+exec "$@"

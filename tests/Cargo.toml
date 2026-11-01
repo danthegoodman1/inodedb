@@ -1,0 +1,31 @@
+[package]
+name = "inodedb-tests"
+description = "API conformance against a running server."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+rocksdb = [
+    "dep:inodedb-storage-rocksdb",
+    "inodedb-server/rocksdb",
+    "inodedb-storage-conformance/rocksdb",
+]
+fdb = ["inodedb-server/fdb", "inodedb-storage-conformance/fdb"]
+
+[dependencies]
+bytes.workspace = true
+inodedb-client.workspace = true
+inodedb-core.workspace = true
+inodedb-proto.workspace = true
+inodedb-server.workspace = true
+inodedb-sim = { path = "../crates/sim" }
+inodedb-storage.workspace = true
+inodedb-storage-conformance.workspace = true
+inodedb-storage-rocksdb = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tonic.workspace = true
+
+[dev-dependencies]
+inodedb-storage-sqlite.workspace = true
+tempfile.workspace = true

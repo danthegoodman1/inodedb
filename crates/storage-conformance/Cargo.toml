@@ -1,0 +1,19 @@
+[package]
+name = "inodedb-storage-conformance"
+description = "The storage contract as tests generic over a backend."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+rocksdb = ["dep:inodedb-storage-rocksdb"]
+fdb = ["dep:inodedb-storage-fdb", "inodedb-storage-fdb/fdb"]
+
+[dependencies]
+inodedb-core.workspace = true
+inodedb-storage.workspace = true
+inodedb-storage-fdb = { workspace = true, optional = true }
+inodedb-storage-rocksdb = { workspace = true, optional = true }
+inodedb-storage-sqlite.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

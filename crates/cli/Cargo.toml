@@ -1,0 +1,29 @@
+[package]
+name = "inodedb-cli"
+description = "idb: InodeDB from the shell."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "idb"
+path = "src/main.rs"
+
+[features]
+# `idb mount`, which needs FUSE: fusermount3 on Linux, macFUSE on macOS.
+mount = ["dep:fuser", "dep:tonic"]
+
+[dependencies]
+clap.workspace = true
+fuser = { workspace = true, optional = true }
+inodedb-client.workspace = true
+inodedb-core.workspace = true
+inodedb-storage.workspace = true
+inodedb-storage-sqlite.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+tonic = { workspace = true, optional = true }
+
+[dev-dependencies]
+inodedb-server.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util"] }

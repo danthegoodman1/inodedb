@@ -1,0 +1,23 @@
+#!/bin/sh
+# Runs a command beside a one-process FoundationDB cluster in a Linux
+# container that can mount FUSE, from the repository's root, with the build
+# cached in Docker volumes.
+#
+#     scripts/fdb                  # storage and API conformance on FoundationDB
+#     scripts/fdb cargo test ...   # any other command, such as
+#     scripts/fdb cargo test -p inodedb-cli --features mount
+set -eu
+version=7.3.79
+image="inodedb-fdb:$version"
+root=$(cd "$(dirname "$0")/.." && pwd)
+docker build -q -t "$image" --build-arg "FDB_VERSION=$version" "$root/scripts/fdb.d" >/dev/null
+if [ "$#" -eq 0 ]; then
+  set -- sh -c 'cargo test --release -p inodedb-storage-conformance --features fdb --test fdb \
+    && cargo test --release -p inodedb-tests --features fdb --test fdb'
+fi
+exec docker run --rm \
+  --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
+  -v "$root:/src" -w /src \
+  -v inodedb-fdb-target:/target -e CARGO_TARGET_DIR=/target \
+  -v inodedb-fdb-cargo:/usr/local/cargo/registry \
+  "$image" "$@"

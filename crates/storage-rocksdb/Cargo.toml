@@ -1,0 +1,12 @@
+[package]
+name = "inodedb-storage-rocksdb"
+description = "InodeDB's RocksDB backend, for single-server deployments."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+inodedb-core.workspace = true
+inodedb-storage.workspace = true
+rocksdb.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }

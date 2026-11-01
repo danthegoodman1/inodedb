@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cli",
+    "crates/client",
+    "crates/core",
+    "crates/proto",
+    "crates/server",
+    "crates/sim",
+    "crates/storage",
+    "crates/storage-conformance",
+    "crates/storage-fdb",
+    "crates/storage-rocksdb",
+    "crates/storage-sqlite",
+    "tests",
+]
+# RocksDB links a C++ library; `--workspace` builds it, a plain build skips it.
+default-members = [
+    "crates/cli",
+    "crates/client",
+    "crates/core",
+    "crates/proto",
+    "crates/server",
+    "crates/sim",
+    "crates/storage",
+    "crates/storage-conformance",
+    "crates/storage-sqlite",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+inodedb-client = { path = "crates/client" }
+inodedb-core = { path = "crates/core" }
+inodedb-proto = { path = "crates/proto" }
+inodedb-server = { path = "crates/server" }
+inodedb-storage = { path = "crates/storage" }
+inodedb-storage-rocksdb = { path = "crates/storage-rocksdb" }
+inodedb-storage-conformance = { path = "crates/storage-conformance" }
+inodedb-storage-fdb = { path = "crates/storage-fdb" }
+inodedb-storage-sqlite = { path = "crates/storage-sqlite" }
+bytes = "1.10.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+fuser = "0.18.0"
+foundationdb = { version = "0.11.0", default-features = false, features = ["fdb-7_3", "embedded-fdb-include"] }
+getrandom = "0.4.3"
+hmac = "0.13.0"
+prost = "0.14.4"
+rocksdb = { version = "0.25.0", default-features = false, features = ["lz4"] }
+rusqlite = "0.41.1"
+serde = "1.0.229"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+tokio = "1.53.1"
+tokio-stream = { version = "0.1.19", features = ["net"] }
+toml = "1.1.8"
+tonic = "0.14.9"
+tonic-prost = "0.14.9"
+tonic-prost-build = "0.14.9"
+xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+
+[profile.release]
+debug = "line-tables-only"

@@ -1,0 +1,17 @@
+[package]
+name = "inodedb-storage-fdb"
+description = "InodeDB's FoundationDB backend, for replicated deployments with standbys."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Linking needs FoundationDB's client library, so the backend builds only
+# with the `fdb` feature; without it the crate is empty.
+[features]
+fdb = ["dep:foundationdb"]
+
+[dependencies]
+foundationdb = { workspace = true, optional = true }
+inodedb-core.workspace = true
+inodedb-storage.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }

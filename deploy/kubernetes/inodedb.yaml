@@ -1,0 +1,113 @@
+# InodeDB on FoundationDB: three servers, each a standby until the head
+# record goes unrenewed, so one writes and two stand by. Clients connect to
+# the `inodedb` service; a standby answers reads at a version and sends the
+# rest to the writer, by the address each server advertises through the
+# `inodedb-pods` service. Needs the `fdb-cluster` ConfigMap, which fdb.yaml
+# makes, and an `inodedb-key` Secret holding the first admin key:
+#
+#     kubectl create secret generic inodedb-key \
+#       --from-literal=key="$(openssl rand -hex 8).$(openssl rand -hex 16)"
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inodedb
+data:
+  inodedb.toml: |
+    listen = "0.0.0.0:7070"
+
+    [storage]
+    backend = "fdb"
+    cluster_file = "/var/inodedb/fdb.cluster"
+    prefix = "inodedb"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inodedb
+spec:
+  selector:
+    app: inodedb
+  ports:
+    - name: grpc
+      port: 7070
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inodedb-pods
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: inodedb
+  ports:
+    - name: grpc
+      port: 7070
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: inodedb
+spec:
+  serviceName: inodedb-pods
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: inodedb
+  template:
+    metadata:
+      labels:
+        app: inodedb
+    spec:
+      # Shutdown waits up to 20 seconds for requests, then for the writer.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: inodedb
+          image: inodedb:dev
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              cp /etc/fdb/fdb.cluster /var/inodedb/fdb.cluster
+              exec inodedb --config /etc/inodedb/inodedb.toml --init-key /etc/inodedb-key/key
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: INODEDB_ADVERTISE
+              value: "http://$(POD_NAME).inodedb-pods.$(POD_NAMESPACE).svc.cluster.local:7070"
+          ports:
+            - name: grpc
+              containerPort: 7070
+          # A server listens only once it has loaded the store, as writer
+          # or standby, so a connection means it answers.
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+          volumeMounts:
+            - name: config
+              mountPath: /etc/inodedb
+            - name: fdb-cluster
+              mountPath: /etc/fdb
+            - name: key
+              mountPath: /etc/inodedb-key
+            - name: state
+              mountPath: /var/inodedb
+      volumes:
+        - name: config
+          configMap:
+            name: inodedb
+        - name: fdb-cluster
+          configMap:
+            name: fdb-cluster
+        - name: key
+          secret:
+            secretName: inodedb-key
+        - name: state
+          emptyDir: {}

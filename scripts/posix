@@ -1,0 +1,15 @@
+#!/bin/sh
+# Runs the POSIX differential test on Linux, whose error order InodeDB
+# follows, in Docker. Named volumes keep the toolchain, crates and build
+# between runs.
+set -eu
+root=$(cd "$(dirname "$0")/.." && pwd)
+exec docker run --rm \
+    -v "$root":/src:ro \
+    -v inodedb-posix-target:/target \
+    -v inodedb-posix-cargo:/usr/local/cargo/registry \
+    -v inodedb-posix-rustup:/usr/local/rustup \
+    -e CARGO_TARGET_DIR=/target \
+    -w /src \
+    rust:1-bookworm \
+    cargo test --locked -p inodedb-sim --test posix "$@"
