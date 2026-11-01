@@ -63,3 +63,12 @@ fn seed_75494() {
 fn seed_97619() {
     passes(97619);
 }
+
+/// The model forgot that a file unlinked outside a detached subtree was
+/// still held by a link inside it, so it refused a key above that link the
+/// stat by inode the core rightly answered once freeing the subtree freed
+/// the file.
+#[test]
+fn seed_7638357803986486160() {
+    passes(7638357803986486160);
+}

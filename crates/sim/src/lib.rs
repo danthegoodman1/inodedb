@@ -2483,15 +2483,21 @@ impl Simulator {
                 "version {version} commits after model version {at}"
             )));
         }
-        // Freeing a detached subtree removes the links inside it.
+        // Freeing a detached subtree removes the links inside it. A file
+        // that keeps a name outside is reached through that name alone.
         for effect in &entry.entries {
             if let (Some(before), None) = (effect.before, effect.after)
                 && before.kind == Kind::File
-                && let Some(node) = self.mapping.node(before.child)
-                && let Some(node) = model.nodes.get_mut(&node)
+                && let Some(id) = self.mapping.node(before.child)
             {
-                node.detached_links = node.detached_links.saturating_sub(1);
-                node.version = version;
+                let named = !model.paths_of(id).is_empty();
+                if let Some(node) = model.nodes.get_mut(&id) {
+                    node.detached_links = node.detached_links.saturating_sub(1);
+                    node.version = version;
+                    if node.detached_links == 0 && named {
+                        node.detached_under.clear();
+                    }
+                }
             }
         }
         let reached = entry.entries.iter().map(|effect| effect.dir).find(|ino| {
@@ -2887,11 +2893,15 @@ impl Simulator {
                 ModelAnswer::Failed(Error::NotFound)
             } else {
                 // A file unlinked, or a directory removed, reads by inode
-                // until it is freed, for keys above a name it last had; one
-                // not yet made doesn't.
+                // until it is freed, for keys above a name it last had or a
+                // link of it that a removed subtree held; one not yet made
+                // doesn't.
                 let root_node = model.node_at_path(&root);
                 let reached = model.nodes.get(&node).filter(|known| {
-                    key.is_none() || root_node.is_some_and(|top| known.lost_under.contains(&top))
+                    key.is_none()
+                        || root_node.is_some_and(|top| {
+                            known.lost_under.contains(&top) || known.detached_under.contains(&top)
+                        })
                 });
                 return match (result, reached) {
                     (QueryResult::Failed(Error::NotFound), _) => Ok(()),

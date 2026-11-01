@@ -5,8 +5,8 @@
 use inodedb_core::Bytes;
 use inodedb_core::keys::{self, KvWrite, Parsed, WriteSet};
 use inodedb_core::ops::{Batch, CommitResult, Op, OpSpec, Outcome, PutMode, Skip};
-use inodedb_core::query::QueryResult;
-use inodedb_core::types::{Error, Millis};
+use inodedb_core::query::{Query, QueryResult, Target};
+use inodedb_core::types::{Error, Ino, Millis, ROOT};
 use inodedb_core::writer::{Action, Answer, CommitOutcome, Config, Head, Token, Writer};
 use inodedb_sim::harness::*;
 use inodedb_storage::Memory;
@@ -98,6 +98,26 @@ impl Driver {
             },
         );
         token
+    }
+
+    /// Runs a query for a caller trusted at `root`, carrying out its reads.
+    fn query(&mut self, root: Ino, query: Query) -> QueryResult {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.writer
+            .query(token, inodedb_core::auth::Caller::Trusted(root), query, 0);
+        self.pump();
+        match self.answers.remove(&token) {
+            Some(Answer::Query { result, .. }) => result,
+            other => panic!("token {token}: {other:?}"),
+        }
+    }
+
+    fn ino(&mut self, path: &str) -> Ino {
+        match self.query(ROOT, Query::Stat(Target::Path(p(path)))) {
+            QueryResult::Stat { ino, .. } => ino,
+            other => panic!("{path}: {other:?}"),
+        }
     }
 
     fn submit_batch(&mut self, batch: Batch) -> Token {
@@ -581,4 +601,29 @@ fn reading_ahead_runs_a_bounded_number_of_ops_a_round() {
         assert!(d.committed(token).committed);
     }
     assert!(d.fsck().is_empty(), "{:?}", d.fsck());
+}
+
+/// A read by inode inside a detached subtree reaches what the directories
+/// above it held as it detached, not those above where they have moved
+/// since.
+#[test]
+fn a_detached_subtree_stays_within_the_directories_above_it_as_it_detached() {
+    let mut d = Driver::new(Memory::new(), Config::default(), 1);
+    d.submit([mkdir_p("p/t"), put("p/t/f", "v"), mkdir("q")]);
+    d.settle(true, CommitOutcome::Committed);
+    let (p_ino, q, f) = (d.ino("p"), d.ino("q"), d.ino("p/t/f"));
+    d.submit([remove_all("p/t"), mv("p", "q/p")]);
+    d.settle(true, CommitOutcome::Committed);
+    // The freeing waits behind the commit in flight, so f stays detached.
+    assert_eq!(d.commits.len(), 1, "the freeing's commit is held");
+    let stat = Query::Stat(Target::Ino(f));
+    assert!(
+        matches!(d.query(p_ino, stat.clone()), QueryResult::Stat { ino, .. } if ino == f),
+        "p held the subtree as it detached"
+    );
+    assert_eq!(
+        d.query(q, stat),
+        QueryResult::Failed(Error::NotFound),
+        "q came above p only after the subtree detached"
+    );
 }

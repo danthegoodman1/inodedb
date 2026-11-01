@@ -20,6 +20,10 @@ pub struct Node {
     pub value: Bytes,
     /// Links inside subtrees that `RemoveAll` detached.
     pub detached_links: u32,
+    /// The directories above those links as each detached: while they
+    /// hold it, or once freeing the last of them freed it, they bound who
+    /// reaches it by inode.
+    pub detached_under: Vec<NodeId>,
     /// The directories above the names it lost at `lost_at`, the version
     /// it last lost one: once it has no name, they bound who reaches it by
     /// inode.
@@ -70,6 +74,7 @@ impl Model {
                     mode: 0,
                     value: Bytes::new(),
                     detached_links: 0,
+                    detached_under: Vec::new(),
                     lost_under: Vec::new(),
                     lost_at: 0,
                     removed: false,
@@ -198,6 +203,7 @@ impl Model {
                 mode: 0,
                 value,
                 detached_links: 0,
+                detached_under: Vec::new(),
                 lost_under: Vec::new(),
                 lost_at: 0,
                 removed: false,
@@ -206,12 +212,17 @@ impl Model {
         id
     }
 
+    /// The directories above `path`'s name.
+    fn above(&self, path: &[Name]) -> Vec<NodeId> {
+        (0..path.len())
+            .filter_map(|depth| self.named(&path[..depth]).map(|named| named.node))
+            .collect()
+    }
+
     /// Removes `path`'s name, keeping it among the names its node lost at
     /// `version`.
     fn drop_name(&mut self, path: &[Name], version: Version) -> Option<Named> {
-        let above: Vec<NodeId> = (0..path.len())
-            .filter_map(|depth| self.named(&path[..depth]).map(|named| named.node))
-            .collect();
+        let above = self.above(path);
         let named = self.paths.remove(path)?;
         let node = self.nodes.get_mut(&named.node).expect("named nodes exist");
         if node.lost_at != version {
@@ -545,13 +556,13 @@ impl Model {
                 // Deepest first, so each name's directories still have
                 // names as it goes.
                 for (doomed_path, doomed_named) in doomed.into_iter().rev() {
+                    let above = self.above(&doomed_path);
                     self.drop_name(&doomed_path, version);
                     if doomed_path.len() > full.len() && self.kind(doomed_named.node) == Kind::File
                     {
-                        self.nodes
-                            .get_mut(&doomed_named.node)
-                            .expect("node exists")
-                            .detached_links += 1;
+                        let node = self.nodes.get_mut(&doomed_named.node).expect("node exists");
+                        node.detached_links += 1;
+                        node.detached_under.extend(above);
                     }
                 }
                 let node = self.nodes.get_mut(&named.node).expect("node exists");
