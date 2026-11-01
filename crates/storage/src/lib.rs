@@ -71,14 +71,29 @@ impl std::error::Error for CommitError {}
 pub trait Storage: Send + Sync + 'static {
     type Txn: Txn;
 
-    /// Runs every read against one committed state.
+    /// Runs every read against one committed state: the latest, or on a
+    /// writer's handle, one at least as new as the handle's latest commit.
     fn snapshot_read(
         &self,
         reads: Vec<KvRead>,
     ) -> impl Future<Output = Result<Vec<KvResult>, StorageError>> + Send;
 
-    /// Begins a transaction at the latest committed state.
+    /// Begins a transaction at the latest committed state, or on a writer's
+    /// handle, at one at least as new as the handle's latest commit.
     fn begin(&self) -> impl Future<Output = Result<Self::Txn, StorageError>> + Send;
+
+    /// A handle for one writer's term. Its reads and transactions may start
+    /// from the state of its latest successful commit, which spares a
+    /// backend from asking for the latest; after a failed commit they start
+    /// from the latest again. The writer's fencing covers what such reads
+    /// miss: a transaction that read state another writer has since changed
+    /// conflicts, and the writer answers reads only within its lease.
+    fn for_writer(&self) -> Self
+    where
+        Self: Clone,
+    {
+        self.clone()
+    }
 
     /// Log entries from version `from` on, in version order.
     fn read_log(

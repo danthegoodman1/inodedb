@@ -504,6 +504,15 @@ impl Clock {
 }
 
 /// A writer's process.
+/// Where a writer's storage handle reads.
+enum Pinned {
+    /// At its latest commit, which is also the latest.
+    Latest,
+    /// At its latest commit, which a later writer's commit has since
+    /// passed.
+    Before(Memory),
+}
+
 struct Proc {
     writer: Writer,
     clock: Clock,
@@ -645,6 +654,11 @@ pub struct Simulator {
     handles: Prng,
     standby_delays: Prng,
     storage: Memory,
+    /// What each writer's storage handle reads, as `Storage::for_writer`
+    /// allows: after a successful commit, the latest, until another
+    /// writer's commit lands and leaves it reading the tree from before.
+    /// A writer absent here, as after a failed commit, reads the latest.
+    pinned: BTreeMap<u64, Pinned>,
     /// Every writer still running, by generation, which is also its id.
     procs: BTreeMap<u64, Proc>,
     /// The writer clients reach: the one the newest committed head names,
@@ -709,6 +723,8 @@ pub struct Summary {
     pub skipped_batches: u64,
     pub queries: u64,
     pub reads: u64,
+    /// Storage reads a writer made from before a later writer's commit.
+    pub pinned_reads: u64,
     pub rejected: u64,
     pub retries: u64,
     pub faults: u64,
@@ -732,7 +748,7 @@ impl fmt::Display for Summary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} commits in {} transactions, {} batches ({} changed nothing, {} rejected), {} queries ({} from standbys), {} storage reads, {} retries ({} given up), {} storage faults, {} crashes, {} cache checks, {} snapshot checks ({} too old), {} leases expired, {} records acknowledged, {} keys ({} requests denied), {} takeovers, {} stalls, {} ticks",
+            "{} commits in {} transactions, {} batches ({} changed nothing, {} rejected), {} queries ({} from standbys), {} storage reads ({} from before a later writer's commit), {} retries ({} given up), {} storage faults, {} crashes, {} cache checks, {} snapshot checks ({} too old), {} leases expired, {} records acknowledged, {} keys ({} requests denied), {} takeovers, {} stalls, {} ticks",
             self.commits,
             self.transactions,
             self.batches,
@@ -741,6 +757,7 @@ impl fmt::Display for Summary {
             self.queries,
             self.standby_queries,
             self.reads,
+            self.pinned_reads,
             self.retries,
             self.given_up,
             self.faults,
@@ -838,6 +855,7 @@ impl Simulator {
             handles: Prng::stream(seed, "handles"),
             standby_delays: Prng::stream(seed, "standby delays"),
             storage: Memory::new(),
+            pinned: BTreeMap::new(),
             procs: BTreeMap::from([(
                 1,
                 Proc {
@@ -1041,7 +1059,13 @@ impl Simulator {
                 id,
                 reads,
             } => {
-                let results = self.storage.read_now(&reads);
+                let results = match self.pinned.get(&generation) {
+                    Some(Pinned::Before(tree)) => {
+                        self.summary.pinned_reads += 1;
+                        tree.read_now(&reads)
+                    }
+                    _ => self.storage.read_now(&reads),
+                };
                 self.summary.reads += 1;
                 let delay = self.storage_delay();
                 self.schedule(
@@ -1069,7 +1093,25 @@ impl Simulator {
                 writes,
             } => {
                 let before = self.storage.head_now();
+                let others = self.pinned.iter().any(|(other, pinned)| {
+                    *other != generation && matches!(pinned, Pinned::Latest)
+                });
+                let tree = others.then(|| self.storage.copy_now());
                 let outcome = self.store(expect.as_deref(), &writes)?;
+                if let Some(tree) = tree
+                    && self.storage.head_now() != before
+                {
+                    for (other, pinned) in &mut self.pinned {
+                        if *other != generation && matches!(pinned, Pinned::Latest) {
+                            *pinned = Pinned::Before(tree.clone());
+                        }
+                    }
+                }
+                if outcome == CommitOutcome::Committed {
+                    self.pinned.insert(generation, Pinned::Latest);
+                } else {
+                    self.pinned.remove(&generation);
+                }
                 self.landed(generation, before)?;
                 let delay = self.storage_delay();
                 self.schedule(
@@ -1091,6 +1133,8 @@ impl Simulator {
                 }
             }
             Event::StorageResolve { generation, id } => {
+                // Resolving commits the head back once it reads the latest.
+                self.pinned.insert(generation, Pinned::Latest);
                 let head = self.storage.head_now();
                 let delay = self.storage_delay();
                 self.schedule(
@@ -2133,6 +2177,7 @@ impl Simulator {
     fn crash(&mut self) -> Result<(), Failure> {
         let dead = self.current;
         self.procs.remove(&dead);
+        self.pinned.remove(&dead);
         self.summary.crashes += 1;
         for (key, event) in std::mem::take(&mut self.events) {
             match event {

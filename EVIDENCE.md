@@ -25,7 +25,7 @@ Notation:
 | P8 Key scope | `check_query`, `durable` (a commit revokes exactly the keys whose roots it removed), `answer` | Write keys minted by the root; stats by inode outside a key's root |
 | P9 Truncation positions | `check_positions` against the simulator's record of live leases | The simulator truncates no log |
 
-Faults the simulator injects: unknown outcomes, storage latency and stalls, writer crashes mid-group, network delay, loss, duplication and reordering of client requests, client cut-offs, cut watch streams, and clock drift of up to 9% against a margin of 20% of the lease.
+Faults the simulator injects: unknown outcomes, storage latency and stalls, an old writer's reads from before its successor's commits, writer crashes mid-group, network delay, loss, duplication and reordering of client requests, client cut-offs, cut watch streams, and clock drift of up to 9% against a margin of 20% of the lease.
 
 ## Data model and operations
 
@@ -76,6 +76,7 @@ Faults the simulator injects: unknown outcomes, storage latency and stalls, writ
 | Contract: order, isolation, conflicts, log, unknown outcomes, durability | `sc::*` on every backend; M"a scan misses an insert into its range", M"a commit skips the head check" |
 | Group commit, one transaction in flight, answers after commit | `groups::*`, `api::concurrent_commits_all_apply`, P2; M"a batch hears back before its group commits" |
 | Batches queued behind a miss read in its round, up to 1,024 ops | `groups::{queued_batches_that_miss_the_cache_read_together, reading_ahead_runs_a_bounded_number_of_ops_a_round}`; M"batches queued behind a miss read one at a time", M"reading ahead runs the whole queue every round" |
+| A writer's handle reads from its latest commit until one of its commits fails; standbys read the latest | `sc::a_writers_handle_reads_its_commits` on every backend, `sc::a_writers_handle_reads_from_its_latest_commit` on FoundationDB (`scripts/fdb`), P1 and P4 with the simulator's pinned reads; M"a writer answers reads after its lease" |
 | Unknown outcomes resolve through the head | `groups::{an_unknown_commit_that_applied_is_answered_as_committed, an_unknown_commit_that_did_not_apply_runs_again}`; M"an unknown outcome counts as a failure" |
 | Renewal, takeover after lease and margin, drifting clocks | `standby::*`, `core/standby::a_standby_waits_for_the_head_to_go_unchanged`, P4; M"a takeover waits without the margin", M"a writer answers reads after its lease" |
 | Standbys: `AtLeast` reads, unknown keys to the writer, warm takeover, small caches, value versions ahead of the log | `standby::{a_standby_with_a_small_cache_answers_under_steady_writes, a_standby_waits_for_a_value_version_it_hasnt_reached}` and the rest of `standby::*`, `api-sb::*`, P1 and P5 through standbys in the swarm; M"a standby refuses a key newer than the log it has read", M"a standby evicts what its reads fetched before their queries run", M"a cache takes a value under a version it hasn't reached as absent" |
@@ -101,4 +102,5 @@ Faults the simulator injects: unknown outcomes, storage latency and stalls, writ
 - The snapshot miss path that waits for the feed never runs.
 - Releasing the writer lease on a graceful shutdown is unbuilt, so a planned restart costs the lease plus the margin.
 - `idb mount` on macOS is untested.
+- FoundationDB's backend has no planted bugs, since `scripts/mutants` runs without a cluster; `scripts/fdb` runs its conformance and API suites.
 - The server's clocks across a sleeping host or a stepped wall clock, a check racing truncation, a claim cursor after an `Unavailable` claim, and redirect backoff have no test.

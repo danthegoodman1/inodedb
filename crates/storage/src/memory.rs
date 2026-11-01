@@ -127,6 +127,13 @@ impl Memory {
         self.state().read(reads)
     }
 
+    /// A copy of the tree as it stands, which later commits leave as it is.
+    pub fn copy_now(&self) -> Memory {
+        let copy = Memory::new();
+        copy.state().data = self.state().data.clone();
+        copy
+    }
+
     /// Checks the head record and applies a writer's commit at once.
     pub fn commit_now(&self, expect: Option<&[u8]>, writes: &WriteSet) -> CommitOutcome {
         let mut state = self.state();

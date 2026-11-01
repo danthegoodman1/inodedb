@@ -373,6 +373,9 @@ enum Role {
 /// The engine's task state.
 struct Node<S> {
     storage: S,
+    /// The writer's handle for its term, made anew at each takeover, so a
+    /// follower never reads through a former writer's.
+    writing: S,
     config: Config,
     /// Whether the store admits standbys, so a fenced writer follows again
     /// rather than stopping.
@@ -443,6 +446,7 @@ impl<S: Storage + Clone> Node<S> {
         if let Some(task) = self.following.take() {
             task.abort();
         }
+        self.writing = self.storage.for_writer();
         self.role = Role::Write(Box::new(writer));
     }
 
@@ -652,18 +656,22 @@ impl<S: Storage + Clone> Node<S> {
             if actions.is_empty() {
                 return;
             }
+            let storage = match &self.role {
+                Role::Write(_) => &self.writing,
+                Role::Follow(_) => &self.storage,
+            };
             for action in actions {
                 let era = self.era;
                 match action {
                     Action::Read { id, reads } => {
-                        let (storage, commands) = (self.storage.clone(), self.commands.clone());
+                        let (storage, commands) = (storage.clone(), self.commands.clone());
                         tokio::spawn(async move {
                             let results = persist(|| storage.snapshot_read(reads.clone())).await;
                             report(commands, Command::ReadDone { era, id, results }).await;
                         });
                     }
                     Action::Commit { id, expect, writes } => {
-                        let (storage, commands) = (self.storage.clone(), self.commands.clone());
+                        let (storage, commands) = (storage.clone(), self.commands.clone());
                         let failures = self.failures.clone();
                         tokio::spawn(async move {
                             let outcome = commit(&storage, expect, writes, &failures).await;
@@ -671,7 +679,7 @@ impl<S: Storage + Clone> Node<S> {
                         });
                     }
                     Action::Resolve { id } => {
-                        let (storage, commands) = (self.storage.clone(), self.commands.clone());
+                        let (storage, commands) = (storage.clone(), self.commands.clone());
                         tokio::spawn(async move {
                             let head = persist(|| inodedb_storage::resolve(&storage)).await;
                             report(commands, Command::ResolveDone { era, id, head }).await;
@@ -763,6 +771,7 @@ async fn run<S: Storage + Clone>(
         Role::Write(Box::new(writer(&config, random_secret())))
     };
     let mut node = Node {
+        writing: storage.for_writer(),
         storage,
         config,
         standby,

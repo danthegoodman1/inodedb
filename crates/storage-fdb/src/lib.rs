@@ -7,6 +7,11 @@
 //! are the trait's. `wait_past` watches the newest version's key, which
 //! every transaction that appends to the log sets.
 //!
+//! A writer's handle starts its reads and transactions from the read version
+//! of its latest commit, or of its latest request for one, for up to a
+//! second, so a round of reads or a commit skips asking the cluster for a
+//! read version first.
+//!
 //! The client library runs a network thread per process; `boot` starts it,
 //! and the returned guard stops it when dropped.
 #![cfg(feature = "fdb")]
@@ -21,10 +26,15 @@ use inodedb_storage::{
     CommitError, MAX_KEY, MAX_TRANSACTION, MAX_VALUE, Storage, StorageError, Txn,
 };
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const TREE: u8 = 0x00;
 const LOG: u8 = 0x01;
 const LATEST: u8 = 0x02;
+
+/// How long a writer's handle reuses a read version it knows, well inside
+/// the five seconds FoundationDB keeps old versions readable.
+const REUSE: Duration = Duration::from_secs(1);
 
 /// The longest prefix, which with the tree's byte keeps the trait's keys
 /// within FoundationDB's.
@@ -60,7 +70,12 @@ pub fn boot_for_process() {
 pub struct Fdb {
     db: Arc<Database>,
     prefix: Arc<[u8]>,
+    /// On a writer's handle, a read version that holds every commit the
+    /// handle made, and when the handle learned it.
+    known: Option<Arc<Mutex<Known>>>,
 }
+
+type Known = Option<(i64, Instant)>;
 
 fn unavailable(error: impl std::fmt::Display) -> StorageError {
     StorageError::Unavailable(error.to_string())
@@ -79,6 +94,7 @@ impl Fdb {
         Ok(Fdb {
             db: Arc::new(db),
             prefix: prefix.into(),
+            known: None,
         })
     }
 
@@ -118,8 +134,53 @@ impl Fdb {
         out
     }
 
-    fn trx(&self) -> Result<Transaction, StorageError> {
+    /// A transaction at the latest committed state.
+    fn latest_trx(&self) -> Result<Transaction, StorageError> {
         self.db.create_trx().map_err(unavailable)
+    }
+
+    /// A transaction for the trait's reads and commits: on a writer's
+    /// handle, from a recent read version it knows.
+    async fn trx(&self) -> Result<Transaction, StorageError> {
+        let trx = self.latest_trx()?;
+        let Some(known) = &self.known else {
+            return Ok(trx);
+        };
+        let recent = known
+            .lock()
+            .expect("no thread panics holding the read version")
+            .filter(|(_, at)| at.elapsed() < REUSE);
+        match recent {
+            Some((version, _)) => trx.set_read_version(version),
+            None => {
+                let asked = Instant::now();
+                let version = trx.get_read_version().await.map_err(unavailable)?;
+                self.learn(version, asked);
+            }
+        }
+        Ok(trx)
+    }
+
+    /// Records a read version that holds every commit so far.
+    fn learn(&self, version: i64, at: Instant) {
+        if let Some(known) = &self.known {
+            let mut known = known
+                .lock()
+                .expect("no thread panics holding the read version");
+            if known.is_none_or(|(newest, _)| version > newest) {
+                *known = Some((version, at));
+            }
+        }
+    }
+
+    /// Drops the known read version, so the next transaction asks for the
+    /// latest.
+    fn forget(&self) {
+        if let Some(known) = &self.known {
+            *known
+                .lock()
+                .expect("no thread panics holding the read version") = None;
+        }
     }
 
     /// Up to `limit` pairs of a range of the tree, with the prefix taken
@@ -215,11 +276,18 @@ fn commit_error(error: &FdbError) -> CommitError {
 impl Storage for Fdb {
     type Txn = FdbTxn;
 
+    fn for_writer(&self) -> Fdb {
+        Fdb {
+            known: Some(Arc::default()),
+            ..self.clone()
+        }
+    }
+
     async fn snapshot_read(&self, reads: Vec<KvRead>) -> Result<Vec<KvResult>, StorageError> {
-        let trx = self.trx()?;
+        let trx = self.trx().await?;
         // Every read goes out at once, so a round costs one trip to the
         // cluster rather than one per key.
-        try_join_all(reads.iter().map(|read| async {
+        let results = try_join_all(reads.iter().map(|read| async {
             Ok(match read {
                 KvRead::Get(key) => KvResult::Get(
                     trx.get(&self.tree(key), true)
@@ -232,13 +300,18 @@ impl Storage for Fdb {
                 }
             })
         }))
-        .await
+        .await;
+        // A read version too old to read, among other failures.
+        if results.is_err() {
+            self.forget();
+        }
+        results
     }
 
     async fn begin(&self) -> Result<FdbTxn, StorageError> {
         Ok(FdbTxn {
             store: self.clone(),
-            trx: self.trx()?,
+            trx: self.trx().await?,
             bytes: 0,
             too_large: false,
             latest: None,
@@ -250,7 +323,7 @@ impl Storage for Fdb {
         from: Version,
         limit: usize,
     ) -> Result<Vec<(Version, Vec<u8>)>, StorageError> {
-        let trx = self.trx()?;
+        let trx = self.latest_trx()?;
         let (begin, end) = (self.log(from), self.log_end());
         let mut entries: Vec<(Version, Vec<u8>)> = Vec::new();
         let mut option = Some(RangeOption {
@@ -285,7 +358,7 @@ impl Storage for Fdb {
     async fn wait_past(&self, version: Version) -> Result<Version, StorageError> {
         let key = self.latest_key();
         loop {
-            let trx = self.trx()?;
+            let trx = self.latest_trx()?;
             let latest = self.latest(&trx).await?;
             if latest > version {
                 return Ok(latest);
@@ -299,7 +372,7 @@ impl Storage for Fdb {
     }
 
     async fn truncate_log(&self, below: Version) -> Result<(), StorageError> {
-        let mut trx = self.trx()?;
+        let mut trx = self.latest_trx()?;
         loop {
             trx.clear_range(&self.log(0), &self.log(below));
             match trx.commit().await {
@@ -372,6 +445,7 @@ impl Txn for FdbTxn {
 
     async fn commit(self) -> Result<(), CommitError> {
         if self.too_large || self.bytes > MAX_TRANSACTION {
+            self.store.forget();
             return Err(CommitError::TooLarge);
         }
         if let Some(latest) = self.latest {
@@ -379,8 +453,19 @@ impl Txn for FdbTxn {
                 .set(&self.store.latest_key(), &latest.to_be_bytes());
         }
         match self.trx.commit().await {
-            Ok(_) => Ok(()),
-            Err(error) => Err(commit_error(&error)),
+            Ok(committed) => {
+                // A transaction that wrote nothing reports -1.
+                if let Ok(version) = committed.committed_version()
+                    && version >= 0
+                {
+                    self.store.learn(version, Instant::now());
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.store.forget();
+                Err(commit_error(&error))
+            }
         }
     }
 }

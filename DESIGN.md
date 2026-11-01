@@ -225,8 +225,12 @@ InodeDB's semantics live once, in `core`, above an ordered, transactional key-va
 pub trait Storage: Send + Sync + 'static {
     type Txn: Txn;
 
+    /// Runs every read against one committed state.
+    async fn snapshot_read(&self, reads: Vec<KvRead>) -> Result<Vec<KvResult>, StorageError>;
     /// Begins a transaction at the latest committed state.
     async fn begin(&self) -> Result<Self::Txn, StorageError>;
+    /// A handle for one writer's term, whose reads may start from its latest commit.
+    fn for_writer(&self) -> Self;
     /// Log entries from version `from` on, in version order.
     async fn read_log(&self, from: Version, limit: usize) -> Result<Vec<LogEntry>, StorageError>;
     /// Resolves with the latest version once a commit later than `v` exists.
@@ -252,6 +256,7 @@ The log is keyed by version, so `truncate_log` is one range delete, and the engi
 
 - **Order.** Keys and scans order bytes lexicographically.
 - **Isolation.** Committed transactions are strictly serializable. A commit fails with `Conflict` when another commit, after this transaction began, wrote a key it read or scanned. With one writer, only the fence produces conflicts.
+- **The writer's handle.** The engine makes one with `for_writer` at each takeover. Its reads and transactions start from a state at least as new as its latest successful commit, and from the latest after a failed one. FoundationDB's reuses the read version of its latest commit, or of its latest request for one, for up to a second, so a round of reads or a commit skips a round trip to the cluster; the other backends always read the latest. Fencing covers what such reads miss: a transaction that read state another writer has since changed conflicts, and the writer answers reads only within its lease ([Fencing](#fencing)). Standbys read the latest through the engine's other handle.
 - **The log.** Entries read back in version order.
 - **Unknown outcomes.** `Unknown` means the commit may or may not have applied.
 - **Durability.** A commit is durable before it returns.
@@ -261,7 +266,7 @@ The log is keyed by version, so `truncate_log` is one range delete, and the engi
 
 | Backend | Use | How it keeps the contract |
 |---|---|---|
-| **memory** | Simulator, unit tests | An in-memory multi-version map. Hooks inject unknown outcomes, applied or not, and outages; the simulator adds latency and writer crashes around it. |
+| **memory** | Simulator, unit tests | An ordered map under one lock, with optimistic conflict checks. Hooks inject unknown outcomes, applied or not, and outages; the simulator adds latency and writer crashes around it. |
 | **SQLite** | Local development, tests, small single-server deployments | rusqlite with SQLite bundled, WAL mode, `synchronous = FULL`. Its file lock admits one writing process. |
 | **RocksDB** | Single-server deployments | The log in its own column family, the WAL synced on each commit, and its lock file admitting one process. Behind the `rocksdb` feature. |
 | **FoundationDB** | Replicated deployments, with standbys | A store under one key prefix: the tree beneath `<prefix> 00`, the log beneath `<prefix> 01` in chunks of up to 100,000 bytes keyed by version and chunk number, and the newest logged version at `<prefix> 02`, which `wait_past` watches. Stores share a cluster without touching. Behind the `fdb` feature. |
@@ -294,6 +299,7 @@ Numbers are big-endian, so ranges scan in numeric order. Values sit apart from i
 - byte ordering, ranges, and each limit at and past its bound;
 - read-your-writes within a transaction, and snapshot reads across transactions;
 - conflicts: write skew fails, a scan conflicts with an insert into its range, and a transaction that read the head record fails once another commit changes it;
+- a writer's handle: it reads its own commits, and once another handle commits, it conflicts on what changed and then reads the latest;
 - log order, truncation and `wait_past`;
 - `Unknown` from backends that report it, and durability across close and reopen.
 
@@ -426,7 +432,7 @@ Testing follows s3-accelerator's design: a deterministic core, a simulator that 
 
 One thread runs clients with caches and snapshots, a writer, standbys that follow the log and answer reads at a version, the memory backend, and a network. A standby that takes over hands its cache and waiting reads to its writer. Clients read by path and, for stats, by inode, inside and outside their keys' roots. Each seed draws the number of clients and standbys, the share of clients that only read, the op mix, and the fault rates. Faults:
 
-- **Storage:** unknown outcomes, latency, and stalls long enough for a standby to take over while the old writer still runs.
+- **Storage:** unknown outcomes, latency, and stalls long enough for a standby to take over while the old writer still runs. A writer reads storage as of its latest commit until a commit of its fails, so an old writer reads from before its successor's commits.
 - **Servers:** crashes and restarts mid-group, mid-heartbeat and mid-release.
 - **Network:** delay, loss, duplication, reordering, partitions, cut watch streams.
 - **Clocks:** rate drift within the writer lease's margin.

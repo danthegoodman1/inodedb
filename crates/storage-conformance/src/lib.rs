@@ -28,7 +28,8 @@ macro_rules! conformance {
             byte_order, ranges_and_limits, gets_and_clears, read_your_writes,
             uncommitted_writes_stay_hidden, write_skew_fails, scans_conflict_with_inserts,
             reading_the_head_fences, log_order_and_truncation, wait_past_wakes,
-            limits_hold, durable_across_reopen, commit_and_resolve);
+            limits_hold, durable_across_reopen, commit_and_resolve,
+            a_writers_handle_reads_its_commits);
     };
     (@tests $make:expr; $($check:ident),* $(,)?) => {
         $(
@@ -361,4 +362,36 @@ pub async fn commit_and_resolve<B: Backend>(backend: &mut B) {
         inodedb_storage::resolve(&store).await.expect("resolve"),
         Some(b"h2".to_vec())
     );
+}
+
+/// A writer's handle reads its own commits. Once another handle commits, it
+/// may read from before that commit; then a transaction that read what
+/// changed conflicts, and after the failed commit the handle reads the
+/// latest.
+pub async fn a_writers_handle_reads_its_commits<B: Backend>(backend: &mut B) {
+    let store = backend.fresh();
+    let writer = store.for_writer();
+    put_all(&writer, &[(b"k", b"1")]).await;
+    assert_eq!(get(&writer, b"k").await.as_deref(), Some(&b"1"[..]));
+    put_all(&store, &[(b"k", b"2")]).await;
+    let mut txn = writer.begin().await.expect("begin");
+    let seen = txn.get(&key(b"k")).await.expect("get");
+    txn.set(&key(b"k"), b"3");
+    let after = match (seen.as_deref(), txn.commit().await) {
+        (Some(b"1"), Err(CommitError::Conflict)) => b"2",
+        (Some(b"2"), Ok(())) => b"3",
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(get(&writer, b"k").await.as_deref(), Some(&after[..]));
+}
+
+/// A writer's handle that reuses its latest commit's version reads from
+/// before another handle's later commit. Only FoundationDB's handle does.
+pub async fn a_writers_handle_reads_from_its_latest_commit<B: Backend>(backend: &mut B) {
+    let store = backend.fresh();
+    let writer = store.for_writer();
+    put_all(&writer, &[(b"k", b"1")]).await;
+    put_all(&store, &[(b"k", b"2")]).await;
+    assert_eq!(get(&writer, b"k").await.as_deref(), Some(&b"1"[..]));
+    assert_eq!(get(&store, b"k").await.as_deref(), Some(&b"2"[..]));
 }
