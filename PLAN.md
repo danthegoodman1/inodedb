@@ -55,8 +55,9 @@ Status ledger:
 | Complete | Work | 0B: Clippy restrictions | `crates/core/clippy.toml`, `crates/sim/clippy.toml`; `cargo clippy --workspace --all-targets --features rocksdb -- -D warnings` is clean. |
 | Complete | Work | 0C: Simulator entry point and PRNG | `crates/sim/src/{main,prng}.rs`; `prng::tests::{sequence_is_stable, below_stays_in_bounds, streams_are_independent}`; `cargo run --release -p inodedb-sim -- --seeds N`. |
 | Complete | Work | 0D: Planted-bug tooling | `scripts/mutants`; "the PRNG ignores its bound" is caught by the sim tests. |
-| Blocked | Work | 0E: CI | `.github/workflows/ci.yml` runs fmt, clippy, every test with RocksDB, and a simulation seeded by the commit hash. Blocked by: no commits and no GitHub remote. |
-| Blocked | Gate | CI passes on `main` | Blocked by: 0E. |
+| Complete | Work | 0E: CI | `.github/workflows/ci.yml` on `github.com/danthegoodman1/inodedb` runs fmt, clippy, every test with RocksDB, `scripts/fdb`, and the commit hash's seed plus a 2,000-seed sweep from it. |
+| Complete | Gate | CI passes on `main` | Run 41396101260 passed on 6a7cb2f. |
+| Incomplete | Risk | RocksDB API tests abort at exit | Run 41384872814 on 9407362, a commit that changed only `PLAN.md`: `tests/tests/rocksdb.rs` passed all 43 tests, then printed `pthread lock: Invalid argument` and died of SIGABRT. Likely a RocksDB handle or background thread outliving the process's static teardown. Missing: a reproduction (loop `cargo test -p inodedb-tests --test rocksdb --features rocksdb` on Linux) and a fix. |
 
 ## Phase 1: The Tree
 
@@ -140,7 +141,7 @@ Status ledger:
 | Complete | Work | 2C: SQLite backend | `crates/storage-sqlite`; `crates/storage-conformance/tests/sqlite.rs`. |
 | Complete | Work | 2D: RocksDB backend | `crates/storage-rocksdb`; `crates/storage-conformance/tests/rocksdb.rs` with `--features rocksdb`. |
 | Complete | Work | 2E: Limits on every backend | `limits_hold` on all three backends. |
-| Blocked | Test | 2F: Conformance in CI | `ci.yml` runs `cargo test --workspace --features rocksdb`; passes locally. Blocked by: 0E. |
+| Complete | Test | 2F: Conformance in CI | `ci.yml` runs `cargo test --workspace --features rocksdb` and `scripts/fdb`; run 41396101260 passed. |
 | Complete | Test | Planted bugs for Phase 2 | "a scan includes its end key", "a transaction over the size limit commits", "a scan misses an insert into its range": all caught. |
 | Complete | Gate | Code review | Reviewed with the core; fixes: a commit error after the write reports `Unknown`, and reads run in `spawn_blocking`. |
 
@@ -177,7 +178,7 @@ Status ledger:
 | Complete | Work | S1C: Static admin key | `crates/server/src/auth.rs`; `refuses_bad_requests`. |
 | Complete | Work | S1D: Client without cache | `crates/client/src/{lib,ops,types}.rs`. |
 | Complete | Work | S1E: CLI basics | `crates/cli` (`ls`, `stat`, `cat`, `put`, `mkdir`, `mv`, `rm`, `rmdir`, `ln`); `crates/cli/tests/cli.rs`. |
-| Blocked | Test | S1F: API conformance in CI | `tests/tests/{memory,sqlite,rocksdb}.rs` run the 26 checks of `api_conformance!` and pass locally. Blocked by: 0E. |
+| Complete | Test | S1F: API conformance in CI | `tests/tests/{memory,sqlite,rocksdb}.rs` run `api_conformance!` in `ci.yml`; run 41396101260 passed. |
 | Complete | Test | Planted bugs for S1 | "a listing page drops its last entry", "a listing page outgrows gRPC's default message limit", "a read answers more targets than a default message holds", "a request without a key is accepted", "a wrong key is accepted": all caught. |
 | Complete | Gate | Code review | Review of the server, client and CLI; findings fixed. |
 
@@ -483,6 +484,7 @@ Status ledger:
 | Incomplete | Work | S4H: Warm reads off the engine task | Missing: a profile on Linux of one-client stats (0.3 ms on EC2 against 0.08 ms on the Mac) and of the 64-client ceiling near 235,000/s. |
 | Incomplete | Test | S4I: One-client commit trace | Missing: where a RocksDB or SQLite commit spends 1.35-1.6 ms against a 0.32 ms device sync on EC2. |
 | Complete | Test | Full mutants run after S4G | `scripts/mutants` at 264c9e3: all 137 caught. |
+| Incomplete | Test | Full mutants run after S4J | `scripts/mutants --only` caught the 21 cache and preload mutants at 6a7cb2f. Missing: a full run of all 145, about 3.5 hours on the Mac. |
 | Incomplete | Gate | EC2 benchmarks after S4A-S4F | Missing: a rerun of `scripts/ec2/bench`; `README.md` and `BENCHMARKS.md` show the numbers from before. It should also show why the memory backend's cold reads ran at 28,000-31,000/s there, half SQLite's, when on the Mac they run at 77,000/s, twice SQLite's. |
 
 ## Phase 8: ClickHouse Metadata Type
