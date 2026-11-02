@@ -25,11 +25,12 @@ pub trait Backend {
 macro_rules! conformance {
     ($make:expr) => {
         $crate::conformance!(@tests $make;
-            byte_order, ranges_and_limits, gets_and_clears, read_your_writes,
+            byte_order, ranges_and_limits, large_scans_arrive_whole, gets_and_clears,
+            read_your_writes,
             uncommitted_writes_stay_hidden, write_skew_fails, scans_conflict_with_inserts,
             reading_the_head_fences, log_order_and_truncation, wait_past_wakes,
-            limits_hold, durable_across_reopen, commit_and_resolve,
-            a_writers_handle_reads_its_commits);
+            limits_hold, durable_across_reopen, commit_and_resolve, commit_group_checks_the_head,
+            a_writers_groups_conflict_with_another_writer, a_writers_handle_reads_its_commits);
     };
     (@tests $make:expr; $($check:ident),* $(,)?) => {
         $(
@@ -128,6 +129,28 @@ pub async fn ranges_and_limits<B: Backend>(backend: &mut B) {
         .await
         .is_empty()
     );
+}
+
+/// A scan of more than a store returns at once still returns all of it, in
+/// order: FoundationDB answers a range in batches of about 80 KB.
+pub async fn large_scans_arrive_whole<B: Backend>(backend: &mut B) {
+    let store = backend.fresh();
+    let value = vec![7u8; 16 << 10];
+    let names: Vec<[u8; 4]> = (0..200u32).map(u32::to_be_bytes).collect();
+    let pairs: Vec<(&[u8], &[u8])> = names
+        .iter()
+        .map(|name| (name.as_slice(), value.as_slice()))
+        .collect();
+    put_all(&store, &pairs).await;
+    let range = KeyRange {
+        start: key(b""),
+        end: vec![0x03],
+    };
+    let scanned = scan_all(&store, range.clone(), usize::MAX).await;
+    let keys: Vec<Vec<u8>> = scanned.into_iter().map(|(k, _)| k).collect();
+    let expected: Vec<Vec<u8>> = names.iter().map(|name| key(name)).collect();
+    assert_eq!(keys, expected);
+    assert_eq!(scan_all(&store, range, 150).await.len(), 150, "limits");
 }
 
 pub async fn gets_and_clears<B: Backend>(backend: &mut B) {
@@ -383,6 +406,99 @@ pub async fn a_writers_handle_reads_its_commits<B: Backend>(backend: &mut B) {
         other => panic!("{other:?}"),
     };
     assert_eq!(get(&writer, b"k").await.as_deref(), Some(&after[..]));
+}
+
+/// `commit_group` applies its writes when the head holds what it expects,
+/// applies nothing otherwise, and conflicts with a transaction that read what
+/// it writes.
+pub async fn commit_group_checks_the_head<B: Backend>(backend: &mut B) {
+    let store = backend.fresh();
+    let group = |value: &[u8], head: &[u8], version| {
+        let mut writes = WriteSet::default();
+        writes.set(key(b"k"), value.to_vec());
+        writes.set(keys::head(), head.to_vec());
+        writes.log.push((version, value.to_vec()));
+        std::sync::Arc::new(writes)
+    };
+    assert_eq!(
+        store.commit_group(None, group(b"1", b"h1", 1)).await,
+        CommitOutcome::Committed
+    );
+    assert_eq!(get(&store, b"k").await.as_deref(), Some(&b"1"[..]));
+    let log = store.read_log(1, 10).await.expect("reads the log");
+    assert_eq!(log, vec![(1, b"1".to_vec())]);
+    // A head other than the one it expects means another writer committed.
+    assert_eq!(
+        store.commit_group(None, group(b"2", b"h2", 2)).await,
+        CommitOutcome::Fenced
+    );
+    assert_eq!(
+        store
+            .commit_group(Some(b"other".to_vec()), group(b"2", b"h2", 2))
+            .await,
+        CommitOutcome::Fenced
+    );
+    assert_eq!(get(&store, b"k").await.as_deref(), Some(&b"1"[..]));
+    assert_eq!(store.read_log(2, 10).await.expect("reads the log"), vec![]);
+    // A transaction that read what a group writes conflicts.
+    let mut txn = store.begin().await.expect("begin");
+    txn.get(&key(b"k")).await.expect("get");
+    txn.set(&key(b"other"), b"x");
+    assert_eq!(
+        store
+            .commit_group(Some(b"h1".to_vec()), group(b"3", b"h3", 3))
+            .await,
+        CommitOutcome::Committed
+    );
+    assert!(matches!(txn.commit().await, Err(CommitError::Conflict)));
+    assert_eq!(get(&store, b"other").await, None);
+    // A group past the limits applies nothing.
+    let mut oversized = WriteSet::default();
+    oversized.set(key(b"big"), vec![0; MAX_VALUE + 1]);
+    assert_eq!(
+        store
+            .commit_group(Some(b"h3".to_vec()), std::sync::Arc::new(oversized))
+            .await,
+        CommitOutcome::Failed
+    );
+    assert_eq!(get(&store, b"big").await, None);
+    assert_eq!(get(&store, b"k").await.as_deref(), Some(&b"3"[..]));
+}
+
+/// A writer's handle may skip reading the head it last wrote, so its next group
+/// must still fail once another writer has committed.
+pub async fn a_writers_groups_conflict_with_another_writer<B: Backend>(backend: &mut B) {
+    let store = backend.fresh();
+    let group = |head: &[u8]| {
+        let mut writes = WriteSet::default();
+        writes.set(keys::head(), head.to_vec());
+        std::sync::Arc::new(writes)
+    };
+    let (first, second) = (store.for_writer(), store.for_writer());
+    let expect = |head: &[u8]| Some(head.to_vec());
+    assert_eq!(
+        first.commit_group(None, group(b"h1")).await,
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        first.commit_group(expect(b"h1"), group(b"h2")).await,
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        second.commit_group(expect(b"h2"), group(b"h3")).await,
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        first.commit_group(expect(b"h2"), group(b"h4")).await,
+        CommitOutcome::Fenced
+    );
+    assert_eq!(
+        store
+            .snapshot_read(vec![KvRead::Get(keys::head())])
+            .await
+            .expect("reads"),
+        vec![KvResult::Get(Some(b"h3".to_vec()))]
+    );
 }
 
 /// A writer's handle that reuses its latest commit's version reads from

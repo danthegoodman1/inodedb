@@ -106,7 +106,7 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 
   <div class="card hero" id="ops">
     <div class="hero-head">
-      <h1>InodeDB reads <em>230k</em> times a second from memory on every backend</h1>
+      <h1>InodeDB reads <em>440k</em> times a second from memory on every backend</h1>
       <div class="hero-meta">
         <span><b>gRPC</b> · 64 clients, each on its own connection</span>
         <span>10,000 files of 100 bytes · a warm cache</span>
@@ -121,13 +121,13 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
         <span><i class="sw" style="background:var(--rocksdb)"></i>RocksDB</span>
         <span><i class="sw" style="background:var(--fdb)"></i>FoundationDB</span>
       </div>
-      <span>Writes wait for a durable commit, which batches share. FoundationDB runs as one process.</span>
+      <span>Writes wait for a durable commit, which batches share. FoundationDB runs one process per role.</span>
     </div>
   </div>
 
   <div class="card hero" id="latency">
     <div class="hero-head">
-      <h1>Reads take <em>0.3 ms</em> on every backend, and writes take a commit</h1>
+      <h1>Reads take <em>23 µs</em> on every backend, and writes take a commit</h1>
       <div class="hero-meta">
         <span><b>gRPC</b> · each client on its own connection</span>
         <span>10,000 files of 100 bytes · a warm cache</span>
@@ -148,10 +148,10 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 
   <div class="card hero" id="devices">
     <div class="hero-head">
-      <h1>gp3 syncs <em>7×</em> slower than local NVMe, and grouping keeps puts within 2.4×</h1>
+      <h1>gp3 syncs <em>39×</em> slower than local NVMe, and grouping keeps puts within about 3×</h1>
       <div class="hero-meta">
         <span><b>gp3</b> at its maximum: 80,000 IOPS, 2,000 MiB/s</span>
-        <span>A 4 KiB write and <b>fsync</b>: 322 µs on NVMe, 2,179 µs on gp3</span>
+        <span>An overwritten 4 KiB block and <b>fdatasync</b>: 17 µs on NVMe, 668 µs on gp3</span>
         <span>EC2 i7ie.6xlarge · each store on the device</span>
       </div>
     </div>
@@ -161,7 +161,7 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
         <span><i class="sw" style="background:var(--nvme)"></i>local NVMe</span>
         <span><i class="sw" style="background:var(--gp3)"></i>gp3</span>
       </div>
-      <span>A put creates a new 100-byte file. FoundationDB runs as one process, its data on the device.</span>
+      <span>A put creates a new 100-byte file. FoundationDB runs one process per role, its data on the device.</span>
     </div>
   </div>
 
@@ -171,45 +171,46 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 const D = {
   // BENCHMARKS.md, "Operations", local NVMe: operations a second at 64 clients for memory, SQLite, RocksDB, FoundationDB
   ops: [
-    ["Stat", "by path", 236623, 239433, 237995, 229883],
-    ["Read", "a 100-byte value", 229966, 236875, 236487, 233663],
-    ["List", "100 entries with attributes", 40120, 43614, 43360, 40122],
-    ["Put", "a new 100-byte file", 34881, 13612, 18476, 7310],
-    ["Rename", "a file", 38516, 15289, 20788, 8313],
+    ["Stat", "by path", 440140, 438301, 436641, 436267],
+    ["Read", "a 100-byte value", 433266, 442188, 440804, 433089],
+    ["List", "100 entries with attributes", 171899, 176663, 175845, 182617],
+    ["Put", "a new 100-byte file", 71769, 35985, 62314, 19638],
+    ["Rename", "a file", 81029, 40099, 64141, 18048],
+    ["Mixed", "nine stats for each put", 301852, 252981, 287955, 159879],
   ],
   backends: [["memory", "memory"], ["sqlite", "SQLite"], ["rocksdb", "RocksDB"], ["fdb", "FoundationDB"]],
   // BENCHMARKS.md, "Operations", local NVMe: latency in ms for memory, SQLite, RocksDB, FoundationDB
   latency: [
-    ["Reads", "one client, p50", 0.6, [0, 0.2, 0.4, 0.6], [
-      ["Stat", 0.316, 0.318, 0.130, 0.318],
-      ["Read", 0.338, 0.312, 0.316, 0.333],
-      ["List", 0.458, 0.419, 0.439, 0.465],
+    ["Reads", "one client, p50", 0.08, [0, 0.02, 0.04, 0.06, 0.08], [
+      ["Stat", 0.023, 0.023, 0.023, 0.023],
+      ["Read", 0.023, 0.024, 0.023, 0.023],
+      ["List", 0.062, 0.062, 0.061, 0.062],
     ]],
-    ["Reads", "64 clients, p99", 3, [0, 1, 2, 3], [
-      ["Stat", 0.498, 0.500, 0.559, 0.684],
-      ["Read", 0.604, 0.475, 0.469, 0.497],
-      ["List", 2.254, 1.977, 2.061, 2.238],
+    ["Reads", "64 clients, p99", 1, [0, 0.25, 0.5, 0.75, 1], [
+      ["Stat", 0.242, 0.244, 0.247, 0.248],
+      ["Read", 0.246, 0.238, 0.243, 0.247],
+      ["List", 0.730, 0.704, 0.709, 0.662],
     ]],
-    ["Writes", "one client, p50", 5, [0, 1, 2, 3, 4, 5], [
-      ["Put", 0.408, 1.941, 1.701, 3.933],
-      ["Rename", 0.361, 1.581, 1.499, 3.186],
+    ["Writes", "one client, p50", 1.2, [0, 0.3, 0.6, 0.9, 1.2], [
+      ["Put", 0.046, 0.172, 0.090, 1.004],
+      ["Rename", 0.043, 0.165, 0.095, 1.006],
     ]],
-    ["Writes", "64 clients, p99", 15, [0, 5, 10, 15], [
-      ["Put", 2.835, 8.299, 5.061, 12.174],
-      ["Rename", 2.465, 7.418, 4.626, 11.848],
+    ["Writes", "64 clients, p99", 5, [0, 1, 2, 3, 4, 5], [
+      ["Put", 1.258, 3.753, 1.405, 3.764],
+      ["Rename", 1.036, 2.268, 1.209, 4.185],
     ]],
   ],
   // BENCHMARKS.md, "Operations": puts on local NVMe and on gp3, by backend
   devices: [
-    ["Puts a second", "64 clients", 25000, [0, 5000, 10000, 15000, 20000, 25000], [
-      ["SQLite", 13612, 5718],
-      ["RocksDB", 18476, 10582],
-      ["FoundationDB", 7310, 6052],
+    ["Puts a second", "64 clients", 80000, [0, 20000, 40000, 60000, 80000], [
+      ["SQLite", 35985, 11972],
+      ["RocksDB", 62314, 24504],
+      ["FoundationDB", 19638, 10292],
     ]],
-    ["Put latency", "one client, p50", 8, [0, 2, 4, 6, 8], [
-      ["SQLite", 1.941, 3.747],
-      ["RocksDB", 1.701, 3.342],
-      ["FoundationDB", 3.933, 5.767],
+    ["Put latency", "one client, p50", 2.5, [0, 0.5, 1, 1.5, 2, 2.5], [
+      ["SQLite", 0.172, 1.124],
+      ["RocksDB", 0.090, 0.758],
+      ["FoundationDB", 1.004, 2.220],
     ]],
   ],
 };
@@ -251,7 +252,7 @@ function axis(host, max, ticks, show, caption) {
 
 (function ops() {
   const host = document.getElementById("ops-chart");
-  const MAX = 250000, ticks = [0, 50000, 100000, 150000, 200000, 250000];
+  const MAX = 500000, ticks = [0, 100000, 200000, 300000, 400000, 500000];
   host.append(el("div", "colhead", "Operation"), el("div", "colhead", "Operations a second"));
   rows(host, D.ops.map(([n, s, ...v]) => [n, s, v]), MAX, ticks, fmt);
   axis(host, MAX, ticks, t => t ? t / 1000 + "k" : "0", "Operations a second at 64 clients");

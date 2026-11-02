@@ -4,7 +4,7 @@ reports whether the core's unit tests, the storage conformance suite, the
 server's tests, the API conformance suite, the simulator's tests (scenarios
 and regression seeds) or a seed sweep catch each one.
 
-    scripts/mutants [--seeds N] [--only NAME]... [--check] [--no-baseline]
+    scripts/mutants [--seeds N] [--only NAME]... [--check] [--no-baseline] [--rocksdb] [--fdb]
 
 A mutant is a list of replacements; each must match exactly once, ignoring
 whitespace, so formatting changes leave the mutants intact. The copy lives
@@ -14,6 +14,10 @@ unmutated code runs every layer, since a layer that fails without a mutant
 would claim to catch them all. A step that hangs counts as a catch, and is
 killed with every process it started. Exits non-zero if the unmutated code
 fails, or any mutant goes uncaught or fails to build.
+
+`--rocksdb` and `--fdb` plant the bugs in that backend instead, and try them
+against its conformance suites. FoundationDB's need a cluster:
+`scripts/fdb python3 scripts/mutants --fdb`.
 """
 
 import argparse
@@ -56,6 +60,9 @@ ENGINE = "crates/server/src/engine.rs"
 FSCK = "crates/core/src/fsck.rs"
 PRELOAD = "crates/core/src/preload.rs"
 CONFIG = "crates/server/src/config.rs"
+TRANSPORT = "crates/transport/src/lib.rs"
+FDB = "crates/storage-fdb/src/lib.rs"
+ROCKSDB = "crates/storage-rocksdb/src/lib.rs"
 STEP_TIMEOUT = 900
 
 MUTANTS = [
@@ -152,8 +159,16 @@ MUTANTS = [
     ),
     (
         "expired records are deleted after the group's writes",
-        [(WRITER, "group.expiring = expiring;\n        for prepared in &group.batches {\n            writes.extend(prepared.writes.clone());\n        }",
-          "group.expiring = expiring;\n        let clears = std::mem::take(&mut writes);\n        for prepared in &group.batches {\n            writes.extend(prepared.writes.clone());\n        }\n        writes.extend(clears);")],
+        [(WRITER, """group.expiring = expiring;
+        // A group goes out once: one that fails runs its batches again.
+        for prepared in &mut group.batches {
+            writes.extend(std::mem::take(&mut prepared.writes));
+        }""", """group.expiring = expiring;
+        let clears = std::mem::take(&mut writes);
+        for prepared in &mut group.batches {
+            writes.extend(std::mem::take(&mut prepared.writes));
+        }
+        writes.extend(clears);""")],
     ),
     (
         "a rename onto a directory holding its source reports the kinds",
@@ -282,9 +297,11 @@ MUTANTS = [
     ),
     (
         "a releasing writer answers reads from its cache",
-        [(WRITER, """self.releasing.is_none()
+        [(WRITER, """pub fn is_fresh(&self) -> bool {
+        self.releasing.is_none()
             && self
-                .renewed_at""", """self
+                .renewed_at""", """pub fn is_fresh(&self) -> bool {
+        self
                 .renewed_at""")],
     ),
     (
@@ -302,7 +319,10 @@ MUTANTS = [
     (
         "commits leave the tail empty",
         [(ENGINE, """// Streams find the entries before the writer announces them.
-            tail.extend(&writes.log);""", "")],
+            tail.extend(match Arc::try_unwrap(writes) {
+                Ok(writes) => writes.log,
+                Err(writes) => writes.log.clone(),
+            });""", "")],
     ),
     (
         "a stream caught up with the tail reads storage",
@@ -310,11 +330,11 @@ MUTANTS = [
     ),
     (
         "the tail serves entries truncation may have taken",
-        [(SERVER_FEED, "(now().saturating_sub(entry.time) < self.young).then(|| {", "true.then(|| {")],
+        [(SERVER_FEED, "(now().saturating_sub(entry.time) < self.young).then_some(entries)", "true.then_some(entries)")],
     ),
     (
         "the tail serves across a gap",
-        [(SERVER_FEED, """                Some((last, _, _)) if *version != last + 1 => {
+        [(SERVER_FEED, """                Some((last, _, _)) if version != last + 1 => {
                     tail.held.clear();
                     tail.bytes = 0;
                 }""", "")],
@@ -621,7 +641,7 @@ MUTANTS = [
     ),
     (
         "a server of a store with standbys writes at once",
-        [(ENGINE, "let role = if standby {", "let role = if false {")],
+        [(ENGINE, "let role = Arc::new(RwLock::new(if standby {", "let role = Arc::new(RwLock::new(if false {")],
     ),
     (
         "a feed's changes leave cached links as they were",
@@ -651,7 +671,11 @@ MUTANTS = [
     ),
     (
         "accepted connections wait on Nagle's algorithm",
-        [(SERVER, "TcpIncoming::from(listener).with_nodelay(Some(true))", "TcpIncoming::from(listener)")],
+        [(TRANSPORT, """fn prepare(tcp: &TcpStream) -> std::io::Result<()> {
+    tcp.set_nodelay(true)
+}""", """fn prepare(_: &TcpStream) -> std::io::Result<()> {
+    Ok(())
+}""")],
     ),
     (
         "any admin key checks the whole store",
@@ -676,7 +700,9 @@ MUTANTS = [
     ),
     (
         "a starting writer expires records by other writers' clocks",
-        [(WRITER, "if self.now < self.expiring_from {\n            return Vec::new();\n        }", "")],
+        [(WRITER, """if self.now < self.expiring_from
+            || self.expiries.first().is_none_or(|(at, _)| *at > self.now)
+        {""", """if self.expiries.first().is_none_or(|(at, _)| *at > self.now) {""")],
     ),
     (
         "a removed directory leaves what lies beneath it cached",
@@ -690,6 +716,261 @@ MUTANTS = [
         "fsck misses an entry newer than its directory",
         [(FSCK, "if entry.version > parent.version {", "if false {")],
     ),
+    (
+        "a read the cache holds answers past the writer's lease",
+        [(WRITER, "if self.phase != Phase::Ready || !fresh || at_least > self.version {",
+          "let _ = fresh;\n        if self.phase != Phase::Ready || at_least > self.version {")],
+    ),
+    (
+        "a read the cache holds passes the floor it names",
+        [(WRITER, "if self.phase != Phase::Ready || !fresh || at_least > self.version {",
+          "if self.phase != Phase::Ready || !fresh {")],
+    ),
+    (
+        "a stopped writer answers from its cache",
+        [(WRITER, "if self.phase != Phase::Ready || !fresh || at_least > self.version {",
+          "if !fresh || at_least > self.version {")],
+    ),
+    (
+        "a releasing writer's cached reads go on",
+        [(WRITER, """let fresh = self.releasing.is_none()
+            && self
+                .renewed_at""", """let fresh = self
+                .renewed_at""")],
+    ),
+    (
+        "a read the cache holds reaches past its key's root",
+        [(WRITER, """let result = query::run(&self.cache, scope.root, query).ok()?;
+        Some(Answer::Query {""", """let _ = scope;
+        let result = query::run(&self.cache, ROOT, query).ok()?;
+        Some(Answer::Query {""")],
+    ),
+    (
+        "a read the cache holds reports an older version",
+        [(WRITER, """Some(Answer::Query {
+            version: self.version,
+            result,
+        })""", """Some(Answer::Query {
+            version: self.version.saturating_sub(1),
+            result,
+        })""")],
+    ),
+    (
+        "a refused key reads the cache",
+        [(WRITER, "let scope = auth::authorize(&self.cache, caller, now, Grant::Read).ok()?;",
+          "let scope = auth::authorize(&self.cache, caller, now, Grant::Read).unwrap_or(Scope { root: ROOT, grant: Grant::Admin, expires: 0, key: None });")],
+    ),
+    (
+        "a standby answers the newest state from its cache",
+        [(STANDBY, "if !self.started || at_least == 0 || at_least > version {", "if !self.started || at_least > version {")],
+    ),
+    (
+        "a standby answers from its cache below the floor",
+        [(STANDBY, "if !self.started || at_least == 0 || at_least > version {", "if !self.started || at_least == 0 {")],
+    ),
+    (
+        "reads never answer on the request's task",
+        [(ENGINE, "if let Some(answer) = self.answer_cached(&caller, &query, at_least) {", "if let Some(answer) = None::<Answer> {")],
+    ),
+    (
+        "a dropped server leaves its tasks running",
+        [(SERVER, """if let Some(runtime) = self.runtime.take() {
+            end_runtime(runtime);""", """if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();""")],
+    ),
+    (
+        "a taking over standby drops the answers its burst gave",
+        [(ENGINE, """self.flush(role);
+        let Role::Follow(follower) = std::mem::replace(""", "let Role::Follow(follower) = std::mem::replace(")],
+    ),
+    (
+        "a standby starting over drops the answers its burst gave",
+        [(ENGINE, """self.flush(role);
+        self.era += 1;""", "self.era += 1;")],
+    ),
+    (
+        "a standby's reads of the log leave its tail empty",
+        [(ENGINE, "tail.extend(entries.iter().cloned());", "")],
+    ),
+    (
+        "batches queued together go out one group at a time",
+        [(WRITER, """self.run_queue();
+        self.send_due = true;""", "self.pump();")],
+    ),
+    (
+        "a standby never preloads",
+        [(STANDBY, """if self.config.preload {
+                self.preload_dirs = BTreeSet::from([ROOT]);""", """if false {
+                self.preload_dirs = BTreeSet::from([ROOT]);""")],
+    ),
+    (
+        "a standby's preload passes its budget",
+        [(STANDBY, "if !self.subscriber.cache().has_room(&fact) {", "if false {")],
+    ),
+    (
+        "a preload leaves values out",
+        [(PRELOAD, "_ if !full => Some(Cursor::Values(keys::value_range().start)),", "_ if !full => None,")],
+    ),
+    (
+        "a preload's values pass their budget",
+        [(CACHE, """if let Fact::Value(_, _, value) = fact {
+            return self.value_bytes + value_bytes(value) <= self.budget.value_bytes;
+        }""", "")],
+    ),
+    (
+        "a group on SQLite ignores the head",
+        [(SQLITE, """Ok(head) if head.as_deref() == expect => {}
+        Ok(_) => return CommitOutcome::Fenced,""", "Ok(_) => {}")],
+    ),
+    (
+        "a group past the limits commits on SQLite",
+        [(SQLITE, """if check_limits(&writes.writes, log).is_err() {
+        return CommitOutcome::Failed;
+    }""", "let _ = log;")],
+    ),
+    (
+        "open transactions learn nothing of what SQLite committed",
+        [(SQLITE, ".record(|| writes.iter().map(Written::of).collect());", ".record(Vec::new);")],
+    ),
+    (
+        "SQLite's WAL never goes back to its start",
+        [(SQLITE, "if frames >= WAL_WRAP {", "if false && frames >= WAL_WRAP {")],
+    ),
+    (
+        "SQLite's WAL starts unwritten",
+        [(SQLITE, "write_wal(&path).map_err(unavailable)?;", "let _ = write_wal;")],
+    ),
+    (
+        "a body keeps its flow-control window",
+        [(TRANSPORT, "let _ = this.recv.flow_control().release_capacity(data.len());", "")],
+    ),
+    (
+        "a reply stops short of its trailers",
+        [(TRANSPORT, """Err(frame) => {
+                    if let Ok(trailers) = frame.into_trailers() {
+                        let _ = send.send_trailers(trailers);
+                    }
+                    return;
+                }
+            },
+        }
+    }
+}
+
+#[cfg(test)]""", """Err(_) => return,
+            },
+        }
+    }
+}
+
+#[cfg(test)]""")],
+    ),
+    (
+        "a stream outlives its client",
+        [(TRANSPORT, """if send.poll_reset(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            poll_body(&mut body, cx).map(Some)""", "poll_body(&mut body, cx).map(Some)")],
+    ),
+    (
+        "a failed connection stays in use",
+        [(TRANSPORT, "let connection = self.connection(Some(&connection)).await?;", "")],
+    ),
+    (
+        "the server asks for no particular idle latency",
+        [(SERVER, "file.write_all(&1i32.to_ne_bytes())?;", "file.write_all(&[])?;")],
+    ),
+    (
+        "an attempt ignores its timeout",
+        [(TRANSPORT, """let text = headers.get("grpc-timeout")?.to_str().ok()?;""", """let text = headers.get("no-such-header")?.to_str().ok()?;""")],
+    ),
+]
+
+# Planted in the RocksDB backend: `scripts/mutants --rocksdb`.
+ROCKSDB_MUTANTS = [
+    (
+        "a group on RocksDB ignores the head",
+        [(ROCKSDB, "Ok(_) => return CommitOutcome::Fenced,", "Ok(_) => {}")],
+    ),
+    (
+        "a group past the limits commits on RocksDB",
+        [(ROCKSDB, """if check_limits(&writes.writes, log).is_err() {
+        return CommitOutcome::Failed;
+    }""", "let _ = log;")],
+    ),
+    (
+        "RocksDB's WAL starts unwritten",
+        [(ROCKSDB, "write_wal_files(&mut db).map_err(unavailable)?;", "let _ = write_wal_files;")],
+    ),
+    (
+        "RocksDB's WAL files come free one at a time",
+        [(ROCKSDB, """db.put_cf_opt(pin, b"pin", b"", &options)?;""", "let _ = pin;")],
+    ),
+    (
+        "RocksDB leaves the families that write its WAL",
+        [(ROCKSDB, "db.drop_cf(FILLER)?;", "")],
+    ),
+    (
+        "a store left amid writing its WAL won't open",
+        [(ROCKSDB, """ColumnFamilyDescriptor::new(FILLER, filler()),
+            ColumnFamilyDescriptor::new(PIN, Options::default()),""", ""),
+         (ROCKSDB, """let filler = db.cf_handle(FILLER).expect("opened with the store");
+        let pin = db.cf_handle(PIN).expect("opened with the store");""", """db.create_cf(FILLER, &filler()).expect("made");
+        db.create_cf(PIN, &Options::default()).expect("made");
+        let filler = db.cf_handle(FILLER).expect("made");
+        let pin = db.cf_handle(PIN).expect("made");""")],
+    ),
+]
+
+# Planted in the FoundationDB backend, which needs a cluster to test:
+# `scripts/fdb python3 scripts/mutants --fdb`.
+FDB_MUTANTS = [
+    (
+        "a group after the handle's own declares no read of the head",
+        [(FDB, """trx.add_conflict_range(&head, &end, ConflictRangeType::Read)
+            .map_err(unavailable)?;""", "let _ = (&head, &end, ConflictRangeType::Read);")],
+    ),
+    (
+        "a group runs at the newest version its handle knows",
+        [(FDB, """let trx = self.latest_trx()?;
+        trx.set_read_version(version);
+        let head = self.tree(&keys::head());""", """let trx = self.latest_trx()?;
+        let _ = version;
+        let head = self.tree(&keys::head());""")],
+    ),
+    (
+        "a group that reads the head takes any it finds",
+        [(FDB, """Ok(head) if head == expect => {}
+                Ok(_) => return CommitOutcome::Fenced,""", "Ok(_) => {}")],
+    ),
+    (
+        "a failed commit leaves its handle's read version",
+        [(FDB, """Err(error) => {
+                self.store.forget();
+                Err(commit_error(&error))""", """Err(error) => {
+                Err(commit_error(&error))""")],
+    ),
+    (
+        "a commit leaves the newest logged version unset",
+        [(FDB, """self.trx
+                .set(&self.store.latest_key(), &latest.to_be_bytes());""", "let _ = latest;")],
+    ),
+    (
+        "a transaction past the limits commits",
+        [(FDB, "if self.too_large || self.bytes > MAX_TRANSACTION {", "if false {")],
+    ),
+    (
+        "a scan stops at its first batch",
+        [(FDB, """.map(|pair| (pair.key().to_vec(), pair.value().to_vec())),
+        );
+        option = current.next_range(&values);""", """.map(|pair| (pair.key().to_vec(), pair.value().to_vec())),
+        );
+        option = None;""")],
+    ),
+    (
+        "a conflict reads as a lost commit",
+        [(FDB, "1020 => CommitError::Conflict,", "1020 => CommitError::Unavailable(error.to_string()),")],
+    ),
 ]
 
 # (layer, package, extra cargo test arguments). A layer runs once its crate exists.
@@ -699,6 +980,7 @@ LAYERS = [
     ("SQLite tests", "inodedb-storage-sqlite", "crates/storage-sqlite", []),
     ("storage conformance", "inodedb-storage-conformance", "crates/storage-conformance", []),
     ("server tests", "inodedb-server", "crates/server", []),
+    ("transport tests", "inodedb-transport", "crates/transport", []),
     ("client tests", "inodedb-client", "crates/client", []),
     ("CLI tests", "inodedb-cli", "crates/cli", []),
     ("API conformance", "inodedb-tests", "tests", []),
@@ -715,6 +997,10 @@ def main():
     parser.add_argument("--check", action="store_true", help="only check that every mutant applies")
     parser.add_argument("--no-baseline", action="store_true",
                         help="skip checking that the unmutated code passes every layer")
+    parser.add_argument("--rocksdb", action="store_true",
+                        help="plant bugs in the RocksDB backend, testing against its suites")
+    parser.add_argument("--fdb", action="store_true",
+                        help="plant bugs in the FoundationDB backend, testing against a cluster")
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent.parent
@@ -722,9 +1008,11 @@ def main():
     copy = work / "src"
     target = work / "target"
     results = []
+    backend = "fdb" if args.fdb else "rocksdb" if args.rocksdb else None
+    mutants = {"fdb": FDB_MUTANTS, "rocksdb": ROCKSDB_MUTANTS, None: MUTANTS}[backend]
     if args.check:
         broken = 0
-        for name, replacements in MUTANTS:
+        for name, replacements in MUTANTS + ROCKSDB_MUTANTS + FDB_MUTANTS:
             if args.only and name not in args.only:
                 continue
             for path, old, new in replacements:
@@ -737,10 +1025,10 @@ def main():
     if not args.no_baseline:
         print("== baseline", flush=True)
         fresh_copy(root, copy)
-        outcome = catch(copy, target, args.seeds)
+        outcome = catch(copy, target, args.seeds, backend)
         if outcome != "MISSED":
             sys.exit(f"the unmutated code fails: {outcome}")
-    for name, replacements in MUTANTS:
+    for name, replacements in mutants:
         if args.only and name not in args.only:
             continue
         print(f"== {name}", flush=True)
@@ -753,7 +1041,7 @@ def main():
                 sys.exit(f"{name}: expected one match in {path}, found {len(matches)}, for:\n{old}")
             match = matches[0]
             file.write_text(text[: match.start()] + new + text[match.end() :])
-        outcome = catch(copy, target, args.seeds)
+        outcome = catch(copy, target, args.seeds, backend)
         print(outcome, flush=True)
         results.append((name, outcome))
 
@@ -781,9 +1069,11 @@ def pattern(old):
     return r"\s*".join(re.escape(char) for char in old if not char.isspace())
 
 
-def catch(copy, target, seeds):
+def catch(copy, target, seeds, backend=None):
     """Which layer catches the mutant, or MISSED."""
     env = {"CARGO_TARGET_DIR": str(target)}
+    if backend:
+        return catch_on_backend(copy, env, backend)
     build = run(copy, env, ["cargo", "build", "-q", "--release", "--workspace", "--tests", "--bins"])
     if build is None or build.returncode != 0:
         print(build.stderr[-2000:] if build else "build timed out")
@@ -808,6 +1098,25 @@ def catch(copy, target, seeds):
                 print(result.stdout[-3000:], result.stderr[-3000:])
             summary = next((line for line in result.stdout.splitlines() if " seeds from " in line), "")
             return f"caught by {layer}" + (f" ({summary})" if summary else "")
+    return "MISSED"
+
+
+def catch_on_backend(copy, env, backend):
+    """Which of a backend's suites catches the mutant, or MISSED."""
+    features = ["--features", backend, "--test", backend]
+    suites = [("storage conformance", ["-p", "inodedb-storage-conformance", *features]),
+              ("API conformance", ["-p", "inodedb-tests", *features])]
+    if backend == "rocksdb":
+        suites.append(("unit tests", ["-p", "inodedb-storage-rocksdb", "--lib"]))
+    for layer, selection in suites:
+        result = run(copy, env, ["cargo", "test", "-q", "--release", *selection])
+        if result is None:
+            return f"caught by {backend} {layer} (hung)"
+        if result.returncode != 0:
+            if "error: could not compile" in result.stderr:
+                print(result.stderr[-2000:])
+                return "did not build"
+            return f"caught by {backend} {layer}"
     return "MISSED"
 
 

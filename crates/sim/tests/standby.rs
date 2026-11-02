@@ -223,6 +223,74 @@ fn a_released_store_passes_to_a_standby_at_once() {
     assert!(successor.fsck().is_empty(), "{:?}", successor.fsck());
 }
 
+/// What the writer answers for `query` on the path a request's task takes.
+fn cached(h: &Harness, query: &Query) -> Option<Answer> {
+    let trusted = Caller::Trusted(inodedb_core::types::ROOT);
+    h.writer.answer_cached(&trusted, query, 0, h.now)
+}
+
+/// Once the released head is durable a standby may take over at once, while
+/// the commit's answer is still on its way back. So a writer's cached reads
+/// end when its release starts.
+#[test]
+fn a_releasing_writer_answers_nothing_from_its_cache() {
+    let mut h = Harness::with(inodedb_storage::Memory::new(), config());
+    h.ops([mkdir("a"), put("a/f", "1")]);
+    h.query(read("a/f"));
+    assert!(cached(&h, &read("a/f")).is_some(), "the cache holds it");
+    h.writer.release();
+    assert_eq!(cached(&h, &read("a/f")), None, "the release has started");
+    h.run();
+    assert!(h.writer.is_stopped());
+    assert_eq!(cached(&h, &read("a/f")), None, "the writer has stopped");
+}
+
+/// A fenced writer knows a successor runs, whatever its own clock says of
+/// its lease.
+#[test]
+fn a_fenced_writer_answers_nothing_from_its_cache() {
+    let mut h = Harness::with(inodedb_storage::Memory::new(), config());
+    h.ops([mkdir("a"), put("a/f", "1")]);
+    h.query(read("a/f"));
+    let mut follower = Follower::new(config(), h.now);
+    run(&h, &mut follower);
+    assert_eq!(
+        follower.observe(h.storage.head_now()).expect("decodes"),
+        None
+    );
+    // The standby's clock passes the wait while the writer's stands still.
+    let wait = config().takeover_wait();
+    follower.set_now(h.now + wait);
+    let takeover = follower
+        .observe(h.storage.head_now())
+        .expect("decodes")
+        .expect("takes over");
+    let secret = follower.handle_secret().expect("the store holds one");
+    let handover = follower.hand_over();
+    let writer = Writer::new(config(), Harness::writer_id(), h.now + wait, secret)
+        .after(takeover)
+        .warm(handover.cache, handover.version);
+    let mut successor = Harness::with_writer(h.storage.clone(), writer);
+    successor.ops([put("a/f", "2")]);
+    assert!(
+        cached(&h, &read("a/f")).is_some(),
+        "the old writer's lease runs by its own clock"
+    );
+    // Its next commit finds the successor's head.
+    let token = h.token();
+    h.writer.submit(
+        token,
+        Caller::Trusted(inodedb_core::types::ROOT),
+        inodedb_core::ops::Batch {
+            ops: vec![mkdir("late")],
+            ..Default::default()
+        },
+    );
+    h.run();
+    assert!(h.writer.is_stopped());
+    assert_eq!(cached(&h, &read("a/f")), None);
+}
+
 #[test]
 fn a_standby_waits_while_the_writer_renews() {
     let mut h = Harness::with(inodedb_storage::Memory::new(), config());

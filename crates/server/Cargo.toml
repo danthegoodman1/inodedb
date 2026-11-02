@@ -22,6 +22,8 @@ inodedb-storage.workspace = true
 inodedb-storage-fdb = { workspace = true, optional = true }
 inodedb-storage-rocksdb = { workspace = true, optional = true }
 inodedb-storage-sqlite.workspace = true
+inodedb-transport.workspace = true
+mimalloc = { version = "0.1.52", default-features = false }
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }

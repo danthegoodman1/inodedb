@@ -32,11 +32,14 @@ macro_rules! api_conformance {
             floors_past_the_store_fail_fast, watch_streams_a_subtree, watch_replays_from_a_version,
             watch_reports_compaction, caches_follow_the_feed, keys_bound_their_reach,
             watch_ends_with_its_key, listings_follow_their_directory, inodes_share_their_handle, shutdown_ends_streams,
-            streams_that_keep_up_read_no_log, preloaded_servers_answer_stats_without_reads,
+            streams_that_keep_up_read_no_log, preloaded_servers_answer_without_reads,
             watch_stays_in_its_keys_tree, caches_stop_with_their_key, leases_hold_freed_records,
             leases_hold_the_log, caches_hold_a_lease, snapshots_hold_their_version,
             snapshots_hold_what_they_read, caches_start_under_steady_writes,
-            claims_read_values_their_file_outlived, checks_take_a_root_admin_key);
+            claims_read_values_their_file_outlived, checks_take_a_root_admin_key,
+            dropping_a_server_closes_its_store, a_stream_ends_when_its_client_leaves,
+            clients_reconnect_to_a_restarted_server, a_stream_outlives_its_client_handle,
+            lease_streams_send_every_beat);
     };
     (@tests $make:expr; $($check:ident),* $(,)?) => {
         $(
@@ -1903,6 +1906,135 @@ impl<S: inodedb_storage::Storage + Clone> inodedb_storage::Storage for Counted<S
     }
 }
 
+/// Dropping a server ends its tasks before it returns, so it holds the store
+/// no longer: a store closing as the process exits aborts on RocksDB.
+pub async fn dropping_a_server_closes_its_store<B: Backend>(backend: &mut B) {
+    let store = Counted::new(backend.fresh());
+    let held = store.log_reads.clone();
+    let server = inodedb_server::start_with(store, KEY, Settings::default()).await;
+    let db = Client::connect(server.endpoint(), KEY)
+        .await
+        .expect("connects");
+    db.commit([Op::mkdir("d")]).await.expect("commits");
+    assert!(Arc::strong_count(&held) > 1, "the server holds the store");
+    drop(server);
+    assert_eq!(Arc::strong_count(&held), 1, "the store has closed");
+}
+
+/// A client that leaves resets its stream, which ends the task behind it, so a
+/// stream holds nothing once no one reads it.
+pub async fn a_stream_ends_when_its_client_leaves<B: Backend>(backend: &mut B) {
+    let faults = Arc::new(Faults::default());
+    let Fixture { server, db, .. } = start_with_faults(backend.fresh(), faults.clone()).await;
+    let channel = inodedb_transport::Channel::connect(&server.endpoint())
+        .await
+        .expect("connects");
+    let mut rpc = pb::inode_db_client::InodeDbClient::new(channel);
+    let mut changes = rpc
+        .watch(keyed(pb::WatchRequest {
+            path: Bytes::new(),
+            from: 0,
+        }))
+        .await
+        .expect("watches")
+        .into_inner();
+    db.commit([Op::mkdir("d")]).await.expect("commits");
+    next_change(&mut changes).await;
+    assert_eq!(faults.watches.load(Ordering::Acquire), 1);
+    drop(changes);
+    let ended = async {
+        while faults.watches.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), ended)
+        .await
+        .expect("the stream's task ends");
+}
+
+/// A stream goes on after the channel that opened it has dropped.
+pub async fn a_stream_outlives_its_client_handle<B: Backend>(backend: &mut B) {
+    let Fixture { server, db, .. } = fresh(backend).await;
+    let channel = inodedb_transport::Channel::connect(&server.endpoint())
+        .await
+        .expect("connects");
+    let mut rpc = pb::inode_db_client::InodeDbClient::new(channel);
+    let mut changes = rpc
+        .watch(keyed(pb::WatchRequest {
+            path: Bytes::new(),
+            from: 0,
+        }))
+        .await
+        .expect("watches")
+        .into_inner();
+    drop(rpc);
+    db.commit([Op::mkdir("d")]).await.expect("commits");
+    next_change(&mut changes).await;
+}
+
+/// A stream of requests delivers every message, however many are ready when
+/// the call starts.
+pub async fn lease_streams_send_every_beat<B: Backend>(backend: &mut B) {
+    let Fixture { server, db, .. } = fresh(backend).await;
+    let version = db.commit([Op::mkdir("d")]).await.expect("commits").version;
+    let channel = inodedb_transport::Channel::connect(&server.endpoint())
+        .await
+        .expect("connects");
+    let beat = || pb::LeaseBeat {
+        oldest: version,
+        position: version,
+        ..pb::LeaseBeat::default()
+    };
+    let beats = 5;
+    let (send, receive) = tokio::sync::mpsc::channel(beats);
+    for _ in 0..beats {
+        send.send(beat()).await.expect("queues");
+    }
+    let mut rpc = pb::inode_db_client::InodeDbClient::new(channel);
+    let mut states = rpc
+        .lease(keyed(tokio_stream::wrappers::ReceiverStream::new(receive)))
+        .await
+        .expect("opens")
+        .into_inner();
+    for index in 0..beats {
+        let state = tokio::time::timeout(std::time::Duration::from_secs(10), states.message())
+            .await
+            .expect("an answer in time")
+            .expect("the stream holds");
+        assert!(state.is_some(), "beat {index} has its answer");
+    }
+}
+
+/// A client whose connection fails makes a new one when next called.
+pub async fn clients_reconnect_to_a_restarted_server<B: Backend>(backend: &mut B) {
+    let Fixture { store, server, db } = fresh(backend).await;
+    let db = db.with_retry(inodedb::Retry {
+        deadline: std::time::Duration::from_secs(20),
+        ..inodedb::Retry::default()
+    });
+    db.commit([Op::mkdir("before")]).await.expect("commits");
+    let addr = server.addr;
+    server.stop().await;
+    let store = backend.reopen(store);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("binds the same port");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(inodedb_server::serve(
+        store,
+        async { Ok(listener) },
+        Settings::default(),
+        async move {
+            let _ = stopped.await;
+        },
+    ));
+    db.commit([Op::mkdir("after")]).await.expect("commits");
+    let names = names(&db.list("").await.expect("lists"));
+    assert_eq!(names, ["after", "before"]);
+    let _ = stop.send(());
+    let _ = serving.await;
+}
+
 /// A stream that keeps up takes each change from the server's memory, so
 /// commits cost streams no reads of the log.
 pub async fn streams_that_keep_up_read_no_log<B: Backend>(backend: &mut B) {
@@ -1940,7 +2072,7 @@ pub async fn streams_that_keep_up_read_no_log<B: Backend>(backend: &mut B) {
 
 /// A server that reads the tree into its cache when it starts answers
 /// stats, of names present and absent, without reading storage.
-pub async fn preloaded_servers_answer_stats_without_reads<B: Backend>(backend: &mut B) {
+pub async fn preloaded_servers_answer_without_reads<B: Backend>(backend: &mut B) {
     let store = backend.fresh();
     let first = inodedb_server::start_with(store.clone(), KEY, Settings::default()).await;
     let db = Client::connect(first.endpoint(), KEY)
@@ -1983,10 +2115,11 @@ pub async fn preloaded_servers_answer_stats_without_reads<B: Backend>(backend: &
     for path in ["p/missing", "p/q/missing", "empty/missing"] {
         assert_eq!(fs(db.stat(path).await), FsError::NotFound, "{path}");
     }
+    assert_eq!(db.read("p/q/b").await.expect("reads").value, "2");
     assert_eq!(
         store.snapshot_reads.load(Ordering::Relaxed),
         settled,
-        "a stat read storage"
+        "a stat or read went to storage"
     );
 }
 

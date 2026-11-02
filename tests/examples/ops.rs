@@ -1,6 +1,6 @@
 //! Operations per second through the server's gRPC API, by backend.
 //!
-//!     cargo run --release -p inodedb-tests --example ops --features rocksdb,fdb [-- SECONDS [BACKENDS]]
+//!     cargo run --release -p inodedb-tests --example ops --features rocksdb,fdb [-- SECONDS [BACKENDS [OPERATIONS]]]
 //!
 //! The server runs on a runtime of its own with `SERVER_THREADS` workers,
 //! as a separate process would, and each client opens its own connection.
@@ -11,6 +11,12 @@
 //! preloads, as servers do by default, starts, and clients stat each file
 //! once as it reads the tree; the rest run against its cache. Each client
 //! waits for each answer before sending the next.
+//!
+//! A third argument names the operations to run, such as `stat,put`, to
+//! profile one; it skips those it leaves out of the warm phase.
+
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use inodedb::{Client, Op};
 use inodedb_server::Settings;
@@ -43,6 +49,7 @@ impl Server {
         settings.writer.preload = preload;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(SERVER_THREADS)
+            .thread_name("server")
             .enable_all()
             .build()
             .expect("starts a runtime");
@@ -76,7 +83,7 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
+            inodedb_server::end_runtime(runtime);
         }
     }
 }
@@ -91,9 +98,24 @@ enum Operation {
     List,
     Put,
     Rename,
+    /// Nine stats for each put of a new file.
+    Mixed,
 }
 
 impl Operation {
+    /// What a third argument calls it.
+    fn short(self) -> &'static str {
+        match self {
+            Operation::StatPreloaded | Operation::StatCold | Operation::ReadCold => "cold",
+            Operation::Stat => "stat",
+            Operation::Read => "read",
+            Operation::List => "list",
+            Operation::Put => "put",
+            Operation::Rename => "rename",
+            Operation::Mixed => "mixed",
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Operation::StatPreloaded => "stat, as a preloading server starts",
@@ -104,6 +126,7 @@ impl Operation {
             Operation::List => "list 100 entries",
             Operation::Put => "put a new 100-byte file",
             Operation::Rename => "rename a file",
+            Operation::Mixed => "nine stats for each put",
         }
     }
 
@@ -131,6 +154,18 @@ impl Operation {
                     .await
                     .expect("commits");
                 assert!(commit.all_applied());
+            }
+            Operation::Mixed => {
+                if index.is_multiple_of(10) {
+                    let path = format!("c{client}/mix{clients}-f{index}");
+                    let commit = db
+                        .commit([Op::put(path, vec![7u8; 100]).create()])
+                        .await
+                        .expect("commits");
+                    assert!(commit.all_applied());
+                } else {
+                    db.stat(format!("t/f{file}")).await.expect("stats");
+                }
             }
             Operation::Rename => {
                 let (from, to) = if index.is_multiple_of(2) {
@@ -221,7 +256,10 @@ fn report(backend: &str, operation: Operation, clients: usize, run: &Run) {
 
 const CLIENTS: [usize; 2] = [1, 64];
 
-async fn bench<S: Storage + Clone>(backend: &str, storage: S, seconds: u64) {
+async fn bench<S: Storage + Clone>(backend: &str, storage: S, seconds: u64, chosen: Option<&str>) {
+    let runs = |operation: Operation| {
+        chosen.is_none_or(|chosen| chosen.split(',').any(|name| name == operation.short()))
+    };
     let server = Server::start(storage.clone(), false);
     let db = Client::connect(server.endpoint.clone(), KEY)
         .await
@@ -255,32 +293,36 @@ async fn bench<S: Storage + Clone>(backend: &str, storage: S, seconds: u64) {
     // A server restarted over the store without preloading starts with
     // nothing cached.
     let cold = 16;
-    let server = Server::start(storage.clone(), false);
-    for operation in [Operation::StatCold, Operation::ReadCold] {
-        report(
-            backend,
-            operation,
-            cold,
-            &drive(&server.endpoint, operation, cold, seconds).await,
-        );
+    if runs(Operation::StatCold) {
+        let server = Server::start(storage.clone(), false);
+        for operation in [Operation::StatCold, Operation::ReadCold] {
+            report(
+                backend,
+                operation,
+                cold,
+                &drive(&server.endpoint, operation, cold, seconds).await,
+            );
+        }
+        server.stop().await;
     }
-    server.stop().await;
 
     // A server that preloads reads the tree as clients start asking.
     let server = Server::start(storage, true);
-    report(
-        backend,
-        Operation::StatPreloaded,
-        cold,
-        &drive(&server.endpoint, Operation::StatPreloaded, cold, seconds).await,
-    );
+    let preloaded = drive(&server.endpoint, Operation::StatPreloaded, cold, seconds).await;
+    if runs(Operation::StatPreloaded) {
+        report(backend, Operation::StatPreloaded, cold, &preloaded);
+    }
     for operation in [
         Operation::Stat,
         Operation::Read,
         Operation::List,
         Operation::Put,
         Operation::Rename,
+        Operation::Mixed,
     ] {
+        if !runs(operation) {
+            continue;
+        }
         for clients in CLIENTS {
             report(
                 backend,
@@ -293,37 +335,48 @@ async fn bench<S: Storage + Clone>(backend: &str, storage: S, seconds: u64) {
     server.stop().await;
 }
 
-#[tokio::main(worker_threads = 8)]
-async fn main() {
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .thread_name("client")
+        .enable_all()
+        .build()
+        .expect("starts a runtime")
+        .block_on(run());
+}
+
+async fn run() {
     let mut args = std::env::args().skip(1);
     let seconds = args.next().and_then(|arg| arg.parse().ok()).unwrap_or(3);
     // The backends to run, in order: memory, sqlite, rocksdb, fdb.
     let order = args
         .next()
         .unwrap_or_else(|| "memory,sqlite,rocksdb,fdb".to_string());
+    let chosen = args.next();
+    let chosen = chosen.as_deref();
     println!("| Backend | Operation | Clients | Ops/s | p50 ms | p99 ms |");
     println!("| --- | --- | ---: | ---: | ---: | ---: |");
     for backend in order.split(',') {
         match backend {
-            "memory" => bench("memory", inodedb_storage::Memory::new(), seconds).await,
+            "memory" => bench("memory", inodedb_storage::Memory::new(), seconds, chosen).await,
             "sqlite" => {
                 let dir = tempfile::tempdir().expect("a scratch directory");
                 let path = dir.path().join("db.sqlite");
                 let storage = inodedb_storage_sqlite::Sqlite::open(path).expect("opens");
-                bench("SQLite", storage, seconds).await;
+                bench("SQLite", storage, seconds, chosen).await;
             }
             #[cfg(feature = "rocksdb")]
             "rocksdb" => {
                 let dir = tempfile::tempdir().expect("a scratch directory");
                 let storage =
                     inodedb_storage_rocksdb::Rocks::open(dir.path().join("db")).expect("opens");
-                bench("RocksDB", storage, seconds).await;
+                bench("RocksDB", storage, seconds, chosen).await;
             }
             #[cfg(feature = "fdb")]
             "fdb" => {
                 use inodedb_storage_conformance::Backend;
                 let mut fdb = inodedb_storage_conformance::backends::Fdb::new();
-                bench("FoundationDB", fdb.fresh(), seconds).await;
+                bench("FoundationDB", fdb.fresh(), seconds, chosen).await;
             }
             other => eprintln!("skipping {other}: unknown, or built without its feature"),
         }

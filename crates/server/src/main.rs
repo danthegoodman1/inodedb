@@ -4,6 +4,9 @@
 //! there. `INODEDB_ADVERTISE`, when set, is the address standbys name for
 //! this server in place of the configured one.
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use inodedb_server::config::{Config, StorageConfig};
 use std::process::ExitCode;
 use tokio::net::TcpListener;
@@ -72,6 +75,21 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Held until the process exits.
+    let _shallow = config.shallow_idle.then(|| {
+        match inodedb_server::hold_shallow_idle(std::path::Path::new(
+            inodedb_server::CPU_LATENCY,
+        )) {
+            Ok(held) => Some(held),
+            Err(error) => {
+                eprintln!(
+                    "level=info msg=\"cores may sleep deeply, which slows each wake-up\" file={} error=\"{error}\"",
+                    inodedb_server::CPU_LATENCY
+                );
+                None
+            }
+        }
+    });
     let listener = TcpListener::bind(config.listen);
     let shutdown = async {
         signal().await;

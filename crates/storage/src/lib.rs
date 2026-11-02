@@ -23,6 +23,7 @@ use inodedb_core::keys::{self, KeyRange, KvRead, KvResult, KvWrite, Pairs, Write
 use inodedb_core::types::Version;
 use inodedb_core::writer::CommitOutcome;
 use std::future::Future;
+use std::sync::Arc;
 
 pub use memory::Memory;
 
@@ -112,6 +113,21 @@ pub trait Storage: Send + Sync + 'static {
     /// Deletes log entries older than `below`.
     fn truncate_log(&self, below: Version)
     -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Carries out a writer's `Commit`: checks the head record holds
+    /// `expect`, then applies the writes in one transaction. A backend that
+    /// commits on one thread does both in one call, so a commit costs one
+    /// trip to that thread and no copy of the writes.
+    fn commit_group(
+        &self,
+        expect: Option<Vec<u8>>,
+        writes: Arc<WriteSet>,
+    ) -> impl Future<Output = CommitOutcome> + Send
+    where
+        Self: Sized,
+    {
+        async move { commit(self, expect.as_deref(), &writes).await }
+    }
 }
 
 pub trait Txn: Send {

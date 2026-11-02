@@ -10,18 +10,21 @@
 //! A writer's handle starts its reads and transactions from the read version
 //! of its latest commit, or of its latest request for one, for up to a
 //! second, so a round of reads or a commit skips asking the cluster for a
-//! read version first.
+//! read version first. A commit that follows the handle's own also skips
+//! reading the head it wrote: it runs at that commit's version and declares a
+//! read of the head, so another writer's commit since then still conflicts.
 //!
 //! The client library runs a network thread per process; `boot` starts it,
 //! and the returned guard stops it when dropped.
 #![cfg(feature = "fdb")]
 
 use foundationdb::api::NetworkAutoStop;
-use foundationdb::options::StreamingMode;
+use foundationdb::options::{ConflictRangeType, StreamingMode};
 use foundationdb::{Database, FdbError, RangeOption, Transaction};
 use futures_util::future::try_join_all;
-use inodedb_core::keys::{KeyRange, KvRead, KvResult, Pairs};
+use inodedb_core::keys::{self, KeyRange, KvRead, KvResult, KvWrite, Pairs, WriteSet};
 use inodedb_core::types::Version;
+use inodedb_core::writer::CommitOutcome;
 use inodedb_storage::{
     CommitError, MAX_KEY, MAX_TRANSACTION, MAX_VALUE, Storage, StorageError, Txn,
 };
@@ -73,9 +76,13 @@ pub struct Fdb {
     /// On a writer's handle, a read version that holds every commit the
     /// handle made, and when the handle learned it.
     known: Option<Arc<Mutex<Known>>>,
+    /// On a writer's handle, the head of its latest commit, the version that
+    /// commit took, and when.
+    wrote: Option<Arc<Mutex<Wrote>>>,
 }
 
 type Known = Option<(i64, Instant)>;
+type Wrote = Option<(Vec<u8>, i64, Instant)>;
 
 fn unavailable(error: impl std::fmt::Display) -> StorageError {
     StorageError::Unavailable(error.to_string())
@@ -95,6 +102,7 @@ impl Fdb {
             db: Arc::new(db),
             prefix: prefix.into(),
             known: None,
+            wrote: None,
         })
     }
 
@@ -181,6 +189,35 @@ impl Fdb {
                 .lock()
                 .expect("no thread panics holding the read version") = None;
         }
+        if let Some(wrote) = &self.wrote {
+            *wrote.lock().expect("no thread panics holding the head") = None;
+        }
+    }
+
+    /// The version of this handle's latest commit, if it wrote `expect` as the
+    /// head and went out recently enough to read from.
+    fn wrote_head(&self, expect: Option<&[u8]>) -> Option<i64> {
+        let wrote = self
+            .wrote
+            .as_ref()?
+            .lock()
+            .expect("no thread panics holding the head");
+        let (head, version, at) = wrote.as_ref()?;
+        (Some(head.as_slice()) == expect && at.elapsed() < REUSE).then_some(*version)
+    }
+
+    /// Starts a transaction that commits only if the head still holds what
+    /// this handle's latest commit wrote at `version`. It needs no read: the
+    /// declared read makes any commit to the head since then conflict.
+    fn trx_after(&self, version: i64) -> Result<Transaction, StorageError> {
+        let trx = self.latest_trx()?;
+        trx.set_read_version(version);
+        let head = self.tree(&keys::head());
+        let mut end = head.clone();
+        end.push(0);
+        trx.add_conflict_range(&head, &end, ConflictRangeType::Read)
+            .map_err(unavailable)?;
+        Ok(trx)
     }
 
     /// Up to `limit` pairs of a range of the tree, with the prefix taken
@@ -279,6 +316,7 @@ impl Storage for Fdb {
     fn for_writer(&self) -> Fdb {
         Fdb {
             known: Some(Arc::default()),
+            wrote: Some(Arc::default()),
             ..self.clone()
         }
     }
@@ -316,6 +354,48 @@ impl Storage for Fdb {
             too_large: false,
             latest: None,
         })
+    }
+
+    async fn commit_group(&self, expect: Option<Vec<u8>>, writes: Arc<WriteSet>) -> CommitOutcome {
+        let after = self.wrote_head(expect.as_deref());
+        let txn = match after {
+            Some(version) => self.trx_after(version).map(|trx| FdbTxn {
+                store: self.clone(),
+                trx,
+                bytes: 0,
+                too_large: false,
+                latest: None,
+            }),
+            None => self.begin().await,
+        };
+        let Ok(mut txn) = txn else {
+            return CommitOutcome::Failed;
+        };
+        if after.is_none() {
+            match txn.get(&keys::head()).await {
+                Ok(head) if head == expect => {}
+                Ok(_) => return CommitOutcome::Fenced,
+                Err(_) => return CommitOutcome::Failed,
+            }
+        }
+        inodedb_storage::apply(&mut txn, &writes);
+        let head = writes.writes.iter().rev().find_map(|write| match write {
+            KvWrite::Set(key, value) if *key == keys::head() => Some(value),
+            _ => None,
+        });
+        let sent = Instant::now();
+        match txn.commit_at().await {
+            Ok(version) => {
+                if let (Some(wrote), Some(head), Some(version)) = (&self.wrote, head, version) {
+                    *wrote.lock().expect("no thread panics holding the head") =
+                        Some((head.clone(), version, sent));
+                }
+                CommitOutcome::Committed
+            }
+            Err(CommitError::Conflict) => CommitOutcome::Fenced,
+            Err(CommitError::Unknown) => CommitOutcome::Unknown,
+            Err(CommitError::TooLarge | CommitError::Unavailable(_)) => CommitOutcome::Failed,
+        }
     }
 
     async fn read_log(
@@ -444,6 +524,13 @@ impl Txn for FdbTxn {
     }
 
     async fn commit(self) -> Result<(), CommitError> {
+        self.commit_at().await.map(|_| ())
+    }
+}
+
+impl FdbTxn {
+    /// Commits, and reports the version the commit took, if it wrote anything.
+    async fn commit_at(self) -> Result<Option<i64>, CommitError> {
         if self.too_large || self.bytes > MAX_TRANSACTION {
             self.store.forget();
             return Err(CommitError::TooLarge);
@@ -455,12 +542,14 @@ impl Txn for FdbTxn {
         match self.trx.commit().await {
             Ok(committed) => {
                 // A transaction that wrote nothing reports -1.
-                if let Ok(version) = committed.committed_version()
-                    && version >= 0
-                {
+                let version = committed
+                    .committed_version()
+                    .ok()
+                    .filter(|version| *version >= 0);
+                if let Some(version) = version {
                     self.store.learn(version, Instant::now());
                 }
-                Ok(())
+                Ok(version)
             }
             Err(error) => {
                 self.store.forget();

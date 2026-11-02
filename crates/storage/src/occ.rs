@@ -2,13 +2,23 @@
 //! a commit conflicts when a commit since its transaction began wrote what
 //! it read.
 
-use inodedb_core::keys::KeyRange;
+use inodedb_core::keys::{KeyRange, KvWrite};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Debug)]
 pub enum Written {
     Key(Vec<u8>),
     Range(KeyRange),
+}
+
+impl Written {
+    /// What a write changes.
+    pub fn of(write: &KvWrite) -> Written {
+        match write {
+            KvWrite::Set(key, _) | KvWrite::Clear(key) => Written::Key(key.clone()),
+            KvWrite::ClearRange(range) => Written::Range(range.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,11 +78,12 @@ impl Validator {
             .all(|(_, writes)| !writes.iter().any(|written| reads.touches(written)))
     }
 
-    /// Records a commit's writes and returns its sequence number.
-    pub fn record(&mut self, writes: Vec<Written>) -> u64 {
+    /// Records a commit's writes, which it lists only when a transaction
+    /// is open to conflict with them, and returns its sequence number.
+    pub fn record(&mut self, writes: impl FnOnce() -> Vec<Written>) -> u64 {
         self.seq += 1;
         if !self.open.is_empty() {
-            self.recent.push_back((self.seq, writes));
+            self.recent.push_back((self.seq, writes()));
         }
         self.seq
     }
@@ -87,7 +98,7 @@ mod tests {
         let mut validator = Validator::default();
         let (first, start) = validator.begin();
         let (_, other_start) = validator.begin();
-        validator.record(vec![Written::Key(b"k".to_vec())]);
+        validator.record(|| vec![Written::Key(b"k".to_vec())]);
         let reads = ReadSet {
             keys: BTreeSet::from([b"k".to_vec()]),
             ranges: Vec::new(),

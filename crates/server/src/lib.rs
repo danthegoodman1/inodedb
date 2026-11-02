@@ -23,7 +23,6 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
-use tonic::transport::server::TcpIncoming;
 
 /// The largest message either side sends: a full batch plus framing.
 pub const MAX_MESSAGE: usize = 16 * 1024 * 1024;
@@ -135,22 +134,18 @@ pub async fn serve<S: Storage + Clone>(
     .max_encoding_message_size(MAX_MESSAGE);
     let (ended, why) = oneshot::channel();
     let fired = Arc::new(Notify::new());
-    let server = tonic::transport::Server::builder()
-        .http2_keepalive_interval(Some(Duration::from_secs(20)))
-        .http2_keepalive_timeout(Some(Duration::from_secs(20)))
-        .add_service(service)
-        .serve_with_incoming_shutdown(incoming(listener), {
-            let (watcher, fired) = (watcher.clone(), fired.clone());
-            async move {
-                let _ = ended.send(tokio::select! {
-                    () = shutdown => Ended::Shutdown,
-                    () = watcher.stopped() => Ended::WriterStopped,
-                });
-                // Streams end, so the requests in progress can finish.
-                close.send_replace(true);
-                fired.notify_one();
-            }
-        });
+    let server = inodedb_transport::serve(listener, service, {
+        let (watcher, fired) = (watcher.clone(), fired.clone());
+        async move {
+            let _ = ended.send(tokio::select! {
+                () = shutdown => Ended::Shutdown,
+                () = watcher.stopped() => Ended::WriterStopped,
+            });
+            // Streams end, so the requests in progress can finish.
+            close.send_replace(true);
+            fired.notify_one();
+        }
+    });
     let served = tokio::select! {
         served = server => served,
         () = async {
@@ -177,13 +172,33 @@ pub async fn serve<S: Storage + Clone>(
     Ok(why.await.unwrap_or(Ended::Shutdown))
 }
 
-/// Connections as the listener accepts them, each sending its writes at
-/// once. A reply goes out as several writes, such as a listing's messages
-/// and trailers, and Nagle's algorithm would hold each for the client's
-/// delayed acknowledgment, 40 ms on Linux. The server builder's own
-/// setting covers only listeners it binds.
-fn incoming(listener: TcpListener) -> TcpIncoming {
-    TcpIncoming::from(listener).with_nodelay(Some(true))
+/// Linux's request for how long a core may take to leave idle, as long as the
+/// file stays open.
+pub const CPU_LATENCY: &str = "/dev/cpu_dma_latency";
+
+/// Asks that no core take over a microsecond to leave idle, until the returned
+/// file drops. A request wakes several threads, and on a cloud instance each
+/// one that finds its core in C6 pays 190 microseconds (`BENCHMARKS.md`,
+/// "Idle states"), several times what the rest of a read costs. A core in C1
+/// still halts. The file takes root, or a device rule that opens it to the
+/// server's user.
+pub fn hold_shallow_idle(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.write_all(&1i32.to_ne_bytes())?;
+    Ok(file)
+}
+
+/// How long ending a runtime waits for its blocking calls.
+const END_RUNTIME: Duration = Duration::from_secs(10);
+
+/// Ends a runtime and every task on it, as a process kill would, and returns
+/// once they have dropped what they held. A store they held has then closed,
+/// so nothing closes it once the process's exit has begun, when RocksDB's
+/// static locks are gone and closing a database aborts the process. It works
+/// from any thread: its own thread may block, where a runtime's may not.
+pub fn end_runtime(runtime: tokio::runtime::Runtime) {
+    let _ = std::thread::spawn(move || runtime.shutdown_timeout(END_RUNTIME)).join();
 }
 
 /// A server on a free local port, for tests and tools. It runs on a
@@ -213,7 +228,7 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
+            end_runtime(runtime);
         }
     }
 }
@@ -276,21 +291,19 @@ pub async fn start_with<S: Storage + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_stream::StreamExt;
 
-    #[tokio::test]
-    async fn accepted_connections_send_at_once() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
-        let addr = listener.local_addr().expect("bound");
-        let mut accepted = incoming(listener);
-        let _client = tokio::net::TcpStream::connect(addr)
-            .await
-            .expect("connects");
-        let stream = accepted
-            .next()
-            .await
-            .expect("a connection")
-            .expect("accepts");
-        assert!(stream.nodelay().expect("reads the option"));
+    /// The kernel reads the latency as a native 32-bit integer of microseconds.
+    #[test]
+    fn shallow_idle_asks_for_a_microsecond() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("cpu_dma_latency");
+        std::fs::write(&path, []).expect("makes the file");
+        let held = hold_shallow_idle(&path).expect("opens");
+        assert_eq!(
+            std::fs::read(&path).expect("reads"),
+            1i32.to_ne_bytes().to_vec()
+        );
+        drop(held);
+        assert!(hold_shallow_idle(&dir.path().join("missing")).is_err());
     }
 }

@@ -19,6 +19,14 @@ pub struct Config {
     pub log: LogConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Whether the server keeps the machine's cores out of idle states slower
+    /// than a microsecond to leave, while it runs, if it may.
+    #[serde(default = "shallow_idle")]
+    pub shallow_idle: bool,
+}
+
+fn shallow_idle() -> bool {
+    true
 }
 
 /// What the writer's cache, and a standby's, may hold.
@@ -250,6 +258,7 @@ mod tests {
             (1 << 30, 256 << 20, 64 << 20)
         );
         assert!(core.preload);
+        assert!(config.shallow_idle);
     }
 
     #[test]
