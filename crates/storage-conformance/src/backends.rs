@@ -73,6 +73,33 @@ impl Backend for Lite {
     }
 }
 
+pub struct Lion(Scratch);
+
+impl Lion {
+    pub fn new() -> Lion {
+        Lion(Scratch::new())
+    }
+}
+
+impl Default for Lion {
+    fn default() -> Lion {
+        Lion::new()
+    }
+}
+
+impl Backend for Lion {
+    type S = inodedb_storage_lionturtle::Lionturtle;
+
+    fn fresh(&mut self) -> Self::S {
+        inodedb_storage_lionturtle::Lionturtle::open(self.0.next()).expect("opens")
+    }
+
+    fn reopen(&mut self, store: Self::S) -> Self::S {
+        drop(store);
+        inodedb_storage_lionturtle::Lionturtle::open(self.0.current()).expect("reopens")
+    }
+}
+
 #[cfg(feature = "rocksdb")]
 pub struct Rock(Scratch);
 

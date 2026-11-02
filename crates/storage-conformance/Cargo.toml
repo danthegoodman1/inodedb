@@ -13,6 +13,7 @@ fdb = ["dep:inodedb-storage-fdb", "inodedb-storage-fdb/fdb"]
 inodedb-core.workspace = true
 inodedb-storage.workspace = true
 inodedb-storage-fdb = { workspace = true, optional = true }
+inodedb-storage-lionturtle.workspace = true
 inodedb-storage-rocksdb = { workspace = true, optional = true }
 inodedb-storage-sqlite.workspace = true
 tempfile.workspace = true

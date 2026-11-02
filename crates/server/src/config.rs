@@ -93,6 +93,9 @@ pub enum StorageConfig {
     Rocksdb {
         path: PathBuf,
     },
+    Lionturtle {
+        path: PathBuf,
+    },
     /// A store under `prefix` in the cluster `cluster_file` names, or the
     /// default cluster file's.
     Fdb {
@@ -228,6 +231,11 @@ mod tests {
         .expect("parses");
         assert!(matches!(config.storage, StorageConfig::Sqlite { .. }));
         assert_eq!(config.writer.group_max_bytes, 9_000_000);
+        let config = Config::parse(
+            "listen = \"127.0.0.1:7070\"\n[storage]\nbackend = \"lionturtle\"\npath = \"data\"",
+        )
+        .expect("parses");
+        assert!(matches!(config.storage, StorageConfig::Lionturtle { .. }));
     }
 
     /// The defaults DESIGN.md's table gives, with the measurements behind

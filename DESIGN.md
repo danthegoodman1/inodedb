@@ -1,6 +1,6 @@
 # InodeDB
 
-InodeDB is a transactional metadata store whose keyspace is a tree of inodes. Directories map names to inodes, and files hold up to 64 KiB of opaque bytes. Renaming a directory rewrites one entry, however much lies beneath it. Clients speak gRPC to a Rust server. One server writes at a time, keeping its records in SQLite, RocksDB or FoundationDB through one storage trait; FoundationDB adds replicated durability.
+InodeDB is a transactional metadata store whose keyspace is a tree of inodes. Directories map names to inodes, and files hold up to 64 KiB of opaque bytes. Renaming a directory rewrites one entry, however much lies beneath it. Clients speak gRPC to a Rust server. One server writes at a time, keeping its records in SQLite, RocksDB, lionturtle or FoundationDB through one storage trait; FoundationDB adds replicated durability.
 
 **Best fit:** metadata for systems that keep their data in object storage and commit by renaming directories. The first user is a ClickHouse object-storage disk, with InodeDB holding the file tree and S3 the blobs ([ClickHouse integration](#clickhouse-integration)).
 
@@ -163,7 +163,7 @@ The server and the client library share one cache implementation, in `core`. It 
 
 **The writer's cache holds every committed batch,** so the core executes batches against it and reads storage only for keys the cache lacks. A batch that lacks keys waits for them, and the batches queued behind it, up to 1,024 ops of them, read what they lack in the same round, so a queue of batches that each miss costs a round of reads rather than one per batch, and cached work queued behind costs each round a bounded stall. Eviction spares what reads in progress fetched, so work that needs many reads, such as freeing a detached subtree, always finishes.
 
-**Preload.** A writer or standby that starts reads the tree into its cache while it serves: every directory's entries, then every inode record, then every file's back-pointers, in pages of 16,384 keys, then every value, in pages of 1,024. Entries come first because they resolve paths, so in a tree whose inode records outgrow the cache, a path resolves from the cache and reads only the record at its end. Each page is a read like any other, moved to the cache's version through the commits since. A directory whose entries fall in one page arrives complete, and so does an empty directory the entries pass over once an entry has named it, so the cache answers that a name is absent without a read; a larger directory arrives as known names. The preload stops at the first record its budget has no room for, so it never evicts what it read before. Stats as a server starts run at 2.3 to 6.9 times the rate of cold ones (`BENCHMARKS.md`).
+**Preload.** A writer or standby that starts reads the tree into its cache while it serves: every directory's entries, then every inode record, then every file's back-pointers, in pages of 16,384 keys, then every value, in pages of 1,024. Entries come first because they resolve paths, so in a tree whose inode records outgrow the cache, a path resolves from the cache and reads only the record at its end. Each page is a read like any other, moved to the cache's version through the commits since. A directory whose entries fall in one page arrives complete, and so does an empty directory the entries pass over once an entry has named it, so the cache answers that a name is absent without a read; a larger directory arrives as known names. The preload stops at the first record its budget has no room for, so it never evicts what it read before. Stats as a server starts run at 1.5 to 3.5 times the rate of cold ones (`BENCHMARKS.md`).
 
 **Settings,** separate for the writer and each client: tree bytes, value bytes, and undo bytes for snapshots. A server takes the first two, and whether to preload, from its configuration's `[cache]` table, and a client passes a `Budget` to `cached_within`.
 
@@ -268,7 +268,7 @@ The log is keyed by version, so `truncate_log` is one range delete, and the engi
 - **The log.** Entries read back in version order.
 - **Unknown outcomes.** `Unknown` means the commit may or may not have applied.
 - **Durability.** A commit is durable before it returns.
-- **Group commits.** `commit_group` applies a group's writes in one transaction when the head record holds what it expects, and answers `Fenced` otherwise. A transaction that read what it writes conflicts. SQLite and RocksDB read the head and write under their commit locks in one blocking call, so a commit costs one trip to a blocking thread and no copy of its writes.
+- **Group commits.** `commit_group` applies a group's writes in one transaction when the head record holds what it expects, and answers `Fenced` otherwise. A transaction that read what it writes conflicts. SQLite, RocksDB and lionturtle read the head and write under their commit locks in one blocking call, so a commit costs one trip to a blocking thread and no copy of its writes.
 - **Limits,** matching FoundationDB on every backend: keys up to 9,000 bytes, which leaves room for a FoundationDB store's prefix within its 10,000-byte keys, values up to 100,000 bytes, and transactions up to 10,000,000 bytes. FoundationDB also ends a transaction after 5 seconds; the writer's take milliseconds, and only a whole-store check (`idb fsck`) reads for longer.
 
 ### Backends
@@ -277,12 +277,13 @@ The log is keyed by version, so `truncate_log` is one range delete, and the engi
 |---|---|---|
 | **memory** | Simulator, unit tests | An ordered map under one lock, with optimistic conflict checks. Hooks inject unknown outcomes, applied or not, and outages; the simulator adds latency and writer crashes around it. |
 | **SQLite** | Local development, tests, small single-server deployments | rusqlite with SQLite bundled, WAL mode, `synchronous = FULL`, syncing with `fdatasync`. The WAL file is written to 128 MiB when the store opens. A thread of the store's own copies the WAL into the database file and, once it passes half its size, briefly holds commits to send them back to its start, so commits overwrite written blocks. Its file lock admits one writing process. |
-| **RocksDB** | Single-server deployments | The log in its own column family, the WAL synced on each commit, and its lock file admitting one process. Five WAL files are written when the store opens and overwritten from then on, and a flush comes due once the live WAL reaches three memtables' worth, so commits stay within those files. A crash while they are written leaves a store that still opens. Point reads check a Bloom filter in each table and memtable. Behind the `rocksdb` feature. |
+| **RocksDB** | Single-server deployments | The log in its own column family, the WAL synced on each commit, and its lock file admitting one process. Five WAL files are written when the store opens and overwritten from then on, and a flush comes due once the live WAL reaches three memtables' worth, so commits stay within those files. A crash while they are written leaves a store that still opens. Point reads check a Bloom filter in each table and memtable. A range clear leaves a range tombstone, so a group that expires records writes one for each, and the rate falls by 94% once records expire (`BENCHMARKS.md`, "Expiring records"). Behind the `rocksdb` feature. |
+| **lionturtle** | Single-server deployments | One keyspace: the tree beneath `00` and the log beneath `01`, keyed by version. Every commit is a durable write that returns once it is readable. Each log segment is zero-filled ahead of its writes, so commits overwrite written blocks. lionturtle deletes key by key, so a range clear reads what it clears, which costs it a third of its rate once request records expire (`BENCHMARKS.md`, "Expiring records"), and truncation deletes the log oldest first, a chunk at a time, so a crash partway leaves its newest entries whole. A write that fails stops the store, which then answers `Unavailable` until the server restarts and recovers from the log, because the failed batch stays readable in memory though it may never reach the disk. A lock file beside the store's directory admits one process. |
 | **FoundationDB** | Replicated deployments, with standbys | A store under one key prefix: the tree beneath `<prefix> 00`, the log beneath `<prefix> 01` in chunks of up to 100,000 bytes keyed by version and chunk number, and the newest logged version at `<prefix> 02`, which `wait_past` watches. Stores share a cluster without touching. Behind the `fdb` feature. |
 
 - **Every backend has one writer.** A batch takes microseconds of CPU, so the durability wait bounds the commit rate: a sync locally, a commit of a millisecond or more on FoundationDB. Group commit spreads that wait over many batches ([The writer](#the-writer)).
-- **A sync of written blocks costs the device alone.** One that grows a file or converts an allocated extent also commits the file system's journal, which costs 3 to 7 times as much on local NVMe and twice on gp3 (`BENCHMARKS.md`, "Devices"). So SQLite and RocksDB keep their logs in files already written.
-- **RocksDB and FoundationDB link C++ libraries,** so they sit behind cargo features. `core` and the simulator build without them.
+- **A sync of written blocks costs the device alone.** One that grows a file or converts an allocated extent also commits the file system's journal, which costs 2.5 to 4 times as much on local NVMe and twice on gp3 (`BENCHMARKS.md`, "Devices"). So SQLite, RocksDB and lionturtle keep their logs in files already written.
+- **RocksDB and FoundationDB link C++ libraries,** so they sit behind cargo features. lionturtle is Rust, and every build has it. `core` and the simulator build without any of them.
 - **InodeDB uses existing engines.** An engine of our own, a data file and a WAL, would write each change once, since its WAL could serve as the log, and would let the simulator inject torn writes and lost syncs. It would also need its own page format, recovery, checksums and replication. Replication decides it: blob keys are random, so losing the metadata loses the data, and FoundationDB already replicates. `append_log` and `read_log` stand apart in the trait so that such an engine can arrive later as another backend.
 
 ### Key layout
@@ -310,11 +311,11 @@ Numbers are big-endian, so ranges scan in numeric order. Values sit apart from i
 - read-your-writes within a transaction, and snapshot reads across transactions;
 - conflicts: write skew fails, a scan conflicts with an insert into its range, and a transaction that read the head record fails once another commit changes it;
 - a writer's handle: it reads its own commits, and once another handle commits, it conflicts on what changed and then reads the latest;
-- `commit_group`: it checks the head, applies nothing when fenced or past the limits, and conflicts with transactions that read what it writes, on a writer's handle too;
+- `commit_group`: it checks the head, applies its writes in order, applies nothing when fenced or past the limits, and conflicts with transactions that read what it writes, on a writer's handle too;
 - log order, truncation and `wait_past`;
 - `Unknown` from backends that report it, and durability across close and reopen.
 
-Every CI run tests memory, SQLite and RocksDB, memory's injected unknown outcomes and outages, and FoundationDB in a container (`scripts/fdb`). The suite carries the simulator's results to real deployments: the simulator shows InodeDB correct over the contract, and the suite shows each backend keeps the contract.
+Every CI run tests memory, SQLite, RocksDB and lionturtle, memory's injected unknown outcomes and outages, and FoundationDB in a container (`scripts/fdb`). The suite carries the simulator's results to real deployments: the simulator shows InodeDB correct over the contract, and the suite shows each backend keeps the contract.
 
 ## The writer
 
@@ -334,7 +335,7 @@ One server writes. On FoundationDB, other servers run as standbys.
 
 ### Fencing
 
-On SQLite and RocksDB, the database's lock admits one process, and a starting server writes at once. On FoundationDB, every server starts as a standby, and the head record does the fencing.
+On SQLite, RocksDB and lionturtle, the database's lock admits one process, and a starting server writes at once. On FoundationDB, every server starts as a standby, and the head record does the fencing.
 
 - **Renewal.** Every commit renews the writer's lease, `writer.lease_ms` (5 seconds by default) from when the commit went out. An idle writer commits the head alone every `writer.renew_every_ms` (a second by default).
 - **Takeover.** A standby reads the head record every 100 ms. Once it has seen the record unchanged for the lease plus `writer.takeover_margin_ms` (a second by default) on its own clock, it starts a writer that reads the store and commits the next epoch, expecting the head it watched. A head that changed meanwhile means the writer renewed, and the standby goes back to watching. An empty store has no writer to wait for.
@@ -469,7 +470,7 @@ One thread runs clients with caches and snapshots, a writer, standbys that follo
 - A seed replays its run exactly. The simulator's PRNG is its own module, `sim/src/prng.rs`, and each source of randomness draws from its own stream, so a new source leaves existing draws unchanged.
 - `--seeds N` sweeps N seeds on every core.
 - A bug the simulator finds becomes a regression test in `sim/tests` that runs its seed. The commit message records the seed and the commit that failed.
-- `scripts/mutants` plants known bugs one at a time and requires some layer to catch each: skipping the cycle check or its reverse for `Exchange`, keeping a file's link count on unlink, releasing below a lease, dropping the request-id lookup, skipping the epoch check, skipping the scope check on reads by handle, an op that applies although an op it names in `Applied` was skipped, a batch answered before the groups it was evaluated against commit, a cache that keeps a name a commit removed, a feed that leaves cached links as they were, a snapshot that ignores its undo records, a writer that answers after its lease, a read from the cache past the lease or outside its key's root, a standby that waits out a released head. `scripts/mutants --rocksdb` plants bugs in the RocksDB backend, and `scripts/fdb python3 scripts/mutants --fdb` in the FoundationDB backend, against a cluster. `EVIDENCE.md` maps every behavior here to the tests, properties and planted bugs that check it.
+- `scripts/mutants` plants known bugs one at a time and requires some layer to catch each: skipping the cycle check or its reverse for `Exchange`, keeping a file's link count on unlink, releasing below a lease, dropping the request-id lookup, skipping the epoch check, skipping the scope check on reads by handle, an op that applies although an op it names in `Applied` was skipped, a batch answered before the groups it was evaluated against commit, a cache that keeps a name a commit removed, a feed that leaves cached links as they were, a snapshot that ignores its undo records, a writer that answers after its lease, a read from the cache past the lease or outside its key's root, a standby that waits out a released head. `scripts/mutants --rocksdb` and `--lionturtle` plant bugs in those backends, and `scripts/fdb python3 scripts/mutants --fdb` in the FoundationDB backend, against a cluster. `EVIDENCE.md` maps every behavior here to the tests, properties and planted bugs that check it.
 
 ### Conformance and differential suites
 
@@ -483,7 +484,7 @@ One thread runs clients with caches and snapshots, a writer, standbys that follo
 |---|---|
 | `core` | Inode semantics, batch execution, the cache and snapshots, changefeed effects, lease and release decisions, `fsck`. No I/O, clocks or threads. |
 | `storage` | The trait, key encoding, and the memory backend. |
-| `storage-sqlite`, `storage-rocksdb`, `storage-fdb` | Backends. |
+| `storage-sqlite`, `storage-rocksdb`, `storage-lionturtle`, `storage-fdb` | Backends. |
 | `storage-conformance` | The contract as a test suite generic over `Storage`. |
 | `proto` | The `.proto` files and tonic code generation. |
 | `transport` | gRPC over HTTP/2 for tonic's generated code: the client's channel and the server's connection loop. |
@@ -531,12 +532,12 @@ Each default, and the measurement it rests on (`BENCHMARKS.md`; rates are batche
 
 | Setting | Default | Basis |
 | --- | --- | --- |
-| `writer.lease_ms`, `renew_every_ms`, `takeover_margin_ms` | 5 s, 1 s, 1 s | Failover takes 6.2 s on FoundationDB. A grouped FoundationDB commit's p99 at 128 clients is under 10 ms on EC2, local NVMe or gp3, well inside the lease, and an idle writer commits once a second. The margin covers clocks drifting apart by up to a fifth of the lease. |
+| `writer.lease_ms`, `renew_every_ms`, `takeover_margin_ms` | 5 s, 1 s, 1 s | Failover takes 6.2 s on FoundationDB. A grouped FoundationDB commit's p99 at 128 clients is under 10 ms, on local NVMe or gp3, well inside the lease, and an idle writer commits once a second. The margin covers clocks drifting apart by up to a fifth of the lease. |
 | `writer.lease_ttl_ms` | 30 s | Heartbeats go every 10 seconds, so a reader rides out two lost ones; a dead reader holds the horizon back 30 seconds. |
 | `writer.claim_ttl_ms` | 60 s | A consumer deletes a claim's blobs well within it; one that dies returns its entries a minute later. |
 | `log.min_retention_ms`, `max_retention_ms` | 5 min, 1 h | A log entry takes 43 to 74 bytes: 18 MB for five minutes at 1,000, and 216 MB for an hour. |
 | `request_ttl` | 10 min, 5 at least | Five times the client's two-minute retry deadline. A live record takes about 100 bytes of the writer's memory and a little more in storage: 60 MB of memory at 1,000. |
-| `group_max_bytes` | 9 MB | FoundationDB's 10,000,000-byte transactions, less the head, expiry deletions and up to 512 KiB of lease heartbeats. At 128 clients, grouping multiplies FoundationDB throughput 25 times on local NVMe and 18 times on gp3. |
+| `group_max_bytes` | 9 MB | FoundationDB's 10,000,000-byte transactions, less the head, expiry deletions and up to 512 KiB of lease heartbeats. At 128 clients, grouping multiplies FoundationDB throughput 30 times on local NVMe and 18 times on gp3. |
 | `undo_bytes` | 64 MiB | A replaced value's undo takes 160 bytes, so a snapshot outlasts about 400,000 changes in its subtree. |
 | `cache.tree_bytes`, `value_bytes` | 1 GiB of tree, 256 MiB of values | A cached file holds 910 bytes and is charged 983: about a million files. |
 | `cache.preload` | on | The server serves while it reads, and the cache reaches its budget at most, so the cost is memory the budget already allows. |

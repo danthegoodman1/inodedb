@@ -1,6 +1,6 @@
 //! Batches per second through the server, with and without group commit.
 //!
-//!     cargo run --release -p inodedb-tests --example commits --features rocksdb,fdb [-- SECONDS]
+//!     cargo run --release -p inodedb-tests --example commits --features rocksdb,fdb [-- SECONDS [BACKENDS]]
 //!
 //! Each client commits one small file per batch into its own directory, as
 //! fast as answers come back. "One per group" caps groups at one batch.
@@ -85,10 +85,12 @@ fn report(backend: &str, grouping: &str, clients: usize, run: &Run) {
 
 #[tokio::main]
 async fn main() {
-    let seconds = std::env::args()
-        .nth(1)
-        .and_then(|arg| arg.parse().ok())
-        .unwrap_or(3);
+    let mut args = std::env::args().skip(1);
+    let seconds = args.next().and_then(|arg| arg.parse().ok()).unwrap_or(3);
+    let backends = args
+        .next()
+        .unwrap_or_else(|| "sqlite,rocksdb,lionturtle,fdb".to_string());
+    let chosen = |backend: &str| backends.split(',').any(|name| name == backend);
     let groupings = [
         (
             "one per group",
@@ -100,22 +102,24 @@ async fn main() {
         ("grouped", Config::default()),
     ];
     #[cfg(feature = "fdb")]
-    let mut fdb = inodedb_storage_conformance::backends::Fdb::new();
+    let mut fdb = chosen("fdb").then(inodedb_storage_conformance::backends::Fdb::new);
     println!("| Backend | Commit | Clients | Batches/s | p50 ms | p99 ms |");
     println!("| --- | --- | ---: | ---: | ---: | ---: |");
     for clients in [1, 16, 128] {
         for (grouping, config) in &groupings {
-            let dir = tempfile::tempdir().expect("a scratch directory");
-            let storage =
-                inodedb_storage_sqlite::Sqlite::open(dir.path().join("db.sqlite")).expect("opens");
-            report(
-                "SQLite",
-                grouping,
-                clients,
-                &drive(storage, config.clone(), clients, seconds).await,
-            );
+            if chosen("sqlite") {
+                let dir = tempfile::tempdir().expect("a scratch directory");
+                let storage = inodedb_storage_sqlite::Sqlite::open(dir.path().join("db.sqlite"))
+                    .expect("opens");
+                report(
+                    "SQLite",
+                    grouping,
+                    clients,
+                    &drive(storage, config.clone(), clients, seconds).await,
+                );
+            }
             #[cfg(feature = "rocksdb")]
-            {
+            if chosen("rocksdb") {
                 let dir = tempfile::tempdir().expect("a scratch directory");
                 let storage =
                     inodedb_storage_rocksdb::Rocks::open(dir.path().join("db")).expect("opens");
@@ -126,8 +130,19 @@ async fn main() {
                     &drive(storage, config.clone(), clients, seconds).await,
                 );
             }
+            if chosen("lionturtle") {
+                let dir = tempfile::tempdir().expect("a scratch directory");
+                let storage = inodedb_storage_lionturtle::Lionturtle::open(dir.path().join("db"))
+                    .expect("opens");
+                report(
+                    "lionturtle",
+                    grouping,
+                    clients,
+                    &drive(storage, config.clone(), clients, seconds).await,
+                );
+            }
             #[cfg(feature = "fdb")]
-            {
+            if let Some(fdb) = &mut fdb {
                 use inodedb_storage_conformance::Backend;
                 let storage = fdb.fresh();
                 report(

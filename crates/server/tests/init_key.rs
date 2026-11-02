@@ -101,6 +101,41 @@ async fn the_first_key_comes_from_the_key_file() {
     assert_eq!(refused.code(), tonic::Code::Unauthenticated);
 }
 
+/// The binary serves a lionturtle store from its config, and finds what it
+/// committed after a kill.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_keeps_a_lionturtle_store() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port();
+    let config = dir.path().join("inodedb.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "listen = \"127.0.0.1:{port}\"\n[storage]\nbackend = \"lionturtle\"\npath = {:?}\n",
+            dir.path().join("db")
+        ),
+    )
+    .expect("writes the config");
+    let key_file = dir.path().join("admin.key");
+    let mut server = serve(&config, &key_file);
+    let key = loop {
+        match std::fs::read_to_string(&key_file) {
+            Ok(key) if key.ends_with('\n') => break key.trim().to_string(),
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+    let before = stat_root(port, &key).await.expect("the key works");
+    server.kill().await.expect("stops");
+    server.wait().await.expect("exits");
+    let mut server = serve(&config, &key_file);
+    let after = stat_root(port, &key).await.expect("the store kept the key");
+    assert!(after >= before, "version {after} after {before}");
+    server.kill().await.expect("stops");
+}
+
 async fn revoke(port: u16, key: &str) {
     let mut rpc = pb::inode_db_client::InodeDbClient::connect(format!("http://127.0.0.1:{port}"))
         .await

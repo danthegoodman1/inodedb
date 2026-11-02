@@ -137,6 +137,15 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
+        StorageConfig::Lionturtle { path } => {
+            match inodedb_storage_lionturtle::Lionturtle::open(path) {
+                Ok(storage) => inodedb_server::serve(storage, listener, settings, shutdown).await,
+                Err(error) => {
+                    eprintln!("level=error msg=\"cannot open lionturtle\" error=\"{error}\"");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         #[cfg(feature = "rocksdb")]
         StorageConfig::Rocksdb { path } => match inodedb_storage_rocksdb::Rocks::open(path) {
             Ok(storage) => inodedb_server::serve(storage, listener, settings, shutdown).await,

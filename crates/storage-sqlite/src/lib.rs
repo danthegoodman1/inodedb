@@ -6,7 +6,7 @@
 //! the WAL into the database file, so commits rarely wait on a checkpoint.
 //!
 //! A sync that must also grow a file commits the file system's journal, which
-//! costs up to three times the write itself on local NVMe and twice on gp3
+//! costs up to four times the write itself on local NVMe and twice on gp3
 //! (`BENCHMARKS.md`, "Devices"). So the WAL file is written to its full size
 //! when the store opens, and the thread sends commits back to its start before
 //! they pass its end, so they overwrite written blocks. `.cargo/config.toml`

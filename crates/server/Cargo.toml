@@ -20,6 +20,7 @@ inodedb-core.workspace = true
 inodedb-proto.workspace = true
 inodedb-storage.workspace = true
 inodedb-storage-fdb = { workspace = true, optional = true }
+inodedb-storage-lionturtle.workspace = true
 inodedb-storage-rocksdb = { workspace = true, optional = true }
 inodedb-storage-sqlite.workspace = true
 inodedb-transport.workspace = true

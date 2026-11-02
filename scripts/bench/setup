@@ -1,15 +1,23 @@
 #!/bin/bash
-# Prepares an Ubuntu 24.04 EC2 instance with local NVMe and a 500 GiB gp3
-# volume to benchmark InodeDB: tools, an XFS file system on each device at
-# /mnt/nvme and /mnt/ebs, and FoundationDB. scripts/ec2/bench runs the
-# benchmarks.
+# Prepares an Ubuntu 24.04 machine with a local NVMe drive to benchmark InodeDB:
+# tools, an XFS file system at /mnt/nvme, and FoundationDB. On EC2, a 500 GiB gp3
+# volume gets one too, at /mnt/ebs. scripts/bench/run runs the benchmarks.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -q
 sudo apt-get install -yq build-essential clang libclang-dev protobuf-compiler pkg-config xfsprogs rsync fio
 curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
-# The local NVMe drive and the gp3 volume, by model and size.
+# EC2's instance store, or else the first NVMe drive with nothing on it.
 nvme=$(lsblk -dn -o NAME,MODEL | awk '/Instance Storage/{print "/dev/"$1; exit}')
+if [ -z "$nvme" ]; then
+  for disk in $(lsblk -dn -o NAME | grep '^nvme'); do
+    if [ -z "$(lsblk -n -o FSTYPE,MOUNTPOINT "/dev/$disk" | tr -d ' ')" ]; then
+      nvme=/dev/$disk
+      break
+    fi
+  done
+fi
+[ -n "$nvme" ] || { echo "no free NVMe drive" >&2; exit 1; }
 ebs=$(lsblk -dn -o NAME,SIZE,MODEL | awk '/Elastic Block Store/ && $2=="500G"{print "/dev/"$1}')
 mount_at() {
   sudo mkfs.xfs -f -q "$1"
@@ -18,10 +26,10 @@ mount_at() {
   sudo chown ubuntu:ubuntu "$2"
 }
 mount_at "$nvme" /mnt/nvme
-mount_at "$ebs" /mnt/ebs
+if [ -n "$ebs" ]; then mount_at "$ebs" /mnt/ebs; fi
 v=7.3.79
 base="https://github.com/apple/foundationdb/releases/download/$v"
 curl -fsSL -o /tmp/clients.deb "$base/foundationdb-clients_$v-1_amd64.deb"
 curl -fsSL -o /tmp/server.deb "$base/foundationdb-server_$v-1_amd64.deb"
 sudo dpkg -i /tmp/clients.deb /tmp/server.deb
-df -h /mnt/nvme /mnt/ebs
+df -h /mnt/nvme

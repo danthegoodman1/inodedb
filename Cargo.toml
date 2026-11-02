@@ -10,6 +10,7 @@ members = [
     "crates/storage",
     "crates/storage-conformance",
     "crates/storage-fdb",
+    "crates/storage-lionturtle",
     "crates/storage-rocksdb",
     "crates/storage-sqlite",
     "crates/transport",
@@ -25,6 +26,7 @@ default-members = [
     "crates/sim",
     "crates/storage",
     "crates/storage-conformance",
+    "crates/storage-lionturtle",
     "crates/storage-sqlite",
     "tests",
 ]
@@ -40,6 +42,7 @@ inodedb-core = { path = "crates/core" }
 inodedb-proto = { path = "crates/proto" }
 inodedb-server = { path = "crates/server" }
 inodedb-storage = { path = "crates/storage" }
+inodedb-storage-lionturtle = { path = "crates/storage-lionturtle" }
 inodedb-storage-rocksdb = { path = "crates/storage-rocksdb" }
 inodedb-storage-conformance = { path = "crates/storage-conformance" }
 inodedb-storage-fdb = { path = "crates/storage-fdb" }
@@ -56,6 +59,7 @@ h2 = "0.4.13"
 http = "1.4.0"
 http-body = "1.0.1"
 prost = "0.14.4"
+lionturtle = "0.5.3"
 rocksdb = { version = "0.25.0", default-features = false, features = ["lz4"] }
 rusqlite = "0.41.1"
 serde = "1.0.229"

@@ -26,10 +26,11 @@ macro_rules! conformance {
     ($make:expr) => {
         $crate::conformance!(@tests $make;
             byte_order, ranges_and_limits, large_scans_arrive_whole, gets_and_clears,
-            read_your_writes,
+            read_your_writes, a_limit_counts_what_a_scan_returns,
             uncommitted_writes_stay_hidden, write_skew_fails, scans_conflict_with_inserts,
             reading_the_head_fences, log_order_and_truncation, wait_past_wakes,
             limits_hold, durable_across_reopen, commit_and_resolve, commit_group_checks_the_head,
+            a_group_applies_its_writes_in_order,
             a_writers_groups_conflict_with_another_writer, a_writers_handle_reads_its_commits);
     };
     (@tests $make:expr; $($check:ident),* $(,)?) => {
@@ -189,6 +190,38 @@ pub async fn read_your_writes<B: Backend>(backend: &mut B) {
     assert_eq!(
         txn.get(&key(b"z")).await.expect("get"),
         Some(b"26".to_vec())
+    );
+}
+
+/// A transaction's scan fills its limit from what remains once the
+/// transaction's own writes apply, however many stored keys they hide.
+pub async fn a_limit_counts_what_a_scan_returns<B: Backend>(backend: &mut B) {
+    let store = backend.fresh();
+    let pairs: [(&[u8], &[u8]); 5] = [
+        (b"a", b"1"),
+        (b"b", b"2"),
+        (b"c", b"3"),
+        (b"d", b"4"),
+        (b"e", b"5"),
+    ];
+    put_all(&store, &pairs).await;
+    let mut txn = store.begin().await.expect("begin");
+    txn.clear(&key(b"a"));
+    txn.clear(&key(b"b"));
+    let found = txn.scan(all(), 2).await.expect("scan");
+    assert_eq!(
+        found,
+        vec![(key(b"c"), b"3".to_vec()), (key(b"d"), b"4".to_vec())]
+    );
+    txn.clear_range(KeyRange {
+        start: key(b"c"),
+        end: key(b"d"),
+    });
+    txn.set(&key(b"0"), b"0");
+    let found = txn.scan(all(), 2).await.expect("scan");
+    assert_eq!(
+        found,
+        vec![(key(b"0"), b"0".to_vec()), (key(b"d"), b"4".to_vec())]
     );
 }
 
@@ -467,6 +500,33 @@ pub async fn commit_group_checks_the_head<B: Backend>(backend: &mut B) {
 
 /// A writer's handle may skip reading the head it last wrote, so its next group
 /// must still fail once another writer has committed.
+/// A range clears what the store holds and what the group set before it, and
+/// keeps what the group sets after it.
+pub async fn a_group_applies_its_writes_in_order<B: Backend>(backend: &mut B) {
+    let store = backend.fresh();
+    put_all(
+        &store,
+        &[(b"r/stored", b"1"), (b"r/again", b"1"), (b"s", b"1")],
+    )
+    .await;
+    let mut writes = WriteSet::default();
+    writes.set(key(b"r/before"), b"2".to_vec());
+    writes.set(keys::head(), b"h".to_vec());
+    writes.writes.push(KvWrite::ClearRange(KeyRange {
+        start: key(b"r/"),
+        end: key(b"r0"),
+    }));
+    writes.set(key(b"r/again"), b"2".to_vec());
+    assert_eq!(
+        store.commit_group(None, std::sync::Arc::new(writes)).await,
+        CommitOutcome::Committed
+    );
+    assert_eq!(get(&store, b"r/stored").await, None);
+    assert_eq!(get(&store, b"r/before").await, None);
+    assert_eq!(get(&store, b"r/again").await, Some(b"2".to_vec()));
+    assert_eq!(get(&store, b"s").await, Some(b"1".to_vec()));
+}
+
 pub async fn a_writers_groups_conflict_with_another_writer<B: Backend>(backend: &mut B) {
     let store = backend.fresh();
     let group = |head: &[u8]| {
