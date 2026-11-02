@@ -1,7 +1,7 @@
 //! Scripted scenarios for a writer that reads the tree into its cache when
 //! it starts.
 
-use inodedb_core::cache::Budget;
+use inodedb_core::cache::{Budget, DIR_BYTES, INODE_BYTES, NAME_BYTES};
 use inodedb_core::preload::{Cursor, PAGE};
 use inodedb_core::query::{Query, QueryResult, Target};
 use inodedb_core::types::Error;
@@ -76,7 +76,8 @@ fn a_directory_larger_than_a_page_arrives_as_names() {
     for chunk in names.chunks(500) {
         h.ops(chunk.iter().map(|name| put(name, "")));
     }
-    h.ops([mkdir("small"), put("small/f", "")]);
+    // An empty directory whose entries would lie pages past the root's.
+    h.ops([mkdir("small"), put("small/f", ""), mkdir("empty")]);
     let mut h = Harness::with(h.storage.clone(), preloading());
     assert_eq!(stat(&mut h, "big/f00000"), (true, 0));
     assert_eq!(stat(&mut h, &format!("big/f{:05}", PAGE + 9)), (true, 0));
@@ -86,21 +87,26 @@ fn a_directory_larger_than_a_page_arrives_as_names() {
         "a name missing from a partial directory needs a read"
     );
     assert_eq!(stat(&mut h, "small/missing"), (false, 0));
+    assert_eq!(stat(&mut h, "empty/missing"), (false, 0));
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
 
 #[test]
-fn a_preload_stops_at_the_cache_budget() {
+fn an_empty_store_preloads_as_an_empty_root() {
+    let h = Harness::new();
+    let mut h = Harness::with(h.storage.clone(), preloading());
+    assert_eq!(stat(&mut h, "missing"), (false, 0));
+}
+
+#[test]
+fn a_preload_stops_at_the_cache_budget_with_the_entries_first() {
     let mut h = Harness::new();
     h.ops([mkdir("d")]);
-    let names: Vec<String> = (0..PAGE + 10)
-        .map(|index| format!("d/f{index:05}"))
-        .collect();
-    for chunk in names.chunks(500) {
-        h.ops(chunk.iter().map(|name| put(name, "")));
-    }
+    let names: Vec<String> = (0..50).map(|index| format!("d/f{index:05}")).collect();
+    h.ops(names.iter().map(|name| put(name, "")));
+    // Room for both listings and about ten of the 52 inode records.
     let budget = Budget {
-        inodes: 10,
+        tree_bytes: 2 * DIR_BYTES + (NAME_BYTES + 1) + 50 * (NAME_BYTES + 6) + 10 * INODE_BYTES,
         ..Budget::default()
     };
     let config = Config {
@@ -108,7 +114,7 @@ fn a_preload_stops_at_the_cache_budget() {
         ..Config::default()
     };
     let plain = Harness::with(h.storage.clone(), config.clone());
-    let preloaded = Harness::with(
+    let mut preloaded = Harness::with(
         h.storage.clone(),
         Config {
             preload: true,
@@ -117,10 +123,18 @@ fn a_preload_stops_at_the_cache_budget() {
     );
     assert_eq!(
         preloaded.reads - plain.reads,
-        1,
-        "the first page of inodes fills the budget, and the preload stops"
+        2,
+        "a page of entries, then a page of inodes that fills the budget"
     );
-    assert!(preloaded.writer.cache().inodes() <= budget.inodes);
+    let cache = preloaded.writer.cache();
+    assert!(cache.tree_bytes() <= budget.tree_bytes);
+    assert!((1..52).contains(&cache.inodes()), "{}", cache.inodes());
+    assert_eq!(stat(&mut preloaded, "d/missing"), (false, 0));
+    assert_eq!(
+        stat(&mut preloaded, "d/f00049"),
+        (true, 1),
+        "the path resolves from the cache, and only the record needs a read"
+    );
 }
 
 #[test]

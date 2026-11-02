@@ -22,7 +22,7 @@ pub mod prng;
 
 use generate::Shape;
 use inodedb_core::auth::{Caller, Denied, Grant, KeyError, KeyId, KeyOp};
-use inodedb_core::cache::{Budget, Cache};
+use inodedb_core::cache::{Budget, Cache, DIR_BYTES, INODE_BYTES};
 use inodedb_core::feed::{Change, Subscriber, route};
 use inodedb_core::fsck;
 use inodedb_core::keys::{self, KvRead, KvResult, Parsed, WriteSet};
@@ -170,8 +170,10 @@ impl Options {
             },
             cache: if prng.percent(30) {
                 Budget {
-                    dirs: prng.range(0..=6) as usize,
-                    inodes: prng.range(0..=12) as usize,
+                    // Room for a few directories and a dozen inode records.
+                    tree_bytes: (prng.range(0..=6) * DIR_BYTES as u64
+                        + prng.range(0..=12) * INODE_BYTES as u64)
+                        as usize,
                     value_bytes: prng.range(0..=200) as usize,
                     undo_bytes: prng.range(0..=4_000) as usize,
                 }

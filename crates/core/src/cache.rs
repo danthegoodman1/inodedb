@@ -7,17 +7,18 @@ use crate::snapshot::Kept;
 use crate::types::{Entry, Ino, Inode, Kind, Name, Version};
 use crate::view::{Fact, Lookup, Read, View};
 use bytes::Bytes;
+use std::cell::Cell;
+use std::collections::btree_map;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 
-/// How much a cache holds before it evicts what it cached longest ago.
+/// How much a cache holds before it evicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
-    /// Directories with entries cached.
-    pub dirs: usize,
-    /// Inode records, with each file's links.
-    pub inodes: usize,
-    /// Bytes of values.
+    /// Bytes of directories' entries, inode records and files' links, as
+    /// the cache charges them.
+    pub tree_bytes: usize,
+    /// Bytes of values, as the cache charges them.
     pub value_bytes: usize,
     /// Bytes of a subscriber's undo records and kept states, for its
     /// snapshots.
@@ -26,24 +27,56 @@ pub struct Budget {
 
 impl Default for Budget {
     fn default() -> Budget {
-        // A cached file costs about 830 bytes, so a full cache holds about
-        // 0.8 GB of tree beside its values (`BENCHMARKS.md`).
+        // About a million cached files beside 256 MiB of values
+        // (`BENCHMARKS.md`).
         Budget {
-            dirs: 1 << 18,
-            inodes: 1 << 20,
+            tree_bytes: 1 << 30,
             value_bytes: 256 << 20,
             undo_bytes: 64 << 20,
         }
     }
 }
 
+/// What the cache charges for each record: at least what the allocator
+/// holds for it, eviction's bookkeeping included, so a cache within its
+/// budget is within that much memory (`BENCHMARKS.md`). A directory's
+/// entries cost `DIR_BYTES` and each name `NAME_BYTES` beside its own
+/// bytes; an inode's record costs `INODE_BYTES`; a file's links cost
+/// `LINKS_BYTES` and each link as a name. A value costs `VALUE_BYTES`
+/// beside its bytes, against `value_bytes`.
+pub const DIR_BYTES: usize = 570;
+pub const NAME_BYTES: usize = 80;
+pub const INODE_BYTES: usize = 250;
+pub const LINKS_BYTES: usize = 360;
+pub const VALUE_BYTES: usize = 200;
+
+fn name_bytes(name: &[u8]) -> usize {
+    NAME_BYTES + name.len()
+}
+
+fn links_bytes(links: &Links) -> usize {
+    LINKS_BYTES
+        + links
+            .iter()
+            .map(|(_, name)| name_bytes(name))
+            .sum::<usize>()
+}
+
+fn value_bytes(value: &Option<Bytes>) -> usize {
+    VALUE_BYTES + value.as_ref().map_or(0, Bytes::len)
+}
+
 /// The order the cache last wrote what it holds. Each write takes the
 /// next place; a queue keeps places oldest first, and a place the key has
-/// since left is stale.
+/// since left is stale. Eviction sweeps a hand from the oldest place to
+/// the newest, then starts again from the oldest, passing over once each
+/// key a read used since the hand last passed it (SIEVE).
 #[derive(Debug)]
 struct Queue<K> {
     places: VecDeque<(u64, K)>,
     latest: BTreeMap<K, u64>,
+    /// Where the hand's sweep goes on from.
+    hand: u64,
 }
 
 impl<K> Default for Queue<K> {
@@ -51,6 +84,7 @@ impl<K> Default for Queue<K> {
         Queue {
             places: VecDeque::new(),
             latest: BTreeMap::new(),
+            hand: 0,
         }
     }
 }
@@ -59,8 +93,11 @@ impl<K: Ord + Copy> Queue<K> {
     fn touch(&mut self, place: u64, key: K) {
         self.latest.insert(key, place);
         self.places.push_back((place, key));
-        // Writes to the same keys leave stale places; drop them once they
-        // outnumber the keys.
+        self.compact();
+    }
+
+    /// Drops stale places once they outnumber the keys.
+    fn compact(&mut self) {
         if self.places.len() > 2 * self.latest.len() + 1024 {
             let latest = &self.latest;
             self.places
@@ -68,19 +105,35 @@ impl<K: Ord + Copy> Queue<K> {
         }
     }
 
-    /// The key written longest ago, if written before `spare`.
-    fn oldest(&mut self, spare: u64) -> Option<K> {
-        while let Some(&(place, key)) = self.places.front() {
-            if place >= spare {
-                return None;
-            }
-            self.places.pop_front();
-            if self.latest.get(&key) == Some(&place) {
+    /// The next key to evict among those written before `spare`. `used`
+    /// says whether a read used a key since the hand last passed it, and
+    /// clears that.
+    fn next(&mut self, spare: u64, used: impl Fn(&K) -> bool) -> Option<K> {
+        let mut from = self.hand;
+        loop {
+            let start = self.places.partition_point(|(place, _)| *place < from);
+            let mut passed = false;
+            for &(place, key) in self.places.range(start..) {
+                if place >= spare {
+                    break;
+                }
+                if self.latest.get(&key) != Some(&place) {
+                    continue;
+                }
+                if used(&key) {
+                    passed = true;
+                    continue;
+                }
+                self.hand = place + 1;
                 self.latest.remove(&key);
+                self.compact();
                 return Some(key);
             }
+            if from == 0 && !passed {
+                return None;
+            }
+            from = 0;
         }
-        None
     }
 
     fn forget(&mut self, key: K) {
@@ -88,31 +141,113 @@ impl<K: Ord + Copy> Queue<K> {
     }
 }
 
+/// What the tree's queue orders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Record {
+    /// A directory's entries.
+    Entries(Ino),
+    /// An inode's record and, for a file, its links.
+    Inode(Ino),
+}
+
 #[derive(Default, Debug)]
 struct Order {
-    dirs: Queue<Ino>,
-    inodes: Queue<Ino>,
+    tree: Queue<Record>,
     values: Queue<(Ino, Version)>,
     written: u64,
 }
 
-#[derive(Default, Debug)]
+/// A cached record, and whether a read used it since eviction's hand last
+/// passed it.
+#[derive(Debug)]
+struct Held<T> {
+    record: T,
+    used: Cell<bool>,
+}
+
+impl<T> Held<T> {
+    fn new(record: T) -> Held<T> {
+        Held {
+            record,
+            used: Cell::new(false),
+        }
+    }
+
+    /// The record, for a read.
+    fn read(&self) -> &T {
+        self.used.set(true);
+        &self.record
+    }
+}
+
+/// Records `record` under `key`, keeping whether a read used what it
+/// replaces, and returns what it replaces.
+fn put<K: Ord, T>(held: &mut BTreeMap<K, Held<T>>, key: K, record: T) -> Option<T> {
+    match held.entry(key) {
+        btree_map::Entry::Vacant(slot) => {
+            slot.insert(Held::new(record));
+            None
+        }
+        btree_map::Entry::Occupied(slot) => {
+            Some(std::mem::replace(&mut slot.into_mut().record, record))
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Dir {
-    /// Known names: present entries and known-absent ones.
+    /// Known names: present entries and, until the directory is complete,
+    /// known-absent ones.
     entries: BTreeMap<Name, Option<Entry>>,
     /// Every present entry is in `entries`.
     complete: bool,
+    /// What the cache charges for the directory.
+    bytes: usize,
+}
+
+impl Dir {
+    fn new() -> Dir {
+        Dir {
+            entries: BTreeMap::new(),
+            complete: false,
+            bytes: DIR_BYTES,
+        }
+    }
+
+    /// Records what `name` holds. A complete directory keeps no record of
+    /// an absent name.
+    fn put(&mut self, name: Name, entry: Option<Entry>) {
+        if self.complete && entry.is_none() {
+            if self.entries.remove(&name).is_some() {
+                self.bytes -= name_bytes(&name);
+            }
+            return;
+        }
+        let bytes = name_bytes(&name);
+        if self.entries.insert(name, entry).is_none() {
+            self.bytes += bytes;
+        }
+    }
+
+    /// Makes the directory complete with no names, ready for its listing.
+    fn restart(&mut self) {
+        self.entries.clear();
+        self.complete = true;
+        self.bytes = DIR_BYTES;
+    }
 }
 
 #[derive(Default, Debug)]
 pub struct Cache {
     budget: Budget,
     order: Order,
+    /// What the cache charges for its directories, inode records and links.
+    tree_bytes: usize,
     value_bytes: usize,
-    inodes: BTreeMap<Ino, Option<Inode>>,
-    dirs: BTreeMap<Ino, Dir>,
-    backptrs: BTreeMap<Ino, Links>,
-    values: BTreeMap<(Ino, Version), Option<Bytes>>,
+    inodes: BTreeMap<Ino, Held<Option<Inode>>>,
+    dirs: BTreeMap<Ino, Held<Dir>>,
+    backptrs: BTreeMap<Ino, Held<Links>>,
+    values: BTreeMap<(Ino, Version), Held<Option<Bytes>>>,
     requests: BTreeMap<u128, Option<CommitResult>>,
     /// Every request id with a live record, once loaded, so a new id needs
     /// no read.
@@ -148,55 +283,101 @@ impl Cache {
         self.order.written - 1
     }
 
-    fn dir(&mut self, dir: Ino) -> &mut Dir {
+    /// Changes a directory's entries, recording it if the cache lacks it.
+    fn edit_dir(&mut self, dir: Ino, edit: impl FnOnce(&mut Dir)) {
         let place = self.place();
-        self.order.dirs.touch(place, dir);
-        self.dirs.entry(dir).or_default()
+        self.order.tree.touch(place, Record::Entries(dir));
+        let (cached, before) = match self.dirs.entry(dir) {
+            btree_map::Entry::Vacant(slot) => (&mut slot.insert(Held::new(Dir::new())).record, 0),
+            btree_map::Entry::Occupied(slot) => {
+                let cached = &mut slot.into_mut().record;
+                let before = cached.bytes;
+                (cached, before)
+            }
+        };
+        edit(cached);
+        self.tree_bytes += cached.bytes;
+        self.tree_bytes -= before;
     }
 
     fn put_inode(&mut self, ino: Ino, inode: Option<Inode>) {
         let place = self.place();
-        self.order.inodes.touch(place, ino);
-        self.inodes.insert(ino, inode);
+        self.order.tree.touch(place, Record::Inode(ino));
+        if put(&mut self.inodes, ino, inode).is_none() {
+            self.tree_bytes += INODE_BYTES;
+        }
     }
 
     fn put_backptrs(&mut self, ino: Ino, links: Links) {
         let place = self.place();
-        self.order.inodes.touch(place, ino);
-        self.backptrs.insert(ino, links);
+        self.order.tree.touch(place, Record::Inode(ino));
+        self.tree_bytes += links_bytes(&links);
+        if let Some(old) = put(&mut self.backptrs, ino, links) {
+            self.tree_bytes -= links_bytes(&old);
+        }
     }
 
     fn put_value(&mut self, key: (Ino, Version), value: Option<Bytes>) {
         let place = self.place();
         self.order.values.touch(place, key);
-        let len = value.as_ref().map_or(0, Bytes::len);
-        if let Some(old) = self.values.insert(key, value) {
-            self.value_bytes -= old.as_ref().map_or(0, Bytes::len);
+        self.value_bytes += value_bytes(&value);
+        if let Some(old) = put(&mut self.values, key, value) {
+            self.value_bytes -= value_bytes(&old);
         }
-        self.value_bytes += len;
     }
 
-    /// Evicts what it wrote longest ago until it fits its budget, sparing
-    /// what it wrote at or after `spare`, which reads in progress need.
+    fn remove_dir(&mut self, dir: Ino) -> Option<Dir> {
+        self.order.tree.forget(Record::Entries(dir));
+        let cached = self.dirs.remove(&dir)?.record;
+        self.tree_bytes -= cached.bytes;
+        Some(cached)
+    }
+
+    /// Drops an inode's record and links, returning the record.
+    fn remove_inode(&mut self, ino: Ino) -> Option<Option<Inode>> {
+        self.order.tree.forget(Record::Inode(ino));
+        if let Some(links) = self.backptrs.remove(&ino) {
+            self.tree_bytes -= links_bytes(&links.record);
+        }
+        let inode = self.inodes.remove(&ino)?;
+        self.tree_bytes -= INODE_BYTES;
+        Some(inode.record)
+    }
+
+    /// Evicts until it fits its budget, sparing what it wrote at or after
+    /// `spare`, which reads in progress need. Eviction passes over, once,
+    /// what a read used since eviction last passed it.
     pub fn evict(&mut self, spare: u64) {
-        while self.dirs.len() > self.budget.dirs
-            && let Some(dir) = self.order.dirs.oldest(spare)
-        {
-            self.dirs.remove(&dir);
+        while self.tree_bytes > self.budget.tree_bytes {
+            let Some(record) = self.order.tree.next(spare, |record| match record {
+                Record::Entries(dir) => self.dirs.get(dir).is_some_and(|held| held.used.take()),
+                Record::Inode(ino) => {
+                    let inode = self.inodes.get(ino).is_some_and(|held| held.used.take());
+                    let links = self.backptrs.get(ino).is_some_and(|held| held.used.take());
+                    inode || links
+                }
+            }) else {
+                break;
+            };
+            match record {
+                Record::Entries(dir) => {
+                    self.remove_dir(dir);
+                }
+                Record::Inode(ino) => {
+                    self.remove_inode(ino);
+                    self.free.remove(&ino);
+                    self.detach.remove(&ino);
+                }
+            }
         }
-        while self.inodes.len().max(self.backptrs.len()) > self.budget.inodes
-            && let Some(ino) = self.order.inodes.oldest(spare)
-        {
-            self.inodes.remove(&ino);
-            self.backptrs.remove(&ino);
-            self.free.remove(&ino);
-            self.detach.remove(&ino);
-        }
-        while self.value_bytes > self.budget.value_bytes
-            && let Some(key) = self.order.values.oldest(spare)
-        {
+        while self.value_bytes > self.budget.value_bytes {
+            let Some(key) = self.order.values.next(spare, |key| {
+                self.values.get(key).is_some_and(|held| held.used.take())
+            }) else {
+                break;
+            };
             if let Some(value) = self.values.remove(&key) {
-                self.value_bytes -= value.as_ref().map_or(0, Bytes::len);
+                self.value_bytes -= value_bytes(&value.record);
             }
         }
     }
@@ -221,8 +402,7 @@ impl Cache {
         let budget = std::mem::replace(
             &mut self.budget,
             Budget {
-                dirs: 0,
-                inodes: 0,
+                tree_bytes: 0,
                 value_bytes: 0,
                 undo_bytes: 0,
             },
@@ -236,12 +416,10 @@ impl Cache {
 
     /// Forgets a directory's entries, returning what it held of them.
     pub fn forget_entries(&mut self, dir: Ino) -> Kept {
-        self.order.dirs.forget(dir);
         Kept {
             inode: None,
             entries: self
-                .dirs
-                .remove(&dir)
+                .remove_dir(dir)
                 .map(|cached| (cached.entries, cached.complete)),
         }
     }
@@ -285,30 +463,35 @@ impl Cache {
             let Some(cached) = self.dirs.get(&dir) else {
                 continue;
             };
-            for entry in cached.entries.values().flatten() {
+            for entry in cached.record.entries.values().flatten() {
                 if reached.insert(entry.child) && entry.kind == Kind::Dir {
                     stack.push(entry.child);
                 }
             }
         }
         let mut forgot: BTreeMap<Ino, Kept> = BTreeMap::new();
-        let order = &mut self.order;
-        for (dir, cached) in self.dirs.extract_if(.., |dir, _| !reached.contains(dir)) {
-            order.dirs.forget(dir);
-            forgot.entry(dir).or_default().entries = Some((cached.entries, cached.complete));
+        for dir in outside(&self.dirs, &reached) {
+            if let Some(cached) = self.remove_dir(dir) {
+                forgot.entry(dir).or_default().entries = Some((cached.entries, cached.complete));
+            }
         }
-        for (ino, inode) in self.inodes.extract_if(.., |ino, _| !reached.contains(ino)) {
-            order.inodes.forget(ino);
-            forgot.entry(ino).or_default().inode = Some(inode);
+        let inodes: BTreeSet<Ino> = outside(&self.inodes, &reached)
+            .into_iter()
+            .chain(outside(&self.backptrs, &reached))
+            .collect();
+        for ino in inodes {
+            if let Some(inode) = self.remove_inode(ino) {
+                forgot.entry(ino).or_default().inode = Some(inode);
+            }
         }
-        self.backptrs.retain(|ino, _| reached.contains(ino));
         self.free.retain(|ino, _| reached.contains(ino));
         self.detach.retain(|ino, _| reached.contains(ino));
+        let order = &mut self.order;
         let mut dropped = 0;
         self.values.retain(|key, value| {
             let keep = reached.contains(&key.0);
             if !keep {
-                dropped += value.as_ref().map_or(0, Bytes::len);
+                dropped += value_bytes(&value.record);
                 order.values.forget(*key);
             }
             keep
@@ -320,10 +503,8 @@ impl Cache {
     /// Forgets an inode's record and, for a file, its links, returning
     /// what it held of them.
     pub fn forget_file(&mut self, ino: Ino) -> Kept {
-        self.backptrs.remove(&ino);
-        self.order.inodes.forget(ino);
         Kept {
-            inode: self.inodes.remove(&ino),
+            inode: self.remove_inode(ino),
             entries: None,
         }
     }
@@ -342,23 +523,21 @@ impl Cache {
                 self.put_inode(ino, inode);
             }
             Fact::Entry(dir, name, entry) => {
-                self.dir(dir).entries.insert(name, entry);
+                self.edit_dir(dir, |cached| cached.put(name, entry));
             }
             Fact::Listing {
                 dir,
                 entries,
                 complete,
             } => {
-                let cached = self.dir(dir);
-                if complete {
-                    cached.entries.clear();
-                    cached.complete = true;
-                }
-                for (name, entry) in entries {
-                    if entry.is_some() || !complete {
-                        cached.entries.insert(name, entry);
+                self.edit_dir(dir, |cached| {
+                    if complete {
+                        cached.restart();
                     }
-                }
+                    for (name, entry) in entries {
+                        cached.put(name, entry);
+                    }
+                });
             }
             Fact::Backptrs(ino, links) => {
                 self.put_backptrs(ino, links);
@@ -388,10 +567,7 @@ impl Cache {
         for ino in &delta.created {
             match delta.inodes.get(ino).and_then(|change| change.after) {
                 Some(inode) if inode.kind == Kind::Dir => {
-                    *self.dir(*ino) = Dir {
-                        entries: BTreeMap::new(),
-                        complete: true,
-                    };
+                    self.edit_dir(*ino, Dir::restart);
                 }
                 _ => {
                     self.put_backptrs(*ino, Links::new());
@@ -402,10 +578,11 @@ impl Cache {
             self.put_inode(*ino, change.after);
         }
         for (dir, names) in &delta.entries {
-            let cached = self.dir(*dir);
-            for (name, change) in names {
-                cached.entries.insert(name.clone(), change.after);
-            }
+            self.edit_dir(*dir, |cached| {
+                for (name, change) in names {
+                    cached.put(name.clone(), change.after);
+                }
+            });
         }
         for (ino, change) in &delta.links {
             self.put_backptrs(*ino, change.after.clone().unwrap_or_default());
@@ -421,7 +598,17 @@ impl Cache {
                     if !delta.links.contains_key(&ino)
                         && let Some(links) = self.backptrs.get_mut(&ino)
                     {
-                        relink(links, ino, *dir, name, change.before, change.after);
+                        let before = links_bytes(&links.record);
+                        relink(
+                            &mut links.record,
+                            ino,
+                            *dir,
+                            name,
+                            change.before,
+                            change.after,
+                        );
+                        self.tree_bytes += links_bytes(&links.record);
+                        self.tree_bytes -= before;
                     }
                 }
             }
@@ -461,6 +648,7 @@ impl Cache {
         }
     }
 
+    /// Inode records cached.
     pub fn inodes(&self) -> usize {
         self.inodes.len()
     }
@@ -468,6 +656,35 @@ impl Cache {
     /// Directories with entries cached.
     pub fn dirs(&self) -> usize {
         self.dirs.len()
+    }
+
+    /// What the cache charges for its directories, inode records and
+    /// links.
+    pub fn tree_bytes(&self) -> usize {
+        self.tree_bytes
+    }
+
+    /// What the cache charges for its values.
+    pub fn value_bytes(&self) -> usize {
+        self.value_bytes
+    }
+
+    /// Whether `fact` fits in what the tree budget has left.
+    pub fn has_room(&self, fact: &Fact) -> bool {
+        let bytes = match fact {
+            Fact::Listing { entries, .. } => {
+                DIR_BYTES
+                    + entries
+                        .iter()
+                        .map(|(name, _)| name_bytes(name))
+                        .sum::<usize>()
+            }
+            Fact::Entry(_, name, _) => name_bytes(name),
+            Fact::Inode(..) => INODE_BYTES,
+            Fact::Backptrs(_, links) => links_bytes(links),
+            _ => 0,
+        };
+        self.tree_bytes + bytes <= self.budget.tree_bytes
     }
 
     /// Whether the cache holds an inode's record or a directory's entries.
@@ -478,11 +695,15 @@ impl Cache {
 
 impl View for Cache {
     fn inode(&self, ino: Ino) -> Lookup<Option<Inode>> {
-        self.inodes.get(&ino).copied().ok_or(Read::Inode(ino))
+        self.inodes
+            .get(&ino)
+            .map(|held| *held.read())
+            .ok_or(Read::Inode(ino))
     }
 
     fn entry(&self, dir: Ino, name: &[u8]) -> Lookup<Option<Entry>> {
-        if let Some(cached) = self.dirs.get(&dir) {
+        if let Some(held) = self.dirs.get(&dir) {
+            let cached = held.read();
             if let Some(entry) = cached.entries.get(name) {
                 return Ok(*entry);
             }
@@ -494,7 +715,8 @@ impl View for Cache {
     }
 
     fn has_entry_outside(&self, dir: Ino, removed: &BTreeSet<Name>) -> Lookup<bool> {
-        if let Some(cached) = self.dirs.get(&dir) {
+        if let Some(held) = self.dirs.get(&dir) {
+            let cached = held.read();
             if cached
                 .entries
                 .iter()
@@ -513,13 +735,16 @@ impl View for Cache {
     }
 
     fn backptrs(&self, ino: Ino) -> Lookup<Links> {
-        self.backptrs.get(&ino).cloned().ok_or(Read::Backptrs(ino))
+        self.backptrs
+            .get(&ino)
+            .map(|held| held.read().clone())
+            .ok_or(Read::Backptrs(ino))
     }
 
     fn value(&self, ino: Ino, version: Version) -> Lookup<Option<Bytes>> {
         self.values
             .get(&(ino, version))
-            .cloned()
+            .map(|held| held.read().clone())
             .ok_or(Read::Value(ino, version))
     }
 
@@ -534,7 +759,7 @@ impl View for Cache {
     }
 
     fn listing(&self, dir: Ino, start: Bound<&[u8]>, limit: usize) -> Lookup<Vec<(Name, Entry)>> {
-        match self.dirs.get(&dir) {
+        match self.dirs.get(&dir).map(Held::read) {
             Some(cached) if cached.complete => Ok(cached
                 .entries
                 .range::<[u8], _>((start, Bound::Unbounded))
@@ -580,10 +805,14 @@ impl View for Cache {
     }
 }
 
-/// Moves a fact read at version `read_at` to version `to`, given every
-/// delta between them in ascending version order. Deltas at or below `to`
-/// are committed, so their after-images apply; those above it are not, so
-/// their before-images restore the state at `to`.
+/// The keys of `held` outside `reached`.
+fn outside<V>(held: &BTreeMap<Ino, V>, reached: &BTreeSet<Ino>) -> Vec<Ino> {
+    held.keys()
+        .filter(|ino| !reached.contains(*ino))
+        .copied()
+        .collect()
+}
+
 /// The file an entry names, if it names one.
 fn linked(entry: Option<Entry>) -> Option<Ino> {
     entry
@@ -609,6 +838,10 @@ fn relink(
     }
 }
 
+/// Moves a fact read at version `read_at` to version `to`, given every
+/// delta between them in ascending version order. Deltas at or below `to`
+/// are committed, so their after-images apply; those above it are not, so
+/// their before-images restore the state at `to`.
 pub fn rebase(fact: Fact, read_at: Version, to: Version, window: &[&Delta]) -> Option<Fact> {
     if read_at == to {
         return Some(fact);
@@ -760,48 +993,84 @@ pub fn rebase(fact: Fact, read_at: Version, to: Version, window: &[&Delta]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta::Change;
+
+    fn name(text: &str) -> Name {
+        Name::from(text.as_bytes())
+    }
+
+    fn file(child: Ino) -> Option<Entry> {
+        Some(Entry {
+            child,
+            kind: Kind::File,
+            version: 1,
+        })
+    }
 
     fn listing(dir: Ino) -> Fact {
         Fact::Listing {
             dir,
-            entries: vec![(
-                Name::from(&b"x"[..]),
-                Some(Entry {
-                    child: dir + 100,
-                    kind: Kind::File,
-                    version: 1,
-                }),
-            )],
+            entries: vec![(name("x"), file(dir + 100))],
             complete: true,
         }
     }
 
+    /// What one of `listing`'s directories costs.
+    const LISTING: usize = DIR_BYTES + NAME_BYTES + 1;
+
+    fn budget(tree_bytes: usize) -> Budget {
+        Budget {
+            tree_bytes,
+            value_bytes: 10,
+            undo_bytes: 0,
+        }
+    }
+
     fn holds(cache: &Cache, dir: Ino) -> bool {
-        cache.entry(dir, b"x").is_ok()
+        cache.dirs.contains_key(&dir)
+    }
+
+    /// What the cache should charge, counted afresh.
+    fn recount(cache: &Cache) -> usize {
+        let dirs: usize = cache
+            .dirs
+            .values()
+            .map(|held| {
+                let names: usize = held
+                    .record
+                    .entries
+                    .keys()
+                    .map(|name| name_bytes(name))
+                    .sum();
+                assert_eq!(held.record.bytes, DIR_BYTES + names);
+                held.record.bytes
+            })
+            .sum();
+        let links: usize = cache
+            .backptrs
+            .values()
+            .map(|held| links_bytes(&held.record))
+            .sum();
+        dirs + cache.inodes.len() * INODE_BYTES + links
     }
 
     #[test]
     fn eviction_drops_what_was_written_longest_ago() {
-        let mut cache = Cache::with_budget(Budget {
-            dirs: 2,
-            inodes: 10,
-            value_bytes: 10,
-            undo_bytes: 0,
-        });
+        let mut cache = Cache::with_budget(budget(2 * LISTING));
         for dir in 1..=3 {
             cache.fill(listing(dir));
         }
         cache.evict(u64::MAX);
         assert!(!holds(&cache, 1) && holds(&cache, 2) && holds(&cache, 3));
         // A write renews a record's place.
-        cache.fill(Fact::Entry(2, Name::from(&b"y"[..]), None));
+        cache.fill(Fact::Entry(2, name("y"), None));
         cache.fill(listing(4));
         cache.evict(u64::MAX);
         assert!(holds(&cache, 2) && !holds(&cache, 3) && holds(&cache, 4));
         // A dropped directory loses its completeness: lookups read again.
         assert_eq!(
             cache.entry(3, b"absent"),
-            Err(Read::Entry(3, Name::from(&b"absent"[..])))
+            Err(Read::Entry(3, name("absent")))
         );
         assert_eq!(
             cache.listing(3, Bound::Unbounded, usize::MAX),
@@ -813,10 +1082,166 @@ mod tests {
     }
 
     #[test]
+    fn eviction_passes_over_what_reads_used_once() {
+        let mut cache = Cache::with_budget(budget(2 * LISTING));
+        for dir in 1..=3 {
+            cache.fill(listing(dir));
+        }
+        assert_eq!(cache.entry(1, b"x"), Ok(file(101)));
+        cache.evict(u64::MAX);
+        assert!(holds(&cache, 1) && !holds(&cache, 2) && holds(&cache, 3));
+        // The hand goes on from where it stopped.
+        cache.fill(listing(4));
+        cache.evict(u64::MAX);
+        assert!(holds(&cache, 1) && !holds(&cache, 3) && holds(&cache, 4));
+        // Past what reads used, it comes around to what it passed over.
+        assert!(cache.entry(4, b"x").is_ok());
+        cache.fill(listing(5));
+        assert!(cache.entry(5, b"x").is_ok());
+        cache.evict(u64::MAX);
+        assert!(!holds(&cache, 1) && holds(&cache, 4) && holds(&cache, 5));
+        // A cache with no room drops what reads used too.
+        assert_eq!(cache.entry(4, b"x"), Ok(file(104)));
+        cache.forget_tree(u64::MAX);
+        assert_eq!((cache.dirs(), cache.tree_bytes()), (0, 0));
+    }
+
+    #[test]
+    fn a_write_keeps_that_a_read_used_its_record() {
+        let mut cache = Cache::with_budget(budget(INODE_BYTES));
+        cache.fill(Fact::Inode(1, Some(Inode::file(1, 0, 0))));
+        assert!(cache.inode(1).is_ok());
+        cache.fill(Fact::Inode(1, Some(Inode::file(2, 0, 0))));
+        cache.fill(Fact::Inode(2, Some(Inode::file(1, 0, 0))));
+        cache.evict(u64::MAX);
+        assert!(cache.inode(1).is_ok() && cache.inode(2).is_err());
+    }
+
+    #[test]
+    fn a_value_is_charged_beside_its_bytes() {
+        let mut cache = Cache::with_budget(Budget {
+            tree_bytes: 0,
+            value_bytes: 2 * VALUE_BYTES,
+            undo_bytes: 0,
+        });
+        for ino in 1..=3 {
+            cache.fill(Fact::Value(ino, 1, Some(Bytes::new())));
+        }
+        cache.evict(u64::MAX);
+        assert_eq!(cache.value_bytes(), 2 * VALUE_BYTES);
+        assert!(cache.value(1, 1).is_err() && cache.value(3, 1).is_ok());
+    }
+
+    #[test]
+    fn a_directory_is_charged_for_its_names() {
+        let mut cache = Cache::with_budget(budget(DIR_BYTES + 10 * (NAME_BYTES + 2)));
+        // Lookups of absent names in a directory the cache lacks in full.
+        for index in 0..10 {
+            cache.fill(Fact::Entry(1, name(&format!("n{index}")), None));
+        }
+        cache.evict(u64::MAX);
+        assert!(holds(&cache, 1));
+        cache.fill(Fact::Entry(1, name("n10"), None));
+        cache.evict(u64::MAX);
+        assert!(!holds(&cache, 1) && cache.tree_bytes() == 0);
+    }
+
+    #[test]
+    fn a_complete_directory_keeps_no_absent_names() {
+        let mut cache = Cache::new();
+        let mut delta = Delta::new(1);
+        delta.created.insert(1);
+        delta.inodes.insert(
+            1,
+            Change {
+                before: None,
+                after: Some(Inode::dir(1, 0, 0)),
+            },
+        );
+        cache.apply(&delta);
+        for (version, (before, after)) in [(None, file(9)), (file(9), None)].into_iter().enumerate()
+        {
+            let mut delta = Delta::new(version as u64 + 2);
+            delta
+                .entries
+                .entry(1)
+                .or_default()
+                .insert(name("temp"), Change { before, after });
+            cache.apply(&delta);
+        }
+        assert!(cache.dirs[&1].record.entries.is_empty());
+        assert_eq!(cache.entry(1, b"temp"), Ok(None));
+        assert_eq!(cache.tree_bytes(), recount(&cache));
+    }
+
+    #[test]
+    fn the_charge_follows_what_the_cache_holds() {
+        let mut cache = Cache::new();
+        cache.fill(listing(1));
+        cache.fill(Fact::Listing {
+            dir: 2,
+            entries: vec![(name("a"), file(20)), (name("gone"), None)],
+            complete: false,
+        });
+        cache.fill(Fact::Entry(2, name("b"), file(21)));
+        cache.fill(Fact::Entry(1, name("x"), None));
+        cache.fill(Fact::Inode(20, Some(Inode::file(1, 0, 0))));
+        cache.fill(Fact::Inode(20, Some(Inode::file(2, 0, 0))));
+        cache.fill(Fact::Backptrs(20, Links::from([(2, name("a"))])));
+        assert_eq!(cache.tree_bytes(), recount(&cache));
+        // A commit renames 2/a to 2/c, links 21 there too, and creates 3.
+        let mut delta = Delta::new(1);
+        let names = delta.entries.entry(2).or_default();
+        names.insert(
+            name("a"),
+            Change {
+                before: file(20),
+                after: None,
+            },
+        );
+        names.insert(
+            name("c"),
+            Change {
+                before: None,
+                after: file(20),
+            },
+        );
+        delta.created.insert(3);
+        delta.inodes.insert(
+            3,
+            Change {
+                before: None,
+                after: Some(Inode::dir(1, 0, 2)),
+            },
+        );
+        delta.links.insert(
+            21,
+            Change {
+                before: None,
+                after: Some(Links::from([(2, name("b")), (2, name("d"))])),
+            },
+        );
+        cache.apply(&delta);
+        assert_eq!(
+            cache.backptrs(20),
+            Ok(Links::from([(2, name("c"))])),
+            "links follow the rename"
+        );
+        assert_eq!(cache.tree_bytes(), recount(&cache));
+        cache.forget_file(21);
+        cache.forget_entries(1);
+        assert_eq!(cache.tree_bytes(), recount(&cache));
+        cache.keep_reachable(2);
+        assert_eq!(cache.tree_bytes(), recount(&cache));
+        cache.forget_beneath(2);
+        assert_eq!(cache.tree_bytes(), recount(&cache));
+        assert_eq!(cache.tree_bytes(), 0);
+    }
+
+    #[test]
     fn eviction_spares_what_reads_in_progress_wrote() {
         let mut cache = Cache::with_budget(Budget {
-            dirs: 0,
-            inodes: 0,
+            tree_bytes: 0,
             value_bytes: 0,
             undo_bytes: 0,
         });

@@ -85,7 +85,7 @@ At 128 clients, grouping multiplies commit throughput 13 to 30 times on local NV
 
 - **One writer.** Every write goes through one server, so write throughput is one machine's, and each group waits a full commit: on FoundationDB, about 14,000 batches a second at most here.
 - **Cold starts.** A restarted writer reads storage for what its cache lacks: on FoundationDB, 16 clients stat 7,200 files a second until the cache warms, against 230,000 after. A standby that takes over brings its cache with it.
-- **Memory.** A cached file costs about 830 bytes, so the default budget of 1 Mi inodes takes about 0.8 GB. Raising the `[cache]` budgets keeps more of the tree in memory.
+- **Memory.** The cache charges each record at least what it holds, a cached file about 980 bytes, so the default `tree_bytes` of 1 GiB holds about a million files in at most 1 GiB. Raising the `[cache]` budgets keeps more of the tree in memory.
 - **Network storage.** On gp3, each sync takes about 7 times as long as on local NVMe, so a single client's write takes 1.5 to 2 times as long.
 - **Small values.** A file holds up to 64 KiB. Larger data belongs in object storage, with its location in the file.
 - **Planned restarts.** Shutting down leaves the writer's lease to run out, so a planned restart waits the lease plus the margin, as a crash does.
@@ -174,7 +174,7 @@ The server reads one TOML file. Fields, with defaults:
 | `writer.lease_ttl_ms` | 30 s | How long a reader's lease lasts past its last heartbeat |
 | `writer.claim_ttl_ms` | 60 s | How long a consumer's claim on freed files lasts past its last acknowledgment |
 | `log.min_retention_ms`, `max_retention_ms` | 5 min, 1 h | How long the changefeed keeps entries, and how long a reader's lease may hold them |
-| `cache.dirs`, `inodes`, `value_bytes` | 256 Ki, 1 Mi, 256 MiB | What the writer's cache, and a standby's, holds |
+| `cache.tree_bytes`, `value_bytes` | 1 GiB, 256 MiB | What the writer's cache, and a standby's, holds |
 
 [deploy/kubernetes](deploy/kubernetes/README.md) runs a writer and standbys on FoundationDB as a StatefulSet.
 

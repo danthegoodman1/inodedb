@@ -405,7 +405,8 @@ pub struct Writer {
     releasing: Option<Option<u64>>,
     /// Where the preload's next page starts, once its last page is read.
     preload: Option<Cursor>,
-    /// The directories the preload's inode pages found.
+    /// The directories the preload knows of: the root, and those its pages
+    /// of entries name.
     preload_dirs: BTreeSet<Ino>,
     now: Millis,
     cache: Cache,
@@ -1873,15 +1874,9 @@ impl Writer {
         }
     }
 
-    /// Reads the preload's next page, while the cache has room and the
-    /// writer serves.
+    /// Reads the preload's next page while the writer serves.
     fn preload_page(&mut self, cursor: Cursor) {
-        let budget = self.config.cache;
-        if self.phase != Phase::Ready
-            || self.releasing.is_some()
-            || self.cache.inodes() >= budget.inodes
-            || self.cache.dirs() >= budget.dirs
-        {
+        if self.phase != Phase::Ready || self.releasing.is_some() {
             self.preload_dirs.clear();
             return;
         }
@@ -2012,7 +2007,14 @@ impl Writer {
             .into_iter()
             .filter_map(|fact| rebase(fact, read_at, to, &window))
             .collect();
+        let preload = matches!(outstanding.purpose, Purpose::Preload(_));
         for fact in rebased {
+            // The preload stops at the first fact the budget has no room
+            // for, so it never evicts what it read before.
+            if preload && !self.cache.has_room(&fact) {
+                self.preload = None;
+                break;
+            }
             self.cache.fill(fact);
         }
         Ok(())
@@ -2167,6 +2169,7 @@ impl Writer {
     fn ready(&mut self) {
         self.phase = Phase::Ready;
         if self.config.preload {
+            self.preload_dirs = BTreeSet::from([ROOT]);
             self.preload_page(Cursor::start());
         }
         let waiting: Vec<u64> = self.queries.keys().copied().collect();

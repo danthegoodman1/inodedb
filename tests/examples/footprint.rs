@@ -1,6 +1,7 @@
 //! What InodeDB's state costs, which its defaults rest on: the log's bytes
 //! per batch, the writer's memory per live request record and per cached
-//! file, and the undo a snapshot keeps per change.
+//! file, what each cached record holds against what the cache charges for
+//! it, and the undo a snapshot keeps per change.
 //!
 //!     cargo run --release -p inodedb-tests --example footprint
 //!
@@ -8,11 +9,14 @@
 //! overhead. The writer runs alone, against storage that keeps nothing,
 //! which is enough for batches whose reads the cache answers.
 
+use inodedb_core::cache::Cache;
+use inodedb_core::delta::Links;
 use inodedb_core::feed::{Subscriber, route};
 use inodedb_core::keys::{KvRead, KvResult};
 use inodedb_core::log::LogEntry;
 use inodedb_core::ops::{Batch, OpSpec};
-use inodedb_core::types::ROOT;
+use inodedb_core::types::{Entry, Inode, Kind, Name, ROOT};
+use inodedb_core::view::Fact;
 use inodedb_core::writer::{Action, CommitOutcome, Config, Writer};
 use inodedb_sim::harness::*;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -80,8 +84,9 @@ fn batch(ops: Vec<OpSpec>, request_id: u128) -> Batch {
     }
 }
 
-/// The writer's bytes per item, over `count` batches that each add one.
-fn per_item(count: u64, make: impl Fn(u64) -> Batch) -> f64 {
+/// The writer's bytes per item, over `count` batches that each add one,
+/// and what its cache charges for each.
+fn per_item(count: u64, make: impl Fn(u64) -> Batch) -> (f64, f64) {
     let mut writer = Writer::new(Config::default(), 1, 1_000, [7; 32]);
     drive(&mut writer);
     writer.submit(
@@ -91,6 +96,8 @@ fn per_item(count: u64, make: impl Fn(u64) -> Batch) -> f64 {
     );
     drive(&mut writer);
     let before = live();
+    let charged = |writer: &Writer| writer.cache().tree_bytes() + writer.cache().value_bytes();
+    let charged_before = charged(&writer);
     for index in 0..count {
         writer.submit(
             index,
@@ -100,7 +107,10 @@ fn per_item(count: u64, make: impl Fn(u64) -> Batch) -> f64 {
         drive(&mut writer);
     }
     assert_eq!(writer.pending(), 0);
-    (live() - before) as f64 / count as f64
+    (
+        (live() - before) as f64 / count as f64,
+        (charged(&writer) - charged_before) as f64 / count as f64,
+    )
 }
 
 /// The bytes of the log entry and request record each batch adds.
@@ -143,17 +153,79 @@ fn main() {
         println!("| {name} | {log} | {tree} |");
     }
     let count = 200_000;
-    let record = per_item(count, |index| {
+    let (record, _) = per_item(count, |index| {
         batch(vec![set_mtime("d", index)], u128::from(index + 1) | 1 << 64)
     });
-    let file = per_item(count, |index| {
+    let (file, file_charged) = per_item(count, |index| {
         batch(vec![put(&format!("d/f{index}"), "")], 0)
     });
     println!();
-    println!("| Writer state | Bytes each |");
-    println!("| --- | ---: |");
-    println!("| Live request record (`set_mtime` batches with request ids) | {record:.0} |");
-    println!("| Cached empty file (inode, entry, back-pointer) | {file:.0} |");
+    println!("| Writer state | Held | Charged |");
+    println!("| --- | ---: | ---: |");
+    println!("| Live request record (`set_mtime` batches with request ids) | {record:.0} | none |");
+    println!(
+        "| Cached empty file (inode, entry, back-pointer, value) | {file:.0} | {file_charged:.0} |"
+    );
+    println!();
+    println!("| Cached record | Held | Charged |");
+    println!("| --- | ---: | ---: |");
+    let name = |index: u64| Name::from(format!("f{index:06}").as_bytes());
+    let entry = |child: u64| {
+        Some(Entry {
+            child,
+            kind: Kind::File,
+            version: 1,
+        })
+    };
+    type Make = Box<dyn Fn(u64) -> Fact>;
+    let records: Vec<(&str, Make)> = vec![
+        (
+            "Inode record",
+            Box::new(|index| Fact::Inode(index + 2, Some(Inode::file(1, 0, 0)))),
+        ),
+        (
+            "Empty directory",
+            Box::new(|index| Fact::Listing {
+                dir: index + 2,
+                entries: Vec::new(),
+                complete: true,
+            }),
+        ),
+        (
+            "Directory of one 7-byte name",
+            Box::new(move |index| Fact::Listing {
+                dir: index + 2,
+                entries: vec![(name(index), entry(index))],
+                complete: true,
+            }),
+        ),
+        (
+            "7-byte name in a large directory",
+            Box::new(move |index| Fact::Entry(1, name(index), entry(index + 2))),
+        ),
+        (
+            "File's one link, by a 7-byte name",
+            Box::new(move |index| Fact::Backptrs(index + 2, Links::from([(1, name(index))]))),
+        ),
+        (
+            "Empty value",
+            Box::new(|index| Fact::Value(index + 2, 1, Some(bytes::Bytes::new()))),
+        ),
+        (
+            "100-byte value",
+            Box::new(|index| Fact::Value(index + 2, 1, Some(bytes::Bytes::from(vec![0; 100])))),
+        ),
+    ];
+    for (record, fact) in records {
+        let mut cache = Cache::new();
+        let before = live();
+        for index in 0..count {
+            cache.fill(fact(index));
+        }
+        let held = (live() - before) as f64 / count as f64;
+        let charged = (cache.tree_bytes() + cache.value_bytes()) as f64 / count as f64;
+        println!("| {record} | {held:.0} | {charged:.0} |");
+    }
     let mut h = Harness::new();
     h.ops([mkdir("t")]);
     for index in 0..1_000 {

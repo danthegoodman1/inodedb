@@ -356,8 +356,7 @@ fn a_standby_follows_links_through_renames() {
 fn a_standby_with_a_small_cache_answers_under_steady_writes() {
     let config = Config {
         cache: inodedb_core::cache::Budget {
-            dirs: 1,
-            inodes: 1,
+            tree_bytes: 1,
             value_bytes: 1,
             ..inodedb_core::cache::Budget::default()
         },

@@ -894,9 +894,10 @@ async fn run<S: Storage + Clone>(
             preloading = None;
             let cache = writer.cache();
             eprintln!(
-                "level=info msg=preloaded inodes={} dirs={} ms={}",
+                "level=info msg=preloaded inodes={} dirs={} tree_bytes={} ms={}",
                 cache.inodes(),
                 cache.dirs(),
+                cache.tree_bytes(),
                 started.elapsed().as_millis()
             );
         }

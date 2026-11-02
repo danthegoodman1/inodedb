@@ -128,7 +128,7 @@ A writer and a standby share a store. Eight clients that know only the standby's
 cargo run --release -p inodedb-tests --example footprint
 ```
 
-What state costs. Log and storage bytes come from the harness's writer over the memory backend; the tree's directories are three deep, and each batch carries a request id. Memory counts the bytes allocations ask for, for the writer alone, over 200,000 batches each adding one item, against storage that keeps nothing. The undo is what a subscriber holding a snapshot open keeps beyond one without, over 10,000 replaced values, beside what the `undo_bytes` budget charges for it.
+What state costs. Log and storage bytes come from the harness's writer over the memory backend; the tree's directories are three deep, and each batch carries a request id. Memory counts the bytes allocations ask for, for the writer alone, over 200,000 batches each adding one item, against storage that keeps nothing, beside what its cache charges for them. Each cached record is 200,000 of its kind filled into an empty cache. The undo is what a subscriber holding a snapshot open keeps beyond one without, over 10,000 replaced values, beside what the `undo_bytes` budget charges for it.
 
 | Batch | Log entry bytes | Tree and record bytes |
 | --- | ---: | ---: |
@@ -138,16 +138,26 @@ What state costs. Log and storage bytes come from the harness's writer over the 
 | rename a file across directories | 74 | 53 |
 | unlink a file | 67 | 42 |
 
-| State | Bytes each |
-| --- | ---: |
-| Live request record, in the writer's memory | 98 |
-| Cached empty file: inode, entry and back-pointer | 830 |
-| Snapshot undo per replaced value, held | 162 |
-| Snapshot undo per replaced value, charged to `undo_bytes` | 160 |
+| State | Held | Charged |
+| --- | ---: | ---: |
+| Live request record, in the writer's memory | 98 | none |
+| Cached empty file: inode, entry, back-pointer and value | 910 | 983 |
+| Snapshot undo per replaced value | 162 | 160 |
+
+| Cached record | Held | Charged |
+| --- | ---: | ---: |
+| Inode record | 247 | 250 |
+| Empty directory | 188 | 570 |
+| Directory of one 7-byte name | 651 | 657 |
+| 7-byte name in a large directory | 86 | 87 |
+| File's one link, by a 7-byte name | 446 | 447 |
+| Empty value | 188 | 200 |
+| 100-byte value | 288 | 300 |
 
 - The log stays small: varint-coded effects and ancestor chains, no values. Even an hour of it at 1,000 batches a second is about 216 MB.
 - The writer keeps only a live record's id, and a retry reads the record from storage, so a large batch's result costs no memory while its record lives.
-- A cached file's 830 bytes, mostly map nodes and eviction bookkeeping, set the default inode budget: 1 Mi inodes is about 0.8 GB.
+- A cached file holds 910 bytes, mostly map nodes and eviction bookkeeping, and the cache charges 983, so the default `tree_bytes` of 1 GiB holds about a million files in at most 1 GiB.
+- Each charge covers what its record holds. A directory's first name allocates a node of its map, which the directory's charge covers, so an empty directory is charged three times what it holds.
 - The undo budget charges what a record holds, so 64 MiB of `undo_bytes` is 64 MiB of memory.
 
 ## Path resolution

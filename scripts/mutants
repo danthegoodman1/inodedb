@@ -183,13 +183,13 @@ MUTANTS = [
     ),
     (
         "a cache keeps a name a commit removed",
-        [(CACHE, "cached.entries.insert(name.clone(), change.after);",
-          "if change.after.is_some() { cached.entries.insert(name.clone(), change.after); }")],
+        [(CACHE, "cached.put(name.clone(), change.after);",
+          "if change.after.is_some() { cached.put(name.clone(), change.after); }")],
     ),
     (
         "a cache keeps a negative entry after a create",
-        [(CACHE, "cached.entries.insert(name.clone(), change.after);",
-          "cached.entries.entry(name.clone()).or_insert(change.after);")],
+        [(CACHE, "cached.put(name.clone(), change.after);",
+          "if !cached.entries.contains_key(name) { cached.put(name.clone(), change.after); }")],
     ),
     (
         "a directory entering a subtree isn't reported",
@@ -325,7 +325,43 @@ MUTANTS = [
     ),
     (
         "a preload passes the cache's budget",
-        [(WRITER, "|| self.cache.inodes() >= budget.inodes", "")],
+        [(WRITER, "if preload && !self.cache.has_room(&fact) {", "if preload && false {")],
+    ),
+    (
+        "a preload reads inode records before entries",
+        [(PRELOAD, "Cursor::Entries(keys::entry_range().start)\n    }", "Cursor::Inodes(keys::inode_range().start)\n    }"),
+         (PRELOAD, "_ => Cursor::Backptrs(keys::backptr_range().start),", "_ => Cursor::Entries(keys::entry_range().start),"),
+         (PRELOAD, "_ => (Cursor::Inodes(keys::inode_range().start), true),", "_ => (Cursor::Backptrs(keys::backptr_range().start), true),")],
+    ),
+    (
+        "a preload forgets the directories its entries named",
+        [(PRELOAD, "dirs: found.into_iter().collect(),", "dirs: Vec::new(),")],
+    ),
+    (
+        "a preload forgets the root",
+        [(WRITER, "self.preload_dirs = BTreeSet::from([ROOT]);", "self.preload_dirs = BTreeSet::new();")],
+    ),
+    (
+        "a cache charges nothing for a directory's names",
+        [(CACHE, "if self.entries.insert(name, entry).is_none() {\n            self.bytes += bytes;\n        }",
+          "self.entries.insert(name, entry);\n        let _ = bytes;")],
+    ),
+    (
+        "a cache charges nothing for a value beside its bytes",
+        [(CACHE, "VALUE_BYTES + value.as_ref().map_or(0, Bytes::len)", "value.as_ref().map_or(0, Bytes::len)")],
+    ),
+    (
+        "a complete directory keeps the names it lost",
+        [(CACHE, "if self.complete && entry.is_none() {", "if false {")],
+    ),
+    (
+        "eviction ignores what reads used",
+        [(CACHE, "if used(&key) {", "if false && used(&key) {")],
+    ),
+    (
+        "a write forgets that a read used its record",
+        [(CACHE, "btree_map::Entry::Occupied(slot) => {\n            Some(std::mem::replace(&mut slot.into_mut().record, record))\n        }",
+          "btree_map::Entry::Occupied(mut slot) => Some(slot.insert(Held::new(record)).record),")],
     ),
     (
         "a preload completes a directory that began before its page",
@@ -589,7 +625,14 @@ MUTANTS = [
     ),
     (
         "a feed's changes leave cached links as they were",
-        [(CACHE, "relink(links, ino, *dir, name, change.before, change.after);", "let _ = (links, dir, name);")],
+        [(CACHE, """relink(
+                            &mut links.record,
+                            ino,
+                            *dir,
+                            name,
+                            change.before,
+                            change.after,
+                        );""", "let _ = (dir, name);")],
     ),
     (
         "a writer whose lease lapsed answers the claim it scanned",

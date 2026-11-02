@@ -25,10 +25,9 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheConfig {
-    /// Directories with entries cached.
-    pub dirs: usize,
-    /// Inode records, with each file's links.
-    pub inodes: usize,
+    /// Bytes of directories' entries, inode records and files' links, as
+    /// the cache charges them.
+    pub tree_bytes: usize,
     /// Bytes of values.
     pub value_bytes: usize,
     /// Whether the writer reads the tree into its cache when it starts, up
@@ -40,8 +39,7 @@ impl Default for CacheConfig {
     fn default() -> CacheConfig {
         let budget = inodedb_core::cache::Budget::default();
         CacheConfig {
-            dirs: budget.dirs,
-            inodes: budget.inodes,
+            tree_bytes: budget.tree_bytes,
             value_bytes: budget.value_bytes,
             preload: true,
         }
@@ -141,8 +139,7 @@ impl Config {
             lease_ttl: writer.lease_ttl_ms,
             claim_ttl: writer.claim_ttl_ms,
             cache: inodedb_core::cache::Budget {
-                dirs: self.cache.dirs,
-                inodes: self.cache.inodes,
+                tree_bytes: self.cache.tree_bytes,
                 value_bytes: self.cache.value_bytes,
                 ..inodedb_core::cache::Budget::default()
             },
@@ -246,12 +243,11 @@ mod tests {
         );
         assert_eq!(
             (
-                core.cache.dirs,
-                core.cache.inodes,
+                core.cache.tree_bytes,
                 core.cache.value_bytes,
                 core.cache.undo_bytes
             ),
-            (1 << 18, 1 << 20, 256 << 20, 64 << 20)
+            (1 << 30, 256 << 20, 64 << 20)
         );
         assert!(core.preload);
     }

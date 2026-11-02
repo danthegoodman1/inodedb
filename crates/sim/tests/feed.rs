@@ -157,6 +157,33 @@ fn a_file_that_returns_is_read_again() {
     );
 }
 
+/// A removed directory takes what the cache held beneath it with it. One
+/// that leaves the subtree in the batch that removes it is freed outside,
+/// so a file linked in it changes there unseen, and comes back read again.
+#[test]
+fn a_file_beneath_a_removed_directory_is_read_again_when_it_returns() {
+    let mut h = Harness::new();
+    h.ops([mkdir_p("r/d")]);
+    let root = ino(&mut h, "r");
+    let mut subscriber = Subscriber::new(root, h.writer.version());
+    // The feed shows the file's link in d, as d was in the subtree.
+    h.ops([
+        mv("r/d", "d"),
+        put("d/f", "v"),
+        link("d/f", "f"),
+        remove_all("d"),
+    ]);
+    follow(&h, &mut subscriber);
+    h.ops([mv("f", "r/f")]);
+    follow(&h, &mut subscriber);
+    let now = inode_at(&mut h, "r/f");
+    match query::run(subscriber.cache(), root, &Query::Stat(Target::Path(p("f")))) {
+        Ok(QueryResult::Stat { inode, .. }) => assert_eq!(inode, now, "a stale record"),
+        Ok(other) => panic!("{other:?}"),
+        Err(_) => {}
+    }
+}
+
 /// A read from before something left the subtree fills nothing: moving it
 /// forward would need changes the feed never showed.
 #[test]

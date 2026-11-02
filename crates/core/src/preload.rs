@@ -1,10 +1,12 @@
 //! Reading the tree into a writer's cache at startup, a page of keys at a
-//! time: every inode record, then every directory's entries, then every
-//! file's back-pointers. A directory whose entries all fall in one page
-//! arrives complete, so the cache answers that a name is absent without a
-//! read, and so does an empty directory the entries pass over; a larger
-//! one arrives as known names. Each page is one read like any other, moved
-//! to the writer's version through the commits since.
+//! time: every directory's entries, then every inode record, then every
+//! file's back-pointers, so a tree larger than the cache resolves paths
+//! from it. A directory whose entries all fall in one page arrives
+//! complete, so the cache answers that a name is absent without a read,
+//! and so does an empty directory the entries pass over once an entry has
+//! named it; a larger one arrives as known names. Each page is one read
+//! like any other, moved to the writer's version through the commits
+//! since.
 
 use crate::codec::DecodeError;
 use crate::keys::{self, KeyRange, KvRead, Pairs, Parsed};
@@ -24,7 +26,7 @@ pub enum Cursor {
     Backptrs(Vec<u8>),
 }
 
-/// What one page read: its facts, the directories among its inodes, and
+/// What one page read: its facts, the directories its entries name, and
 /// where the next page starts, or None once every key is read.
 pub struct Page {
     pub facts: Vec<Fact>,
@@ -34,7 +36,7 @@ pub struct Page {
 
 impl Cursor {
     pub fn start() -> Cursor {
-        Cursor::Inodes(keys::inode_range().start)
+        Cursor::Entries(keys::entry_range().start)
     }
 
     /// The read for this page.
@@ -53,7 +55,7 @@ impl Cursor {
         }
     }
 
-    /// What a page holds. `dirs` are the directories earlier pages found,
+    /// What a page holds. `dirs` are the directories the preload knows of,
     /// so a page of entries knows which directories it passed over empty.
     pub fn page(&self, pairs: Pairs, dirs: &BTreeSet<Ino>) -> Result<Page, DecodeError> {
         let full = pairs.len() >= PAGE;
@@ -61,23 +63,20 @@ impl Cursor {
             Cursor::Inodes(_) => {
                 let next = match pairs.last() {
                     Some((last, _)) if full => Cursor::Inodes(after(last)),
-                    _ => Cursor::Entries(keys::entry_range().start),
+                    _ => Cursor::Backptrs(keys::backptr_range().start),
                 };
-                let mut facts = Vec::with_capacity(pairs.len());
-                let mut found = Vec::new();
-                for (key, value) in &pairs {
-                    let Some(Parsed::Inode(ino)) = keys::parse(key) else {
-                        return Err(DecodeError);
-                    };
-                    let inode = Inode::from_bytes(value)?;
-                    if inode.kind == Kind::Dir {
-                        found.push(ino);
-                    }
-                    facts.push(Fact::Inode(ino, Some(inode)));
-                }
+                let facts = pairs
+                    .iter()
+                    .map(|(key, value)| match keys::parse(key) {
+                        Some(Parsed::Inode(ino)) => {
+                            Ok(Fact::Inode(ino, Some(Inode::from_bytes(value)?)))
+                        }
+                        _ => Err(DecodeError),
+                    })
+                    .collect::<Result<_, _>>()?;
                 Ok(Page {
                     facts,
-                    dirs: found,
+                    dirs: Vec::new(),
                     next: Some(next),
                 })
             }
@@ -126,13 +125,19 @@ fn entries(
         }
         _ => Err(DecodeError),
     })?;
+    let found: BTreeSet<Ino> = groups
+        .iter()
+        .flat_map(|(_, entries)| entries.iter().flat_map(|(_, entry)| entry))
+        .filter(|entry| entry.kind == Kind::Dir)
+        .map(|entry| entry.child)
+        .collect();
     let (next, last_ends) = match pairs.last() {
         Some((last, _)) if full && groups.len() == 1 => (Cursor::Entries(after(last)), false),
         _ if full => {
             let (dir, _) = groups.pop().ok_or(DecodeError)?;
             (Cursor::Entries(keys::entry_prefix(dir)), true)
         }
-        _ => (Cursor::Backptrs(keys::backptr_range().start), true),
+        _ => (Cursor::Inodes(keys::inode_range().start), true),
     };
     // A directory this page passed over whole, with no entry in it, is
     // empty as of this page's read.
@@ -145,8 +150,14 @@ fn entries(
         Some(Parsed::Entry(dir, _)) => dir,
         _ => beyond,
     };
-    let empty: Vec<Fact> = dirs
-        .range(dir_at(start, 0)..=dir_at(&covered, Ino::MAX))
+    let span = dir_at(start, 0)..=dir_at(&covered, Ino::MAX);
+    let known: BTreeSet<Ino> = dirs
+        .range(span.clone())
+        .chain(found.range(span))
+        .copied()
+        .collect();
+    let empty: Vec<Fact> = known
+        .iter()
         .filter(|dir| !listed.contains(dir))
         .filter(|dir| {
             let prefix = keys::entry_prefix(**dir);
@@ -176,7 +187,7 @@ fn entries(
     facts.extend(empty);
     Ok(Page {
         facts,
-        dirs: Vec::new(),
+        dirs: found.into_iter().collect(),
         next: Some(next),
     })
 }
