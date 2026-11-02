@@ -442,6 +442,46 @@ Status ledger:
 | Complete | Test | Operations through the API | `tests/examples/ops.rs` on an EC2 i7ie.6xlarge with every store on local NVMe and on gp3 at 80,000 IOPS (`scripts/ec2/{setup,bench}`); `BENCHMARKS.md` "Devices", "Operations" and "Group commit" give each result. Measuring found two slow paths, now fixed with a test and a planted bug each: listings waiting 40 ms on Nagle's algorithm (`server/lib::accepted_connections_send_at_once`), and batches behind a cache miss reading one round at a time (`groups::queued_batches_that_miss_the_cache_read_together`), which with FoundationDB's one-key-at-a-time reads held new-file puts to 445 a second at 64 clients. A Codex review of the fixes found read-ahead re-running cached batches each round, now capped at 1,024 ops a round (`groups::reading_ahead_runs_a_bounded_number_of_ops_a_round`). |
 | Complete | Gate | Code review | A review of this phase's changes found no wrong answer in the core's changes and ten issues elsewhere, resolved: a standby with a small cache evicting what its reads fetched, so they never answered (`Subscriber::spare`); the simulator accepting any stat of an unnamed inode, which once tightened (the model records the directories above each name a node lost) found a scope leak in the core, now fixed: a read by inode inside a removed subtree walked up through the top's old parent, wherever it had moved (`query.rs::detached_within` over the detach record, `seeds::seed_541`); a monotonic timer that stops while the host sleeps (the writer now takes the later of it and the wall clock); a value under a version not yet reached cached as absent; a claim cursor advanced by a claim that answered `Unavailable`; shutdown ignored while the engine starts; a tail truncated during a check reported as missing; redirects repeated without backoff; `open_existing`'s doc; and TTLs past `u64` milliseconds. The small cache, the detached scope and the value version each have a test the unfixed code fails and a planted bug; the other fixes have no test, since they need a sleeping host, a race with truncation or misdirected servers. |
 
+## Phase S4: Performance
+
+Goal:
+Cut storage round trips, wire bytes and failover time where measurements show them, without weakening any guarantee.
+
+Scope:
+- S4A Listings answered without a task for one page, each handle made once.
+- S4B Handle MACs as one AES block, and each handle sent once.
+- S4C A writer's storage handle; FoundationDB's reuses its latest commit's read version.
+- S4D A tail of decoded log entries in memory for streams.
+- S4E SQLite checkpoints on a thread of the store's own.
+- S4F A clean shutdown releases the store to a standby.
+- S4G A startup preload of the tree into the cache, up to its budget.
+- S4H Warm reads answered off the engine task, if a profile shows it saturated.
+- S4I A trace of one-client commit latency on Linux.
+
+Out of scope:
+- Merging cold reads across queries: with read versions reused, each FoundationDB round costs one trip, and merging would trade query latency for fewer transactions.
+
+Completion gate:
+Each change lands with tests and planted bugs, and `BENCHMARKS.md` reports its effect on the EC2 machine.
+
+Testing plan:
+- Storage conformance on every backend, `scripts/fdb`, simulator sweeps, `scripts/mutants`, and `tests/examples/ops.rs` before and after.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | S4A: One-page listings, handles made once | `crates/server/src/service.rs` `Pages`; M"a listing page drops its last entry" and the other listing mutants caught by API conformance; 100-entry listings about 30% faster on the Mac. |
+| Complete | Work | S4B: AES handle MACs, handles sent once | `server/auth::a_handle_mac_is_one_aes_block` (checked against OpenSSL), `api::inodes_share_their_handle`; four mutants caught; `BENCHMARKS.md` "Path resolution": 30 ns to make and check, from 146 ns. |
+| Complete | Work | S4C: Writer's handle, FoundationDB read versions | `sc::a_writers_handle_reads_its_commits` on every backend, `sc::a_writers_handle_reads_from_its_latest_commit` and the API suite on FoundationDB (`scripts/fdb`); the simulator's pinned reads over 10,000 seeds. On the Mac's FoundationDB container, puts went from 170/s to 330/s for one client and 7,000/s to 10,100/s for 64, cold stats from 9,500-14,400/s to 21,700-22,600/s. Gap: FoundationDB has no planted bugs (`EVIDENCE.md` "Gaps"). |
+| Complete | Work | S4D: Stream tail | `server/feed::{the_tail_holds_the_newest_young_entries_without_gaps, the_tail_drops_its_oldest_entries_past_its_bound, a_stream_that_keeps_up_reads_no_storage}`, `api::streams_that_keep_up_read_no_log`; four mutants. Gap: a standby's tail has no test. |
+| Complete | Work | S4E: SQLite checkpoint thread | `sqlite::a_thread_checkpoints_the_wal`; M"commits checkpoint the WAL themselves", M"commits never wake the checkpointing thread". On the Mac, puts from 64 clients went from 20,000-20,500/s to 26,900-27,000/s, their p99 from 10.2-10.4 ms to 3.4-3.9 ms; one client's puts slowed from 5,400/s to 4,800/s. Missing: the same on gp3. |
+| Complete | Work | S4F: Release on clean shutdown | `standby::a_released_store_passes_to_a_standby_at_once`, `core/standby::a_standby_takes_over_a_released_head_at_once`, `api-sb::a_clean_stop_hands_the_store_to_a_standby`; clean shutdowns in the swarm over 10,000 seeds; four mutants. |
+| Incomplete | Work | S4G: Startup preload | Missing: paged reads at startup that fill the cache and mark directories complete, a simulator option and a scripted scenario. |
+| Incomplete | Work | S4H: Warm reads off the engine task | Missing: a profile on Linux of one-client stats (0.3 ms on EC2 against 0.08 ms on the Mac) and of the 64-client ceiling near 235,000/s. |
+| Incomplete | Test | S4I: One-client commit trace | Missing: where a RocksDB or SQLite commit spends 1.35-1.6 ms against a 0.32 ms device sync on EC2. |
+| Incomplete | Gate | EC2 benchmarks after S4A-S4F | Missing: a rerun of `scripts/ec2/bench`; `README.md` and `BENCHMARKS.md` show the numbers from before. It should also show why the memory backend's cold reads ran at 28,000-31,000/s there, half SQLite's, when on the Mac they run at 77,000/s, twice SQLite's. |
+
 ## Phase 8: ClickHouse Metadata Type
 
 Goal:

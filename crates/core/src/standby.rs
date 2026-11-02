@@ -30,8 +30,14 @@ impl Successor {
     }
 
     /// Notes the head a read found, as of when the read returned; once the
-    /// writer is due to be taken over, what to take over from.
-    pub fn observe(&mut self, head: Option<Vec<u8>>, now: Millis) -> Option<Takeover> {
+    /// writer is due to be taken over, what to take over from. A head its
+    /// writer `released` is due at once.
+    pub fn observe(
+        &mut self,
+        head: Option<Vec<u8>>,
+        released: bool,
+        now: Millis,
+    ) -> Option<Takeover> {
         let since = match &self.seen {
             Some((seen, since)) if *seen == head => *since,
             _ => {
@@ -39,7 +45,7 @@ impl Successor {
                 now
             }
         };
-        (head.is_none() || now >= since + self.wait).then_some(Takeover::From(head))
+        (head.is_none() || released || now >= since + self.wait).then_some(Takeover::From(head))
     }
 
     /// Starts watching afresh, as after a takeover that lost.
@@ -161,7 +167,8 @@ impl Follower {
         if let Some(bytes) = &head {
             self.head = Some(Head::decode(bytes)?);
         }
-        Ok(self.successor.observe(head, self.now))
+        let released = head.is_some() && self.head.as_ref().is_some_and(|head| head.released);
+        Ok(self.successor.observe(head, released, self.now))
     }
 
     /// Applies the log's next entry, which follows the follower's version.
@@ -381,21 +388,31 @@ mod tests {
     fn a_standby_waits_for_the_head_to_go_unchanged() {
         let mut successor = Successor::new(6_000);
         assert_eq!(
-            successor.observe(None, 0),
+            successor.observe(None, false, 0),
             Some(Takeover::From(None)),
             "an empty store has no writer"
         );
         let head = Some(vec![1]);
-        assert_eq!(successor.observe(head.clone(), 100), None);
-        assert_eq!(successor.observe(head.clone(), 6_099), None);
+        assert_eq!(successor.observe(head.clone(), false, 100), None);
+        assert_eq!(successor.observe(head.clone(), false, 6_099), None);
         // A renewal starts the wait over.
-        assert_eq!(successor.observe(Some(vec![2]), 6_200), None);
-        assert_eq!(successor.observe(Some(vec![2]), 12_199), None);
+        assert_eq!(successor.observe(Some(vec![2]), false, 6_200), None);
+        assert_eq!(successor.observe(Some(vec![2]), false, 12_199), None);
         assert_eq!(
-            successor.observe(Some(vec![2]), 12_200),
+            successor.observe(Some(vec![2]), false, 12_200),
             Some(Takeover::From(Some(vec![2])))
         );
         successor.reset();
-        assert_eq!(successor.observe(Some(vec![2]), 12_300), None);
+        assert_eq!(successor.observe(Some(vec![2]), false, 12_300), None);
+    }
+
+    #[test]
+    fn a_standby_takes_over_a_released_head_at_once() {
+        let mut successor = Successor::new(6_000);
+        assert_eq!(successor.observe(Some(vec![1]), false, 100), None);
+        assert_eq!(
+            successor.observe(Some(vec![2]), true, 200),
+            Some(Takeover::From(Some(vec![2])))
+        );
     }
 }

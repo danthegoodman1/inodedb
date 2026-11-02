@@ -168,6 +168,62 @@ fn a_standby_takes_over_with_its_cache() {
 }
 
 #[test]
+fn a_released_store_passes_to_a_standby_at_once() {
+    let mut h = Harness::with(inodedb_storage::Memory::new(), config());
+    h.ops([mkdir("a"), put("a/f", "1")]);
+    let mut follower = Follower::new(config(), h.now);
+    run(&h, &mut follower);
+    assert_eq!(
+        follower.observe(h.storage.head_now()).expect("decodes"),
+        None
+    );
+    // A releasing writer answers nothing more, reads or batches.
+    h.writer.release();
+    let trusted = Caller::Trusted(inodedb_core::types::ROOT);
+    let (read_token, batch_token) = (h.token(), h.token());
+    h.writer.query(read_token, trusted, read("a/f"), 0);
+    h.writer.submit(
+        batch_token,
+        trusted,
+        inodedb_core::ops::Batch {
+            ops: vec![mkdir("late")],
+            ..Default::default()
+        },
+    );
+    h.run();
+    assert!(h.writer.is_stopped());
+    assert_eq!(h.answer(read_token), Answer::Unavailable);
+    assert_eq!(h.answer(batch_token), Answer::Unavailable);
+    // The standby takes over well inside the lease.
+    follower.set_now(h.now + 1);
+    let takeover = follower
+        .observe(h.storage.head_now())
+        .expect("decodes")
+        .expect("takes over");
+    follow(&h, &mut follower);
+    let secret = follower.handle_secret().expect("the store holds one");
+    let handover = follower.hand_over();
+    let writer = Writer::new(config(), Harness::writer_id(), h.now + 1, secret)
+        .after(takeover)
+        .warm(handover.cache, handover.version);
+    let mut successor = Harness::with_writer(h.storage.clone(), writer);
+    successor.ops([put("a/f", "2")]);
+    let (_, result) = successor.query(read("a/f"));
+    assert!(
+        matches!(&result, QueryResult::Read { value, .. } if &value[..] == b"2"),
+        "{result:?}"
+    );
+    // The successor's head is its own, held and unreleased.
+    let mut next = Follower::new(config(), successor.now);
+    run(&successor, &mut next);
+    assert_eq!(
+        next.observe(successor.storage.head_now()).expect("decodes"),
+        None
+    );
+    assert!(successor.fsck().is_empty(), "{:?}", successor.fsck());
+}
+
+#[test]
 fn a_standby_waits_while_the_writer_renews() {
     let mut h = Harness::with(inodedb_storage::Memory::new(), config());
     let mut follower = Follower::new(config(), h.now);

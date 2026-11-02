@@ -25,7 +25,7 @@ Notation:
 | P8 Key scope | `check_query`, `durable` (a commit revokes exactly the keys whose roots it removed), `answer` | Write keys minted by the root; stats by inode outside a key's root |
 | P9 Truncation positions | `check_positions` against the simulator's record of live leases | The simulator truncates no log |
 
-Faults the simulator injects: unknown outcomes, storage latency and stalls, an old writer's reads from before its successor's commits, writer crashes mid-group, network delay, loss, duplication and reordering of client requests, client cut-offs, cut watch streams, and clock drift of up to 9% against a margin of 20% of the lease.
+Faults the simulator injects: clean shutdowns that release the store, unknown outcomes, storage latency and stalls, an old writer's reads from before its successor's commits, writer crashes mid-group, network delay, loss, duplication and reordering of client requests, client cut-offs, cut watch streams, and clock drift of up to 9% against a margin of 20% of the lease.
 
 ## Data model and operations
 
@@ -53,6 +53,7 @@ Faults the simulator injects: unknown outcomes, storage latency and stalls, an o
 
 | Behavior | Evidence |
 | --- | --- |
+| Streams read the tail, decoded once, while it holds where they are; storage otherwise; `Compacted` exactly as storage holds | `server/feed::{the_tail_holds_the_newest_young_entries_without_gaps, the_tail_drops_its_oldest_entries_past_its_bound, a_stream_that_keeps_up_reads_no_storage}`, `api::{streams_that_keep_up_read_no_log, watch_reports_compaction, leases_hold_the_log}`; M"commits leave the tail empty", M"a stream caught up with the tail reads storage", M"the tail serves entries truncation may have taken", M"the tail serves across a gap" |
 | One entry per commit, keyed by version, split across keys when large | `sc::log_order_and_truncation`, `core/log::entries_round_trip`, P5 |
 | Watch: order, replay, renames, routing, key scope, endings | `api::{watch_streams_a_subtree, watch_replays_from_a_version, watch_stays_in_its_keys_tree, watch_ends_with_its_key, shutdown_ends_streams, watch_reports_compaction}`, `cli::watch_prints_changes_as_paths`, P6; M"a directory entering a subtree isn't reported", M"a stream outlives its key", M"a watch starts past the version its key was checked at" |
 | Retention and truncation | `server/feed::leases_keep_what_their_positions_need_up_to_the_maximum`, `api::leases_hold_the_log`; M"truncation passes a live lease's position" |
@@ -76,10 +77,11 @@ Faults the simulator injects: unknown outcomes, storage latency and stalls, an o
 | Contract: order, isolation, conflicts, log, unknown outcomes, durability | `sc::*` on every backend; M"a scan misses an insert into its range", M"a commit skips the head check" |
 | Group commit, one transaction in flight, answers after commit | `groups::*`, `api::concurrent_commits_all_apply`, P2; M"a batch hears back before its group commits" |
 | Batches queued behind a miss read in its round, up to 1,024 ops | `groups::{queued_batches_that_miss_the_cache_read_together, reading_ahead_runs_a_bounded_number_of_ops_a_round}`; M"batches queued behind a miss read one at a time", M"reading ahead runs the whole queue every round" |
-| A writer's handle reads from its latest commit until one of its commits fails; standbys read the latest | `sc::a_writers_handle_reads_its_commits` on every backend, `sc::a_writers_handle_reads_from_its_latest_commit` on FoundationDB (`scripts/fdb`), P1 and P4 with the simulator's pinned reads; M"a writer answers reads after its lease" |
 | SQLite checkpoints on a thread of its own, never in a commit | `sqlite::a_thread_checkpoints_the_wal`; M"commits checkpoint the WAL themselves", M"commits never wake the checkpointing thread" |
+| A writer's handle reads from its latest commit until one of its commits fails; standbys read the latest | `sc::a_writers_handle_reads_its_commits` on every backend, `sc::a_writers_handle_reads_from_its_latest_commit` on FoundationDB (`scripts/fdb`), P1 and P4 with the simulator's pinned reads; M"a writer answers reads after its lease" |
 | Unknown outcomes resolve through the head | `groups::{an_unknown_commit_that_applied_is_answered_as_committed, an_unknown_commit_that_did_not_apply_runs_again}`; M"an unknown outcome counts as a failure" |
 | Renewal, takeover after lease and margin, drifting clocks | `standby::*`, `core/standby::a_standby_waits_for_the_head_to_go_unchanged`, P4; M"a takeover waits without the margin", M"a writer answers reads after its lease" |
+| Clean shutdown releases the store: the writer answers nothing more, and a standby takes over a released head at once | `standby::a_released_store_passes_to_a_standby_at_once`, `core/standby::a_standby_takes_over_a_released_head_at_once`, `api-sb::a_clean_stop_hands_the_store_to_a_standby`, P1, P2 and P4 with releases in the swarm; M"a standby waits out a released head's lease", M"a releasing writer answers reads from its cache", M"a successor's head keeps the released mark", M"a clean shutdown keeps the lease" |
 | Standbys: `AtLeast` reads, unknown keys to the writer, warm takeover, small caches, value versions ahead of the log | `standby::{a_standby_with_a_small_cache_answers_under_steady_writes, a_standby_waits_for_a_value_version_it_hasnt_reached}` and the rest of `standby::*`, `api-sb::*`, P1 and P5 through standbys in the swarm; M"a standby refuses a key newer than the log it has read", M"a standby evicts what its reads fetched before their queries run", M"a cache takes a value under a version it hasn't reached as absent" |
 | Configuration and defaults | `server/config::{parses_a_minimal_config, rejects_unknown_keys, rejects_unsafe_values, defaults_match_the_design}` |
 
@@ -101,7 +103,7 @@ Faults the simulator injects: unknown outcomes, storage latency and stalls, an o
 - Changefeed progress changes and the "only committed versions" rule of `Watch` have no test.
 - The client library has no unit tests; its cache restart after `Compacted`, heartbeat pacing and listing checks are covered only through `api::`.
 - The snapshot miss path that waits for the feed never runs.
-- Releasing the writer lease on a graceful shutdown is unbuilt, so a planned restart costs the lease plus the margin.
 - `idb mount` on macOS is untested.
+- A standby fills its tail from its reads of the log, which no test checks; its streams would read storage instead.
 - FoundationDB's backend has no planted bugs, since `scripts/mutants` runs without a cluster; `scripts/fdb` runs its conformance and API suites.
 - The server's clocks across a sleeping host or a stepped wall clock, a check racing truncation, a claim cursor after an `Unavailable` claim, and redirect backoff have no test.

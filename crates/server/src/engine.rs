@@ -2,6 +2,7 @@
 //! it returns over a storage backend, and routes answers back to the
 //! requests waiting on them.
 
+use crate::feed::Tail;
 use inodedb_core::auth::{Caller, Denied, Grant, KeyOp, Scope};
 use inodedb_core::delta::Freed;
 use inodedb_core::keys::{self, KvRead, KvResult, WriteSet};
@@ -65,6 +66,11 @@ enum Command {
     },
     Ready {
         reply: oneshot::Sender<Ready>,
+    },
+    /// Give up the store on a clean shutdown; the reply comes once the
+    /// writer has stopped.
+    Release {
+        reply: oneshot::Sender<()>,
     },
     ReadDone {
         era: u64,
@@ -180,6 +186,7 @@ impl Engine {
         storage: S,
         config: Config,
         standby: bool,
+        tail: Arc<Tail>,
     ) -> (Engine, JoinHandle<()>) {
         let (commands, inbox) = mpsc::channel(8192);
         let (stop, stopped) = watch::channel(false);
@@ -195,6 +202,7 @@ impl Engine {
             Published {
                 committed: publish,
                 keep: keeps,
+                tail,
             },
         ));
         (
@@ -217,6 +225,12 @@ impl Engine {
     /// The writer's committed version, as it changes.
     pub fn committed(&self) -> watch::Receiver<Version> {
         self.committed.clone()
+    }
+
+    /// Gives up the store if this server writes, so a standby takes over
+    /// without waiting out the lease; resolves once the writer has stopped.
+    pub async fn release(&self) {
+        let _ = self.ask(|reply| Command::Release { reply }).await;
     }
 
     /// Resolves once the writer stops for good: fenced, on a server with no
@@ -342,6 +356,8 @@ impl Engine {
 struct Published {
     committed: watch::Sender<Version>,
     keep: watch::Sender<Option<Keep>>,
+    /// The newest log entries, for streams.
+    tail: Arc<Tail>,
 }
 
 /// Retries a storage call until it succeeds: the writer has no answer for
@@ -391,6 +407,13 @@ struct Node<S> {
     polling: bool,
     /// The task reading the log for the follower.
     following: Option<JoinHandle<()>>,
+    /// Whoever asked the writer to release the store, until it stops.
+    releasing: Option<oneshot::Sender<()>>,
+    /// The writer released the store, so the server neither writes nor
+    /// follows again.
+    released: bool,
+    /// The newest log entries, for streams.
+    tail: Arc<Tail>,
 }
 
 fn random_secret() -> [u8; 32] {
@@ -646,7 +669,8 @@ impl<S: Storage + Clone> Node<S> {
         {
             let (storage, commands, era) = (self.storage.clone(), self.commands.clone(), self.era);
             let from = follower.version() + 1;
-            self.following = Some(tokio::spawn(follow_log(storage, commands, era, from)));
+            let tail = self.tail.clone();
+            self.following = Some(tokio::spawn(follow_log(storage, tail, commands, era, from)));
         }
         loop {
             let actions = match &mut self.role {
@@ -672,9 +696,9 @@ impl<S: Storage + Clone> Node<S> {
                     }
                     Action::Commit { id, expect, writes } => {
                         let (storage, commands) = (storage.clone(), self.commands.clone());
-                        let failures = self.failures.clone();
+                        let (failures, tail) = (self.failures.clone(), self.tail.clone());
                         tokio::spawn(async move {
-                            let outcome = commit(&storage, expect, writes, &failures).await;
+                            let outcome = commit(&storage, expect, writes, &failures, &tail).await;
                             report(commands, Command::CommitDone { era, id, outcome }).await;
                         });
                     }
@@ -729,6 +753,7 @@ fn token(
 /// end, until the engine is gone.
 async fn follow_log<S: Storage>(
     storage: S,
+    tail: Arc<Tail>,
     commands: mpsc::WeakSender<Command>,
     era: u64,
     mut from: Version,
@@ -739,6 +764,7 @@ async fn follow_log<S: Storage>(
             persist(|| storage.wait_past(from - 1)).await;
             continue;
         };
+        tail.extend(&entries);
         from = last + 1;
         let Some(commands) = commands.upgrade() else {
             return;
@@ -782,6 +808,9 @@ async fn run<S: Storage + Clone>(
         failures: Arc::new(AtomicU32::new(0)),
         polling: false,
         following: None,
+        releasing: None,
+        released: false,
+        tail: published.tail.clone(),
     };
     let mut readying: Vec<oneshot::Sender<Ready>> = Vec::new();
     let mut next_token: Token = 1;
@@ -811,13 +840,29 @@ async fn run<S: Storage + Clone>(
         }
         match command {
             Command::Ready { reply } => readying.push(reply),
+            Command::Release { reply } => match &mut node.role {
+                Role::Write(writer) => {
+                    writer.release();
+                    node.releasing = Some(reply);
+                }
+                Role::Follow(_) => {
+                    let _ = reply.send(());
+                }
+            },
             command => node.handle(command, &mut next_token),
         }
         node.carry_out();
         if let Role::Write(writer) = &node.role
             && writer.is_stopped()
+            && !node.released
         {
-            if node.standby {
+            if let Some(reply) = node.releasing.take() {
+                eprintln!("level=info msg=\"released the store\"");
+                node.released = true;
+                readying.clear();
+                stop.send_replace(true);
+                let _ = reply.send(());
+            } else if node.standby {
                 eprintln!("level=warn msg=\"another writer took over; following it\"");
                 node.follow();
                 node.carry_out();
@@ -879,6 +924,7 @@ async fn commit<S: Storage>(
     expect: Option<Vec<u8>>,
     writes: WriteSet,
     failures: &AtomicU32,
+    tail: &Tail,
 ) -> CommitOutcome {
     let outcome = inodedb_storage::commit(storage, expect.as_deref(), &writes).await;
     match outcome {
@@ -895,7 +941,11 @@ async fn commit<S: Storage>(
         CommitOutcome::Fenced => {
             eprintln!("level=error msg=\"another writer committed; stopping\"");
         }
-        CommitOutcome::Committed => failures.store(0, Ordering::Release),
+        CommitOutcome::Committed => {
+            failures.store(0, Ordering::Release);
+            // Streams find the entries before the writer announces them.
+            tail.extend(&writes.log);
+        }
     }
     outcome
 }

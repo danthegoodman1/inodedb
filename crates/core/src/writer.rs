@@ -123,6 +123,9 @@ pub struct Head {
     pub beat: u64,
     /// Where clients reach the writer.
     pub address: String,
+    /// The writer gave up the store on a clean shutdown, so a standby takes
+    /// over without waiting out the lease.
+    pub released: bool,
 }
 
 impl Head {
@@ -134,6 +137,10 @@ impl Head {
             .varint(self.epoch)
             .varint(self.beat)
             .bytes(self.address.as_bytes());
+        // A head its writer holds ends at the address, as before releases.
+        if self.released {
+            enc.varint(1);
+        }
         enc.finish()
     }
 
@@ -146,6 +153,7 @@ impl Head {
             epoch: dec.varint()?,
             beat: dec.varint()?,
             address: String::from_utf8(dec.bytes()?.to_vec()).map_err(|_| DecodeError)?,
+            released: !dec.is_empty() && dec.varint()? == 1,
         };
         dec.end()?;
         Ok(head)
@@ -385,6 +393,9 @@ pub struct Writer {
     /// This writer's id, unique among writers of one store.
     writer_id: u64,
     phase: Phase,
+    /// The writer is giving up the store, and the id of the commit that
+    /// marks its head released, once sent.
+    releasing: Option<Option<u64>>,
     now: Millis,
     cache: Cache,
     /// The committed version, which the cache reflects.
@@ -467,6 +478,7 @@ impl Writer {
             config,
             writer_id: id,
             phase: Phase::Starting,
+            releasing: None,
             now,
             cache: Cache::with_budget(budget),
             version: 0,
@@ -477,6 +489,7 @@ impl Writer {
                 epoch: 0,
                 beat: 0,
                 address: String::new(),
+                released: false,
             },
             next_version: 1,
             next_ino: ROOT + 1,
@@ -558,8 +571,43 @@ impl Writer {
     /// Whether the writer's lease runs: it answers reads only then, since
     /// a successor may take over once it lapses.
     pub fn is_fresh(&self) -> bool {
-        self.renewed_at
-            .is_some_and(|at| self.now < at + self.config.writer_lease)
+        self.releasing.is_none()
+            && self
+                .renewed_at
+                .is_some_and(|at| self.now < at + self.config.writer_lease)
+    }
+
+    /// Gives up the store on a clean shutdown. The writer answers what
+    /// waits, and whatever arrives, with `Unavailable`, lets the commit in
+    /// flight finish, then commits its head marked released, so a standby
+    /// takes over without waiting out the lease. It stops once that commit
+    /// returns, whatever the outcome.
+    pub fn release(&mut self) {
+        if self.phase != Phase::Ready {
+            return self.stop();
+        }
+        if self.releasing.is_some() {
+            return;
+        }
+        self.releasing = Some(None);
+        let mut tokens: Vec<Token> = std::mem::take(&mut self.queue)
+            .iter()
+            .map(|sub| sub.token)
+            .collect();
+        tokens.extend(
+            std::mem::take(&mut self.queries)
+                .values()
+                .map(|query| query.token),
+        );
+        tokens.extend(
+            std::mem::take(&mut self.claiming)
+                .values()
+                .map(|claim| claim.token),
+        );
+        for token in tokens {
+            self.answer(token, Answer::Unavailable);
+        }
+        self.send();
     }
 
     pub fn is_ready(&self) -> bool {
@@ -1372,6 +1420,12 @@ impl Writer {
         if self.phase != Phase::Ready {
             return;
         }
+        if self.releasing.is_some() {
+            if self.in_flight.is_none() {
+                self.send_release();
+            }
+            return;
+        }
         // Free part of a detached subtree when there is nothing else to
         // do, and now and then however busy the writer is.
         let idle = self.in_flight.is_none()
@@ -1451,6 +1505,19 @@ impl Writer {
         self.actions.push(Action::Commit { id, expect, writes });
     }
 
+    /// Commits the head marked released, and nothing else.
+    fn send_release(&mut self) {
+        let head = Head {
+            released: true,
+            ..self.head.next(self.version, self.head.next_ino)
+        };
+        let mut writes = WriteSet::default();
+        writes.set(keys::head(), head.encode());
+        let id = self.id();
+        self.releasing = Some(Some(id));
+        self.send_commit(id, head, writes);
+    }
+
     /// Commits what no group carries: a renewal of the writer's lease every
     /// `renew_every`, and what heartbeats and release left for storage, at
     /// most every `CHORE_EVERY` or at once for the release record a claim
@@ -1522,6 +1589,9 @@ impl Writer {
         }
         if self.phase == Phase::Claiming {
             return self.claimed(outcome);
+        }
+        if self.releasing == Some(Some(id)) {
+            return self.stop();
         }
         if self.chore.as_ref().is_some_and(|chore| chore.id == id) {
             return self.chore_done(outcome);
@@ -1928,6 +1998,7 @@ impl Writer {
                     epoch: head.epoch + 1,
                     beat: 0,
                     address: self.config.address.clone(),
+                    released: false,
                     ..head.clone()
                 };
                 self.head = head;
@@ -1983,6 +2054,7 @@ impl Writer {
             epoch: 1,
             beat: 0,
             address: self.config.address.clone(),
+            released: false,
         };
         writes.set(keys::head(), head.encode());
         writes.set(keys::handle_secret(), self.handle_secret.to_vec());

@@ -77,6 +77,9 @@ pub struct Options {
     pub retry_after: u64,
     /// Times the writer crashes and a new one starts over the storage.
     pub crashes: usize,
+    /// Chance a crash is a clean shutdown instead: the writer releases the
+    /// store, then its process ends.
+    pub release_percent: u64,
     /// The most ticks between crashes.
     pub crash_every: u64,
     /// How long request records last.
@@ -192,6 +195,10 @@ impl Options {
             },
             ..options
         };
+        let options = Options {
+            release_percent: *Prng::stream(seed, "release options").pick(&[0, 0, 50, 100]),
+            ..options
+        };
         let prng = &mut Prng::stream(seed, "takeover options");
         Options {
             writer_lease: prng.range(50..=2_000),
@@ -230,6 +237,7 @@ impl Options {
             partition_percent: 0,
             retry_after: 1_000,
             crashes: 0,
+            release_percent: 0,
             crash_every: 1_000,
             request_ttl: FOREVER,
             cache: Budget::default(),
@@ -652,6 +660,10 @@ pub struct Simulator {
     standby_reads: Prng,
     /// Which stats go by inode.
     handles: Prng,
+    /// Which crashes are clean shutdowns.
+    releases: Prng,
+    /// The writer releasing the store, whose process ends once it stops.
+    releasing: Option<u64>,
     standby_delays: Prng,
     storage: Memory,
     /// What each writer's storage handle reads, as `Storage::for_writer`
@@ -729,6 +741,8 @@ pub struct Summary {
     pub retries: u64,
     pub faults: u64,
     pub crashes: u64,
+    /// Writers that released the store on a clean shutdown.
+    pub releases: u64,
     pub given_up: u64,
     pub cache_checks: u64,
     pub snapshot_checks: u64,
@@ -748,7 +762,7 @@ impl fmt::Display for Summary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} commits in {} transactions, {} batches ({} changed nothing, {} rejected), {} queries ({} from standbys), {} storage reads ({} from before a later writer's commit), {} retries ({} given up), {} storage faults, {} crashes, {} cache checks, {} snapshot checks ({} too old), {} leases expired, {} records acknowledged, {} keys ({} requests denied), {} takeovers, {} stalls, {} ticks",
+            "{} commits in {} transactions, {} batches ({} changed nothing, {} rejected), {} queries ({} from standbys), {} storage reads ({} from before a later writer's commit), {} retries ({} given up), {} storage faults, {} crashes, {} releases, {} cache checks, {} snapshot checks ({} too old), {} leases expired, {} records acknowledged, {} keys ({} requests denied), {} takeovers, {} stalls, {} ticks",
             self.commits,
             self.transactions,
             self.batches,
@@ -762,6 +776,7 @@ impl fmt::Display for Summary {
             self.given_up,
             self.faults,
             self.crashes,
+            self.releases,
             self.cache_checks,
             self.snapshot_checks,
             self.snapshots_too_old,
@@ -853,6 +868,8 @@ impl Simulator {
             floors: Prng::stream(seed, "floors"),
             standby_reads: Prng::stream(seed, "standby reads"),
             handles: Prng::stream(seed, "handles"),
+            releases: Prng::stream(seed, "releases"),
+            releasing: None,
             standby_delays: Prng::stream(seed, "standby delays"),
             storage: Memory::new(),
             pinned: BTreeMap::new(),
@@ -1011,6 +1028,18 @@ impl Simulator {
                 self.writer_mut().evict_all();
             }
             self.actions()?;
+            if let Some(released) = self.releasing
+                && self
+                    .procs
+                    .get(&released)
+                    .is_none_or(|proc| proc.writer.is_stopped())
+            {
+                self.releasing = None;
+                if self.procs.contains_key(&released) {
+                    self.end(released)?;
+                    self.actions()?;
+                }
+            }
             self.settle();
             if self.now > 10_000_000 {
                 return Err(self.fail("the run never settled"));
@@ -1160,7 +1189,7 @@ impl Simulator {
                 attempt,
                 result,
             } => self.reply(request, attempt, result)?,
-            Event::Crash => self.crash()?,
+            Event::Crash => self.crash_or_release()?,
             Event::Feed { watcher } => self.feed(watcher)?,
             Event::Consume => self.consume()?,
             Event::Tick => {
@@ -2175,10 +2204,45 @@ impl Simulator {
     /// requests on their way to it are lost, and it answers nothing more.
     /// A new writer starts over the storage, and clients retry.
     fn crash(&mut self) -> Result<(), Failure> {
-        let dead = self.current;
+        self.summary.crashes += 1;
+        self.end(self.current)?;
+        self.next_crash();
+        Ok(())
+    }
+
+    /// Some crashes are clean shutdowns: the writer clients reach releases
+    /// the store, and its process ends once it stops.
+    fn crash_or_release(&mut self) -> Result<(), Failure> {
+        let current = self.current;
+        if self.releasing.is_none()
+            && self.releases.percent(self.options.release_percent)
+            && let Some(proc) = self.procs.get_mut(&current)
+        {
+            proc.writer.release();
+            self.releasing = Some(current);
+            self.summary.releases += 1;
+            self.next_crash();
+            return Ok(());
+        }
+        self.crash()
+    }
+
+    fn next_crash(&mut self) {
+        self.crashes_left -= 1;
+        if self.crashes_left > 0 && self.unfinished() {
+            let delay = self.faults.range(1..=self.options.crash_every);
+            self.schedule(delay, Event::Crash);
+        }
+    }
+
+    /// A writer's process ends. A commit on its way to storage lands or
+    /// not, and what it was asked goes unanswered. When clients reach it,
+    /// requests on their way to it are lost, and a writer that holds the
+    /// store, or a new one, takes its place.
+    fn end(&mut self, dead: u64) -> Result<(), Failure> {
+        let reached = self.current == dead;
         self.procs.remove(&dead);
         self.pinned.remove(&dead);
-        self.summary.crashes += 1;
         for (key, event) in std::mem::take(&mut self.events) {
             match event {
                 Event::StorageCommit {
@@ -2202,7 +2266,13 @@ impl Simulator {
                 | Event::StorageResolve { generation, .. }
                 | Event::ResolveDone { generation, .. }
                     if generation == dead => {}
-                Event::Deliver { token } => {
+                Event::Deliver { token }
+                    if reached
+                        || self
+                            .attempts
+                            .get(&token)
+                            .is_some_and(|attempt| attempt.generation == Some(dead)) =>
+                {
                     self.attempts.remove(&token);
                 }
                 other => {
@@ -2229,6 +2299,9 @@ impl Simulator {
                 LeaseCall::Beat { .. } => {}
                 LeaseCall::Claim | LeaseCall::Ack { .. } => self.consuming = false,
             }
+        }
+        if !reached {
+            return Ok(());
         }
         self.claim = None;
         // A writer that holds the store and lives goes on holding it, and
@@ -2261,11 +2334,6 @@ impl Simulator {
                 },
             );
             self.current = generation;
-        }
-        self.crashes_left -= 1;
-        if self.crashes_left > 0 && self.unfinished() {
-            let delay = self.faults.range(1..=self.options.crash_every);
-            self.schedule(delay, Event::Crash);
         }
         Ok(())
     }

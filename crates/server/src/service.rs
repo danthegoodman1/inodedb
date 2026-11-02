@@ -62,6 +62,7 @@ pub struct Service {
     engine: Engine,
     auth: Auth,
     log: Arc<dyn Log>,
+    tail: Arc<feed::Tail>,
     faults: Arc<Faults>,
     /// Turns true when the server shuts down, ending streams.
     closing: tokio::sync::watch::Receiver<bool>,
@@ -120,6 +121,7 @@ impl Service {
         engine: Engine,
         auth: Auth,
         log: Arc<dyn Log>,
+        tail: Arc<feed::Tail>,
         faults: Arc<Faults>,
         closing: tokio::sync::watch::Receiver<bool>,
     ) -> Service {
@@ -127,6 +129,7 @@ impl Service {
             engine,
             auth,
             log,
+            tail,
             faults,
             closing,
         }
@@ -451,6 +454,7 @@ impl InodeDb for Service {
         let (changes, stream) = tokio::sync::mpsc::channel(16);
         tokio::spawn(feed::watch(
             self.log.clone(),
+            self.tail.clone(),
             feed::Watcher {
                 scope,
                 key_root: key.root,

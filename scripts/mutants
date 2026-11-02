@@ -274,6 +274,50 @@ MUTANTS = [
         [(SQLITE, "shared.commits.fetch_add(1, Ordering::Relaxed);", "")],
     ),
     (
+        "a standby waits out a released head's lease",
+        [(STANDBY, "(head.is_none() || released || now >= since + self.wait)",
+          "(head.is_none() || now >= since + self.wait)")],
+    ),
+    (
+        "a releasing writer answers reads from its cache",
+        [(WRITER, """self.releasing.is_none()
+            && self
+                .renewed_at""", """self
+                .renewed_at""")],
+    ),
+    (
+        "a successor's head keeps the released mark",
+        [(WRITER, """address: self.config.address.clone(),
+                    released: false,
+                    ..head.clone()""", """address: self.config.address.clone(),
+                    ..head.clone()""")],
+    ),
+    (
+        "a clean shutdown keeps the lease",
+        [(SERVER, "if tokio::time::timeout(GRACE, watcher.release()).await.is_err() {",
+          "if tokio::time::timeout(GRACE, async {}).await.is_err() {")],
+    ),
+    (
+        "commits leave the tail empty",
+        [(ENGINE, """// Streams find the entries before the writer announces them.
+            tail.extend(&writes.log);""", "")],
+    ),
+    (
+        "a stream caught up with the tail reads storage",
+        [(SERVER_FEED, "if skip == tail.held.len() && reached < from {", "if false {")],
+    ),
+    (
+        "the tail serves entries truncation may have taken",
+        [(SERVER_FEED, "(now().saturating_sub(entry.time) < self.young).then(|| {", "true.then(|| {")],
+    ),
+    (
+        "the tail serves across a gap",
+        [(SERVER_FEED, """                Some((last, _, _)) if *version != last + 1 => {
+                    tail.held.clear();
+                    tail.bytes = 0;
+                }""", "")],
+    ),
+    (
         "a handle's MAC goes unchecked",
         [(AUTH, "if same {", "if true {")],
     ),

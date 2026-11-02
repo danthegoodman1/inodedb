@@ -32,6 +32,7 @@ macro_rules! api_conformance {
             floors_past_the_store_fail_fast, watch_streams_a_subtree, watch_replays_from_a_version,
             watch_reports_compaction, caches_follow_the_feed, keys_bound_their_reach,
             watch_ends_with_its_key, listings_follow_their_directory, inodes_share_their_handle, shutdown_ends_streams,
+            streams_that_keep_up_read_no_log,
             watch_stays_in_its_keys_tree, caches_stop_with_their_key, leases_hold_freed_records,
             leases_hold_the_log, caches_hold_a_lease, snapshots_hold_their_version,
             snapshots_hold_what_they_read, caches_start_under_steady_writes,
@@ -52,7 +53,8 @@ macro_rules! api_conformance {
 macro_rules! standby_conformance {
     ($make:expr) => {
         $crate::api_conformance!(@tests $make;
-            standbys_serve_reads_and_send_writes_on, takeovers_keep_every_acknowledged_batch);
+            standbys_serve_reads_and_send_writes_on, takeovers_keep_every_acknowledged_batch,
+            a_clean_stop_hands_the_store_to_a_standby);
     };
 }
 
@@ -1843,6 +1845,90 @@ pub async fn inodes_share_their_handle<B: Backend>(backend: &mut B) {
     }
 }
 
+/// A store that counts reads of its log.
+#[derive(Clone)]
+struct CountedLog<S> {
+    inner: S,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<S: inodedb_storage::Storage + Clone> inodedb_storage::Storage for CountedLog<S> {
+    type Txn = S::Txn;
+
+    async fn snapshot_read(
+        &self,
+        reads: Vec<inodedb_core::keys::KvRead>,
+    ) -> Result<Vec<inodedb_core::keys::KvResult>, inodedb_storage::StorageError> {
+        self.inner.snapshot_read(reads).await
+    }
+
+    async fn begin(&self) -> Result<S::Txn, inodedb_storage::StorageError> {
+        self.inner.begin().await
+    }
+
+    async fn read_log(
+        &self,
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, inodedb_storage::StorageError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_log(from, limit).await
+    }
+
+    async fn wait_past(&self, version: u64) -> Result<u64, inodedb_storage::StorageError> {
+        self.inner.wait_past(version).await
+    }
+
+    async fn truncate_log(&self, below: u64) -> Result<(), inodedb_storage::StorageError> {
+        self.inner.truncate_log(below).await
+    }
+
+    fn for_writer(&self) -> Self {
+        CountedLog {
+            inner: self.inner.for_writer(),
+            reads: self.reads.clone(),
+        }
+    }
+}
+
+/// A stream that keeps up takes each change from the server's memory, so
+/// commits cost streams no reads of the log.
+pub async fn streams_that_keep_up_read_no_log<B: Backend>(backend: &mut B) {
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store = CountedLog {
+        inner: backend.fresh(),
+        reads: reads.clone(),
+    };
+    let settings = Settings {
+        retention: inodedb_server::feed::Retention {
+            every: std::time::Duration::from_secs(3_600),
+            ..Default::default()
+        },
+        ..Settings::default()
+    };
+    let server = inodedb_server::start_with(store, KEY, settings).await;
+    let db = Client::connect(server.endpoint(), KEY)
+        .await
+        .expect("connects");
+    db.commit([Op::mkdir("s")]).await.expect("commits");
+    let mut changes = watch(&server, "s", 0).await;
+    db.commit([Op::put("s/a", "1")]).await.expect("commits");
+    assert_eq!(names_changed(&next_change(&mut changes).await), ["a"]);
+    let before = reads.load(Ordering::Relaxed);
+    for index in 0..20 {
+        let name = format!("f{index}");
+        db.commit([Op::put(format!("s/{name}"), "1")])
+            .await
+            .expect("commits");
+        assert_eq!(names_changed(&next_change(&mut changes).await), [name]);
+    }
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        before,
+        "the stream read the log"
+    );
+}
+
 /// Shutdown ends open streams instead of waiting out its grace.
 pub async fn shutdown_ends_streams<B: Backend>(backend: &mut B) {
     let Fixture { db, server, .. } = fresh(backend).await;
@@ -1944,6 +2030,39 @@ fn standby_settings() -> Settings {
         standby: true,
         ..Settings::default()
     }
+}
+
+/// A writer that stops cleanly releases the store, so a standby takes over
+/// long before the writer's lease would run out.
+pub async fn a_clean_stop_hands_the_store_to_a_standby<B: Backend>(backend: &mut B) {
+    let settings = || Settings {
+        writer: inodedb_core::writer::Config {
+            writer_lease: 60_000,
+            renew_every: 1_000,
+            takeover_margin: 1_000,
+            ..Default::default()
+        },
+        standby: true,
+        ..Settings::default()
+    };
+    let store = backend.fresh();
+    let first = inodedb_server::start_with(store.clone(), KEY, settings()).await;
+    let db = Client::connect(first.endpoint(), KEY)
+        .await
+        .expect("connects");
+    db.commit([Op::mkdir("t")]).await.expect("commits");
+    let standby = inodedb_server::start_with(store.clone(), KEY, settings()).await;
+    first.stop().await;
+    let db = Client::connect(standby.endpoint(), KEY)
+        .await
+        .expect("connects");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        db.commit([Op::put("t/after", "1")]),
+    )
+    .await
+    .expect("the standby writes long before the lease runs out")
+    .expect("commits");
 }
 
 /// A standby answers reads at a version its client has seen, and sends

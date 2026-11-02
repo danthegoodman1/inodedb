@@ -82,8 +82,8 @@ async fn init_key(engine: &Engine, key: &str) -> Result<(), String> {
 pub type Failure = Box<dyn std::error::Error + Send + Sync>;
 
 /// Serves until `shutdown` resolves or the writer stops, then waits up to
-/// `GRACE` for requests in progress and for the writer to release the
-/// storage. The server listens through `listen` once the engine is ready,
+/// `GRACE` each for requests in progress, for the writer to release the
+/// store so a standby takes over at once, and for the engine to stop. The server listens through `listen` once the engine is ready,
 /// so a connection, such as a readiness probe's, succeeds only once the
 /// server answers.
 pub async fn serve<S: Storage + Clone>(
@@ -93,7 +93,8 @@ pub async fn serve<S: Storage + Clone>(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<Ended, Failure> {
     let log: Arc<dyn Log> = Arc::new(storage.clone());
-    let (engine, task) = Engine::spawn(storage, settings.writer, settings.standby);
+    let tail = Arc::new(feed::Tail::new(&settings.retention));
+    let (engine, task) = Engine::spawn(storage, settings.writer, settings.standby, tail.clone());
     let watcher = engine.clone();
     let mut shutdown = std::pin::pin!(shutdown);
     // A server that can't reach its store yet still stops when asked.
@@ -126,6 +127,7 @@ pub async fn serve<S: Storage + Clone>(
         engine,
         Auth::new(ready.secret),
         log,
+        tail,
         settings.faults,
         closing,
     ))
@@ -161,6 +163,12 @@ pub async fn serve<S: Storage + Clone>(
     };
     truncation.abort();
     let _ = truncation.await;
+    if tokio::time::timeout(GRACE, watcher.release())
+        .await
+        .is_err()
+    {
+        eprintln!("level=warn msg=\"releasing the store outlived the shutdown grace\"");
+    }
     drop(watcher);
     if tokio::time::timeout(GRACE, task).await.is_err() {
         eprintln!("level=warn msg=\"the writer outlived the shutdown grace\"");

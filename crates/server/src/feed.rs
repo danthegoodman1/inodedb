@@ -1,5 +1,6 @@
 //! The changefeed's server side: the log as an object the service holds,
-//! `Watch` streams, and truncation by age and lease positions.
+//! the newest entries in memory, `Watch` streams, and truncation by age and
+//! lease positions.
 
 use crate::auth::Scope;
 use crate::convert;
@@ -9,9 +10,10 @@ use inodedb_core::log::LogEntry;
 use inodedb_core::types::{Ino, Millis, Version};
 use inodedb_proto as pb;
 use inodedb_storage::{Storage, StorageError};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tonic::Status;
@@ -85,6 +87,117 @@ impl Retention {
 /// Entries read from the log per round.
 const READ_BATCH: usize = 256;
 
+/// The most entries, and encoded bytes, the tail holds.
+const TAIL_ENTRIES: usize = 4_096;
+const TAIL_BYTES: usize = 64 << 20;
+
+/// The newest committed log entries, decoded, in version order with no
+/// gaps. The engine adds each entry its writer commits or its standby
+/// reads, so streams that keep up read neither storage nor a decoder. It
+/// serves entries only while they are younger than half the log's minimum
+/// retention, which truncation never takes, so a stream sees `Compacted`
+/// exactly when storage no longer holds where it starts.
+pub struct Tail {
+    entries: Mutex<Entries>,
+    young: Millis,
+}
+
+#[derive(Default)]
+struct Entries {
+    held: VecDeque<(Version, Arc<LogEntry>, usize)>,
+    bytes: usize,
+}
+
+impl Tail {
+    pub fn new(retention: &Retention) -> Tail {
+        Tail {
+            entries: Mutex::default(),
+            young: u64::try_from(retention.min.as_millis() / 2).unwrap_or(Millis::MAX),
+        }
+    }
+
+    /// Adds the entries of versions after the newest held, decoding each;
+    /// one that leaves a gap starts the tail over from it.
+    pub fn extend<'a>(&self, entries: impl IntoIterator<Item = &'a (Version, Vec<u8>)>) {
+        let mut tail = self
+            .entries
+            .lock()
+            .expect("no thread panics holding the tail");
+        for (version, bytes) in entries {
+            let Ok(entry) = decode(*version, bytes) else {
+                continue;
+            };
+            match tail.held.back() {
+                Some((last, _, _)) if *version <= *last => continue,
+                Some((last, _, _)) if *version != last + 1 => {
+                    tail.held.clear();
+                    tail.bytes = 0;
+                }
+                _ => {}
+            }
+            tail.held
+                .push_back((*version, Arc::new(entry), bytes.len()));
+            tail.bytes += bytes.len();
+            while tail.held.len() > TAIL_ENTRIES || tail.bytes > TAIL_BYTES {
+                let Some((_, _, size)) = tail.held.pop_front() else {
+                    break;
+                };
+                tail.bytes -= size;
+            }
+        }
+    }
+
+    /// Up to `limit` entries from version `from` on, if the tail holds it;
+    /// none if `from` is the version after the tail's newest, and this
+    /// server's reads have yet to reach it, so no entry exists for it yet.
+    fn read(
+        &self,
+        from: Version,
+        limit: usize,
+        reached: Version,
+    ) -> Option<Vec<(Version, Arc<LogEntry>)>> {
+        let tail = self
+            .entries
+            .lock()
+            .expect("no thread panics holding the tail");
+        let (first, _, _) = tail.held.front()?;
+        let skip = usize::try_from(from.checked_sub(*first)?).ok()?;
+        if skip == tail.held.len() && reached < from {
+            return Some(Vec::new());
+        }
+        let (_, entry, _) = tail.held.get(skip)?;
+        (now().saturating_sub(entry.time) < self.young).then(|| {
+            tail.held
+                .iter()
+                .skip(skip)
+                .take(limit)
+                .map(|(version, entry, _)| (*version, entry.clone()))
+                .collect()
+        })
+    }
+}
+
+/// Up to `limit` entries from version `from` on: from the tail when it
+/// holds `from`, else from storage. `reached` is the version this server's
+/// reads reach.
+async fn entries(
+    log: &dyn Log,
+    tail: &Tail,
+    from: Version,
+    limit: usize,
+    reached: Version,
+) -> Result<Vec<(Version, Arc<LogEntry>)>, Status> {
+    if let Some(entries) = tail.read(from, limit, reached) {
+        return Ok(entries);
+    }
+    log.read(from, limit)
+        .await
+        .map_err(storage)?
+        .into_iter()
+        .map(|(version, bytes)| Ok((version, Arc::new(decode(version, &bytes)?))))
+        .collect()
+}
+
 fn decode(version: Version, bytes: &[u8]) -> Result<LogEntry, Status> {
     let entry = LogEntry::decode(bytes)
         .map_err(|_| Status::data_loss(format!("log entry {version} doesn't decode")))?;
@@ -147,6 +260,7 @@ impl Watcher {
 /// when the client leaves. `head` is a version known committed.
 pub async fn watch(
     log: Arc<dyn Log>,
+    tail: Arc<Tail>,
     mut watcher: Watcher,
     root: Ino,
     mut from: Version,
@@ -165,11 +279,11 @@ pub async fn watch(
         let entries = tokio::select! {
             () = out.closed() => return,
             status = watcher.ended() => return failed(status).await,
-            entries = log.read(from, READ_BATCH) => entries,
+            entries = entries(&*log, &tail, from, READ_BATCH, *committed.borrow()) => entries,
         };
         let entries = match entries {
             Ok(entries) => entries,
-            Err(error) => return failed(storage(error)).await,
+            Err(status) => return failed(status).await,
         };
         // Every committed version has an entry until truncation takes it.
         let missing = match entries.first() {
@@ -186,16 +300,19 @@ pub async fn watch(
                 .await;
             return;
         }
-        let Some((last, _)) = entries.last().map(|(version, bytes)| (*version, bytes)) else {
-            // Caught up: wait for the next commit.
+        let Some(&(last, _)) = entries.last() else {
+            // Caught up: wait for this server's reads to reach the next
+            // version, whose entry storage then holds.
             let waited = tokio::select! {
                 () = out.closed() => return,
                 status = watcher.ended() => return failed(status).await,
-                waited = log.wait_past(from.saturating_sub(1)) => waited,
+                waited = async {
+                    committed.wait_for(|committed| *committed >= from).await.map(|seen| *seen)
+                } => waited,
             };
             match waited {
                 Ok(latest) => head = head.max(latest),
-                Err(error) => return failed(storage(error)).await,
+                Err(_) => return failed(Status::unavailable("the writer has stopped")).await,
             }
             continue;
         };
@@ -211,18 +328,14 @@ pub async fn watch(
             return failed(Status::unavailable("the writer has stopped")).await;
         }
         let mut sent = 0;
-        for (version, bytes) in &entries {
-            let entry = match decode(*version, bytes) {
-                Ok(entry) => entry,
-                Err(status) => return failed(status).await,
-            };
+        for (version, entry) in &entries {
             if watcher
                 .key
                 .is_some_and(|key| entry.keys.contains(&(key, None)))
             {
                 return failed(Status::unauthenticated("the key was revoked")).await;
             }
-            let route = route(&entry, root, watcher.key_root);
+            let route = route(entry, root, watcher.key_root);
             if let Some(change) = route {
                 if out
                     .send(Ok(convert::change(&change, &scope)))
@@ -323,8 +436,104 @@ pub async fn truncate(
 
 #[cfg(test)]
 mod tests {
-    use super::Retention;
-    use std::time::Duration;
+    use super::*;
+
+    fn entry(version: Version, time: Millis) -> (Version, Vec<u8>) {
+        let entry = LogEntry {
+            version,
+            time,
+            ..LogEntry::default()
+        };
+        (version, entry.encode())
+    }
+
+    fn versions(entries: Option<Vec<(Version, Arc<LogEntry>)>>) -> Option<Vec<Version>> {
+        entries.map(|entries| entries.into_iter().map(|(version, _)| version).collect())
+    }
+
+    /// A log whose reads count, and hold nothing.
+    #[derive(Default)]
+    struct Counted(std::sync::atomic::AtomicUsize);
+
+    impl Log for Counted {
+        fn read(&self, _: Version, _: usize) -> Boxed<'_, Vec<(Version, Vec<u8>)>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn wait_past(&self, _: Version) -> Boxed<'_, Version> {
+            Box::pin(std::future::pending())
+        }
+        fn truncate(&self, _: Version) -> Boxed<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn dump(&self) -> Boxed<'_, inodedb_core::keys::Pairs> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test]
+    fn the_tail_holds_the_newest_young_entries_without_gaps() {
+        let tail = Tail::new(&Retention::default());
+        let now = now();
+        tail.extend(&[entry(5, now), entry(6, now), entry(7, now)]);
+        assert_eq!(versions(tail.read(6, 10, 7)), Some(vec![6, 7]));
+        assert_eq!(versions(tail.read(5, 2, 7)), Some(vec![5, 6]));
+        assert_eq!(versions(tail.read(4, 10, 7)), None, "before the tail");
+        assert_eq!(
+            versions(tail.read(8, 10, 7)),
+            Some(vec![]),
+            "caught up with the tail and the reads"
+        );
+        assert_eq!(
+            versions(tail.read(8, 10, 8)),
+            None,
+            "reads reach past the tail"
+        );
+        assert_eq!(versions(tail.read(9, 10, 9)), None, "past the tail");
+        // A gap starts the tail over.
+        tail.extend(&[entry(9, now)]);
+        assert_eq!(versions(tail.read(7, 10, 9)), None);
+        assert_eq!(versions(tail.read(9, 10, 9)), Some(vec![9]));
+        // An entry as old as half the minimum retention is storage's to give.
+        let old = now - Retention::default().min.as_millis() as u64 / 2;
+        tail.extend(&[entry(10, old)]);
+        assert_eq!(versions(tail.read(10, 10, 10)), None);
+        assert_eq!(versions(tail.read(9, 10, 10)), Some(vec![9, 10]));
+    }
+
+    #[test]
+    fn the_tail_drops_its_oldest_entries_past_its_bound() {
+        let tail = Tail::new(&Retention::default());
+        let now = now();
+        let entries: Vec<_> = (1..=TAIL_ENTRIES as u64 + 10)
+            .map(|version| entry(version, now))
+            .collect();
+        tail.extend(&entries);
+        assert_eq!(versions(tail.read(10, 1, 0)), None);
+        assert_eq!(versions(tail.read(11, 1, 0)), Some(vec![11]));
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_keeps_up_reads_no_storage() {
+        let tail = Tail::new(&Retention::default());
+        let log = Counted::default();
+        tail.extend(&[entry(1, now()), entry(2, now())]);
+        let read = entries(&log, &tail, 1, READ_BATCH, 2).await.expect("reads");
+        assert_eq!(read.len(), 2);
+        assert!(
+            entries(&log, &tail, 3, READ_BATCH, 2)
+                .await
+                .expect("reads")
+                .is_empty()
+        );
+        assert_eq!(log.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        entries(&log, &tail, 3, READ_BATCH, 3).await.expect("reads");
+        assert_eq!(
+            log.0.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "past the tail"
+        );
+    }
 
     #[test]
     fn leases_keep_what_their_positions_need_up_to_the_maximum() {
