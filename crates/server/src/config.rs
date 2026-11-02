@@ -31,6 +31,9 @@ pub struct CacheConfig {
     pub inodes: usize,
     /// Bytes of values.
     pub value_bytes: usize,
+    /// Whether the writer reads the tree into its cache when it starts, up
+    /// to the budget.
+    pub preload: bool,
 }
 
 impl Default for CacheConfig {
@@ -40,6 +43,7 @@ impl Default for CacheConfig {
             dirs: budget.dirs,
             inodes: budget.inodes,
             value_bytes: budget.value_bytes,
+            preload: true,
         }
     }
 }
@@ -142,6 +146,7 @@ impl Config {
                 value_bytes: self.cache.value_bytes,
                 ..inodedb_core::cache::Budget::default()
             },
+            preload: self.cache.preload,
             ..inodedb_core::writer::Config::default()
         }
     }
@@ -248,6 +253,7 @@ mod tests {
             ),
             (1 << 18, 1 << 20, 256 << 20, 64 << 20)
         );
+        assert!(core.preload);
     }
 
     #[test]

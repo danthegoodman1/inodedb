@@ -6,10 +6,11 @@
 //! as a separate process would, and each client opens its own connection.
 //! The tree holds `FILES` files of 100 bytes in one directory and a
 //! directory of 100 more for listings. A server restarted over the store
-//! starts with nothing cached: a cold stat is each file's first, and a cold
-//! read each value's first. The rest run against a warm cache, but a put
-//! names a new file, which the writer reads storage to find absent. Each
-//! client waits for each answer before sending the next.
+//! without preloading starts with nothing cached: a cold stat is each
+//! file's first, and a cold read each value's first. Then a server that
+//! preloads, as servers do by default, starts, and clients stat each file
+//! once as it reads the tree; the rest run against its cache. Each client
+//! waits for each answer before sending the next.
 
 use inodedb::{Client, Op};
 use inodedb_server::Settings;
@@ -30,7 +31,7 @@ struct Server {
 }
 
 impl Server {
-    fn start<S: Storage + Clone>(storage: S) -> Server {
+    fn start<S: Storage + Clone>(storage: S, preload: bool) -> Server {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds a local port");
         listener.set_nonblocking(true).expect("nonblocking");
         let endpoint = format!("http://{}", listener.local_addr().expect("bound"));
@@ -39,6 +40,7 @@ impl Server {
             ..Settings::default()
         };
         settings.writer.address = endpoint.clone();
+        settings.writer.preload = preload;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(SERVER_THREADS)
             .enable_all()
@@ -81,6 +83,7 @@ impl Drop for Server {
 
 #[derive(Clone, Copy)]
 enum Operation {
+    StatPreloaded,
     StatCold,
     ReadCold,
     Stat,
@@ -93,6 +96,7 @@ enum Operation {
 impl Operation {
     fn name(self) -> &'static str {
         match self {
+            Operation::StatPreloaded => "stat, as a preloading server starts",
             Operation::StatCold => "stat, cold cache",
             Operation::ReadCold => "read a 100-byte value, cold cache",
             Operation::Stat => "stat",
@@ -108,7 +112,7 @@ impl Operation {
         // Clients spread over the files, each striding through them.
         let file = (client + index * clients) * 7_919 % FILES;
         match self {
-            Operation::StatCold | Operation::Stat => {
+            Operation::StatPreloaded | Operation::StatCold | Operation::Stat => {
                 db.stat(format!("t/f{file}")).await.expect("stats");
             }
             Operation::ReadCold | Operation::Read => {
@@ -174,7 +178,7 @@ async fn drive(endpoint: &str, operation: Operation, clients: usize, seconds: u6
                 let mut index = 0;
                 loop {
                     let done = match operation {
-                        Operation::StatCold | Operation::ReadCold => {
+                        Operation::StatPreloaded | Operation::StatCold | Operation::ReadCold => {
                             client + index * clients >= FILES
                         }
                         // Renames end with the file back where it started.
@@ -218,7 +222,7 @@ fn report(backend: &str, operation: Operation, clients: usize, run: &Run) {
 const CLIENTS: [usize; 2] = [1, 64];
 
 async fn bench<S: Storage + Clone>(backend: &str, storage: S, seconds: u64) {
-    let server = Server::start(storage.clone());
+    let server = Server::start(storage.clone(), false);
     let db = Client::connect(server.endpoint.clone(), KEY)
         .await
         .expect("connects");
@@ -248,9 +252,10 @@ async fn bench<S: Storage + Clone>(backend: &str, storage: S, seconds: u64) {
     .expect("makes the clients' directories");
     server.stop().await;
 
-    // A server restarted over the store starts with nothing cached.
-    let server = Server::start(storage);
+    // A server restarted over the store without preloading starts with
+    // nothing cached.
     let cold = 16;
+    let server = Server::start(storage.clone(), false);
     for operation in [Operation::StatCold, Operation::ReadCold] {
         report(
             backend,
@@ -259,6 +264,16 @@ async fn bench<S: Storage + Clone>(backend: &str, storage: S, seconds: u64) {
             &drive(&server.endpoint, operation, cold, seconds).await,
         );
     }
+    server.stop().await;
+
+    // A server that preloads reads the tree as clients start asking.
+    let server = Server::start(storage, true);
+    report(
+        backend,
+        Operation::StatPreloaded,
+        cold,
+        &drive(&server.endpoint, Operation::StatPreloaded, cold, seconds).await,
+    );
     for operation in [
         Operation::Stat,
         Operation::Read,

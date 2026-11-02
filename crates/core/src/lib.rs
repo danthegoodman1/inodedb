@@ -18,6 +18,7 @@ pub mod lease;
 pub mod log;
 pub mod ops;
 pub mod overlay;
+pub mod preload;
 pub mod query;
 pub mod snapshot;
 pub mod standby;

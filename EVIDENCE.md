@@ -4,7 +4,7 @@ What checks each behavior `DESIGN.md` names: a test, a simulator property, or a 
 
 Notation:
 
-- `ops::`, `groups::`, `keys::`, `leases::`, `snapshots::`, `feed::`, `standby::`, `posix::`, `seeds::` and `fsck::` are tests in `crates/sim/tests/<file>.rs`.
+- `ops::`, `groups::`, `keys::`, `leases::`, `snapshots::`, `feed::`, `standby::`, `posix::`, `preload::`, `seeds::` and `fsck::` are tests in `crates/sim/tests/<file>.rs`.
 - `api::` is `tests/src/lib.rs` through `api_conformance!`, run on memory, SQLite and RocksDB, and on FoundationDB by `scripts/fdb`. `api-sb::` is `standby_conformance!`, on memory and FoundationDB.
 - `sc::` is `crates/storage-conformance/src/lib.rs`, on every backend.
 - `cli::` and `mount::` are `crates/cli/tests/*.rs`; `init_key::` is `crates/server/tests/init_key.rs`.
@@ -53,6 +53,7 @@ Faults the simulator injects: clean shutdowns that release the store, unknown ou
 
 | Behavior | Evidence |
 | --- | --- |
+| Preload: inodes, entries and back-pointers in pages, moved through the commits since; directories whole in a page, and empty ones passed over, complete; stops at the budget | `preload::{a_preloaded_writer_answers_stats_without_reads, a_directory_larger_than_a_page_arrives_as_names, a_preload_stops_at_the_cache_budget, a_preload_takes_the_commits_made_while_it_reads, a_writer_without_preload_reads_as_it_misses}`, `api::preloaded_servers_answer_stats_without_reads`, `server/config::defaults_match_the_design`, P1 and P6 with preloading writers in the swarm; M"the writer never preloads", M"a preload passes the cache's budget", M"a preload completes a directory that began before its page", M"a preload completes a directory that fills its page", M"a preload leaves empty directories incomplete", M"a preload empties directories past its page", M"a server ignores cache.preload" |
 | Streams read the tail, decoded once, while it holds where they are; storage otherwise; `Compacted` exactly as storage holds | `server/feed::{the_tail_holds_the_newest_young_entries_without_gaps, the_tail_drops_its_oldest_entries_past_its_bound, a_stream_that_keeps_up_reads_no_storage}`, `api::{streams_that_keep_up_read_no_log, watch_reports_compaction, leases_hold_the_log}`; M"commits leave the tail empty", M"a stream caught up with the tail reads storage", M"the tail serves entries truncation may have taken", M"the tail serves across a gap" |
 | One entry per commit, keyed by version, split across keys when large | `sc::log_order_and_truncation`, `core/log::entries_round_trip`, P5 |
 | Watch: order, replay, renames, routing, key scope, endings | `api::{watch_streams_a_subtree, watch_replays_from_a_version, watch_stays_in_its_keys_tree, watch_ends_with_its_key, shutdown_ends_streams, watch_reports_compaction}`, `cli::watch_prints_changes_as_paths`, P6; M"a directory entering a subtree isn't reported", M"a stream outlives its key", M"a watch starts past the version its key was checked at" |

@@ -32,7 +32,7 @@ macro_rules! api_conformance {
             floors_past_the_store_fail_fast, watch_streams_a_subtree, watch_replays_from_a_version,
             watch_reports_compaction, caches_follow_the_feed, keys_bound_their_reach,
             watch_ends_with_its_key, listings_follow_their_directory, inodes_share_their_handle, shutdown_ends_streams,
-            streams_that_keep_up_read_no_log,
+            streams_that_keep_up_read_no_log, preloaded_servers_answer_stats_without_reads,
             watch_stays_in_its_keys_tree, caches_stop_with_their_key, leases_hold_freed_records,
             leases_hold_the_log, caches_hold_a_lease, snapshots_hold_their_version,
             snapshots_hold_what_they_read, caches_start_under_steady_writes,
@@ -1845,20 +1845,32 @@ pub async fn inodes_share_their_handle<B: Backend>(backend: &mut B) {
     }
 }
 
-/// A store that counts reads of its log.
+/// A store that counts its snapshot reads and its reads of the log.
 #[derive(Clone)]
-struct CountedLog<S> {
+struct Counted<S> {
     inner: S,
-    reads: Arc<std::sync::atomic::AtomicUsize>,
+    snapshot_reads: Arc<std::sync::atomic::AtomicUsize>,
+    log_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl<S: inodedb_storage::Storage + Clone> inodedb_storage::Storage for CountedLog<S> {
+impl<S> Counted<S> {
+    fn new(inner: S) -> Counted<S> {
+        Counted {
+            inner,
+            snapshot_reads: Arc::default(),
+            log_reads: Arc::default(),
+        }
+    }
+}
+
+impl<S: inodedb_storage::Storage + Clone> inodedb_storage::Storage for Counted<S> {
     type Txn = S::Txn;
 
     async fn snapshot_read(
         &self,
         reads: Vec<inodedb_core::keys::KvRead>,
     ) -> Result<Vec<inodedb_core::keys::KvResult>, inodedb_storage::StorageError> {
+        self.snapshot_reads.fetch_add(1, Ordering::Relaxed);
         self.inner.snapshot_read(reads).await
     }
 
@@ -1871,7 +1883,7 @@ impl<S: inodedb_storage::Storage + Clone> inodedb_storage::Storage for CountedLo
         from: u64,
         limit: usize,
     ) -> Result<Vec<(u64, Vec<u8>)>, inodedb_storage::StorageError> {
-        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.log_reads.fetch_add(1, Ordering::Relaxed);
         self.inner.read_log(from, limit).await
     }
 
@@ -1884,9 +1896,9 @@ impl<S: inodedb_storage::Storage + Clone> inodedb_storage::Storage for CountedLo
     }
 
     fn for_writer(&self) -> Self {
-        CountedLog {
+        Counted {
             inner: self.inner.for_writer(),
-            reads: self.reads.clone(),
+            ..self.clone()
         }
     }
 }
@@ -1894,11 +1906,8 @@ impl<S: inodedb_storage::Storage + Clone> inodedb_storage::Storage for CountedLo
 /// A stream that keeps up takes each change from the server's memory, so
 /// commits cost streams no reads of the log.
 pub async fn streams_that_keep_up_read_no_log<B: Backend>(backend: &mut B) {
-    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let store = CountedLog {
-        inner: backend.fresh(),
-        reads: reads.clone(),
-    };
+    let store = Counted::new(backend.fresh());
+    let reads = store.log_reads.clone();
     let settings = Settings {
         retention: inodedb_server::feed::Retention {
             every: std::time::Duration::from_secs(3_600),
@@ -1926,6 +1935,58 @@ pub async fn streams_that_keep_up_read_no_log<B: Backend>(backend: &mut B) {
         reads.load(Ordering::Relaxed),
         before,
         "the stream read the log"
+    );
+}
+
+/// A server that reads the tree into its cache when it starts answers
+/// stats, of names present and absent, without reading storage.
+pub async fn preloaded_servers_answer_stats_without_reads<B: Backend>(backend: &mut B) {
+    let store = backend.fresh();
+    let first = inodedb_server::start_with(store.clone(), KEY, Settings::default()).await;
+    let db = Client::connect(first.endpoint(), KEY)
+        .await
+        .expect("connects");
+    db.commit([
+        Op::mkdir("p/q").parents(),
+        Op::put("p/a", "1"),
+        Op::put("p/q/b", "2"),
+        Op::mkdir("empty"),
+    ])
+    .await
+    .expect("commits");
+    first.stop().await;
+    let store = Counted::new(store);
+    let settings = Settings {
+        writer: inodedb_core::writer::Config {
+            preload: true,
+            ..Default::default()
+        },
+        ..Settings::default()
+    };
+    let server = inodedb_server::start_with(store.clone(), KEY, settings).await;
+    let db = Client::connect(server.endpoint(), KEY)
+        .await
+        .expect("connects");
+    // The preload is done once storage reads stop.
+    let mut settled = usize::MAX;
+    loop {
+        let now = store.snapshot_reads.load(Ordering::Relaxed);
+        if now == settled {
+            break;
+        }
+        settled = now;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    for path in ["p", "p/a", "p/q", "p/q/b", "empty"] {
+        db.stat(path).await.expect("stats");
+    }
+    for path in ["p/missing", "p/q/missing", "empty/missing"] {
+        assert_eq!(fs(db.stat(path).await), FsError::NotFound, "{path}");
+    }
+    assert_eq!(
+        store.snapshot_reads.load(Ordering::Relaxed),
+        settled,
+        "a stat read storage"
     );
 }
 

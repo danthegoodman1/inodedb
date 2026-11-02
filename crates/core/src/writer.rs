@@ -29,6 +29,7 @@ use crate::lease::{
 use crate::log::{Chains, LogEntry};
 use crate::ops::{Batch, BatchError, CommitResult};
 use crate::overlay::{Overlaid, Overlay};
+use crate::preload::Cursor;
 use crate::query::{self, Query, QueryResult};
 use crate::types::{Ino, Inode, MAX_BATCH_BYTES, Millis, ROOT, Version};
 use crate::view::{Read, View};
@@ -62,6 +63,9 @@ pub struct Config {
     pub request_ttl: Millis,
     /// What the writer's cache holds.
     pub cache: Budget,
+    /// Whether the writer reads the tree into its cache once it starts, up
+    /// to the cache's budget.
+    pub preload: bool,
     /// How long a lease lasts past its last heartbeat.
     pub lease_ttl: Millis,
     /// How long a claim lasts unless acknowledged or renewed.
@@ -85,6 +89,7 @@ impl Default for Config {
             group_max_bytes: MAX_GROUP_BYTES,
             request_ttl: 10 * 60 * 1000,
             cache: Budget::default(),
+            preload: false,
             lease_ttl: 30 * 1000,
             claim_ttl: 60 * 1000,
             writer_lease: 5 * 1000,
@@ -341,6 +346,8 @@ enum Purpose {
     Batch,
     Query(u64),
     Claim(u64),
+    /// A page of the tree read into the cache.
+    Preload(Cursor),
 }
 
 /// A claim scanning the free queue.
@@ -396,6 +403,10 @@ pub struct Writer {
     /// The writer is giving up the store, and the id of the commit that
     /// marks its head released, once sent.
     releasing: Option<Option<u64>>,
+    /// Where the preload's next page starts, once its last page is read.
+    preload: Option<Cursor>,
+    /// The directories the preload's inode pages found.
+    preload_dirs: BTreeSet<Ino>,
     now: Millis,
     cache: Cache,
     /// The committed version, which the cache reflects.
@@ -479,6 +490,8 @@ impl Writer {
             writer_id: id,
             phase: Phase::Starting,
             releasing: None,
+            preload: None,
+            preload_dirs: BTreeSet::new(),
             now,
             cache: Cache::with_budget(budget),
             version: 0,
@@ -1853,7 +1866,39 @@ impl Writer {
             }
             Purpose::Query(query) => self.run_query(query),
             Purpose::Claim(_) => {}
+            Purpose::Preload(_) => match self.preload.take() {
+                Some(cursor) => self.preload_page(cursor),
+                None => self.preload_dirs.clear(),
+            },
         }
+    }
+
+    /// Reads the preload's next page, while the cache has room and the
+    /// writer serves.
+    fn preload_page(&mut self, cursor: Cursor) {
+        let budget = self.config.cache;
+        if self.phase != Phase::Ready
+            || self.releasing.is_some()
+            || self.cache.inodes() >= budget.inodes
+            || self.cache.dirs() >= budget.dirs
+        {
+            self.preload_dirs.clear();
+            return;
+        }
+        let id = self.id();
+        let read = cursor.read();
+        self.reads.insert(
+            id,
+            Outstanding {
+                issued_at: self.version,
+                reads: Vec::new(),
+                purpose: Purpose::Preload(cursor),
+            },
+        );
+        self.actions.push(Action::Read {
+            id,
+            reads: vec![KvRead::Get(keys::head()), read],
+        });
     }
 
     fn absorb(
@@ -1935,12 +1980,23 @@ impl Writer {
         }
         let read_at = head.map_or(0, |head| head.version);
         let to = self.version;
-        let facts: Vec<_> = outstanding
-            .reads
-            .iter()
-            .zip(results)
-            .map(|(read, result)| read.fact(result))
-            .collect::<Result<_, _>>()?;
+        let facts: Vec<_> = match &outstanding.purpose {
+            Purpose::Preload(cursor) => {
+                let Some(KvResult::Scan(pairs)) = results.next() else {
+                    return Err(DecodeError);
+                };
+                let page = cursor.page(pairs, &self.preload_dirs)?;
+                self.preload_dirs.extend(page.dirs);
+                self.preload = page.next;
+                page.facts
+            }
+            _ => outstanding
+                .reads
+                .iter()
+                .zip(results)
+                .map(|(read, result)| read.fact(result))
+                .collect::<Result<_, _>>()?,
+        };
         let window = self.window();
         // Rebasing needs every delta between the two versions. A read past
         // every change this writer made saw another writer's commit.
@@ -2110,11 +2166,21 @@ impl Writer {
 
     fn ready(&mut self) {
         self.phase = Phase::Ready;
+        if self.config.preload {
+            self.preload_page(Cursor::start());
+        }
         let waiting: Vec<u64> = self.queries.keys().copied().collect();
         for id in waiting {
             self.run_query(id);
         }
         self.pump();
+    }
+
+    /// Whether a page of the preload is being read.
+    pub fn is_preloading(&self) -> bool {
+        self.reads
+            .values()
+            .any(|read| matches!(read.purpose, Purpose::Preload(_)))
     }
 
     /// Batches and answers the writer holds, for tests and metrics.

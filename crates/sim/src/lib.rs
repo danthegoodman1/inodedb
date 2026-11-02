@@ -80,6 +80,8 @@ pub struct Options {
     /// Chance a crash is a clean shutdown instead: the writer releases the
     /// store, then its process ends.
     pub release_percent: u64,
+    /// Whether writers read the tree into their caches when they start.
+    pub preload: bool,
     /// The most ticks between crashes.
     pub crash_every: u64,
     /// How long request records last.
@@ -197,6 +199,7 @@ impl Options {
         };
         let options = Options {
             release_percent: *Prng::stream(seed, "release options").pick(&[0, 0, 50, 100]),
+            preload: Prng::stream(seed, "preload options").percent(50),
             ..options
         };
         let prng = &mut Prng::stream(seed, "takeover options");
@@ -238,6 +241,7 @@ impl Options {
             retry_after: 1_000,
             crashes: 0,
             release_percent: 0,
+            preload: false,
             crash_every: 1_000,
             request_ttl: FOREVER,
             cache: Budget::default(),
@@ -818,6 +822,7 @@ impl Simulator {
             group_max_bytes: options.group_max_bytes,
             request_ttl: options.request_ttl,
             cache: options.cache,
+            preload: options.preload,
             lease_ttl: options.lease_ttl,
             claim_ttl: options.claim_ttl,
             writer_lease: options.writer_lease,

@@ -465,6 +465,11 @@ impl Cache {
         self.inodes.len()
     }
 
+    /// Directories with entries cached.
+    pub fn dirs(&self) -> usize {
+        self.dirs.len()
+    }
+
     /// Whether the cache holds an inode's record or a directory's entries.
     pub fn holds(&self, ino: Ino) -> bool {
         self.inodes.contains_key(&ino) || self.dirs.contains_key(&ino)

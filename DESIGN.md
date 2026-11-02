@@ -161,7 +161,9 @@ The server and the client library share one cache implementation, in `core`. It 
 
 **The writer's cache holds every committed batch,** so the core executes batches against it and reads storage only for keys the cache lacks. A batch that lacks keys waits for them, and the batches queued behind it, up to 1,024 ops of them, read what they lack in the same round, so a queue of batches that each miss costs a round of reads rather than one per batch, and cached work queued behind costs each round a bounded stall. Eviction spares what reads in progress fetched, so work that needs many reads, such as freeing a detached subtree, always finishes.
 
-**Settings,** separate for the writer and each client: directory and inode-record counts, value bytes, and undo bytes for snapshots. A server takes the first three from its configuration's `[cache]` table, and a client passes a `Budget` to `cached_within`.
+**Preload.** A writer that starts reads the tree into its cache while it serves: every inode record, then every directory's entries, then every file's back-pointers, in pages of 16,384 keys. Each page is a read like any other, moved to the writer's version through the commits since. A directory whose entries fall in one page arrives complete, and so does an empty directory the entries pass over, so the cache answers that a name is absent without a read; a larger directory arrives as known names. Values stay out. The preload stops at the first page that finds the cache at its inode or directory budget. A tree of 10,000 files takes 5 to 9 ms on the Mac, and stats as the server starts run at twice the rate of cold ones (`PLAN.md` S4G). Standbys fill their caches from the log instead.
+
+**Settings,** separate for the writer and each client: directory and inode-record counts, value bytes, and undo bytes for snapshots. A server takes the first three, and whether to preload, from its configuration's `[cache]` table, and a client passes a `Budget` to `cached_within`.
 
 ### Snapshots
 
@@ -432,7 +434,7 @@ Testing follows s3-accelerator's design: a deterministic core, a simulator that 
 
 ### Simulator
 
-One thread runs clients with caches and snapshots, a writer, standbys that follow the log and answer reads at a version, the memory backend, and a network. A standby that takes over hands its cache and waiting reads to its writer. Clients read by path and, for stats, by inode, inside and outside their keys' roots. Each seed draws the number of clients and standbys, the share of clients that only read, the op mix, and the fault rates. Faults:
+One thread runs clients with caches and snapshots, a writer, standbys that follow the log and answer reads at a version, the memory backend, and a network. A standby that takes over hands its cache and waiting reads to its writer. Clients read by path and, for stats, by inode, inside and outside their keys' roots. Each seed draws whether writers preload, the number of clients and standbys, the share of clients that only read, the op mix, and the fault rates. Faults:
 
 - **Storage:** unknown outcomes, latency, and stalls long enough for a standby to take over while the old writer still runs. A writer reads storage as of its latest commit until a commit of its fails, so an old writer reads from before its successor's commits.
 - **Servers:** crashes and restarts mid-group, mid-heartbeat and mid-release, and clean shutdowns that release the store.
@@ -527,3 +529,4 @@ Each default, and the measurement it rests on (`BENCHMARKS.md`; rates are batche
 | `group_max_bytes` | 9 MB | FoundationDB's 10,000,000-byte transactions, less the head, expiry deletions and up to 512 KiB of lease heartbeats. At 128 clients, grouping multiplies FoundationDB throughput 30 times on local NVMe and 49 times on gp3. |
 | `undo_bytes` | 64 MiB | A replaced value's undo takes 160 bytes, so a snapshot outlasts about 400,000 changes in its subtree. |
 | `cache.dirs`, `inodes`, `value_bytes` | 256 Ki directories, 1 Mi inodes, 256 MiB of values | About 830 bytes per cached file: 0.8 GB of tree. |
+| `cache.preload` | on | The writer serves while it reads, and the cache reaches its budget at most, so the cost is memory the budget already allows. |

@@ -54,6 +54,8 @@ SNAPSHOT = "crates/core/src/snapshot.rs"
 STANDBY = "crates/core/src/standby.rs"
 ENGINE = "crates/server/src/engine.rs"
 FSCK = "crates/core/src/fsck.rs"
+PRELOAD = "crates/core/src/preload.rs"
+CONFIG = "crates/server/src/config.rs"
 STEP_TIMEOUT = 900
 
 MUTANTS = [
@@ -316,6 +318,37 @@ MUTANTS = [
                     tail.held.clear();
                     tail.bytes = 0;
                 }""", "")],
+    ),
+    (
+        "the writer never preloads",
+        [(WRITER, "if self.config.preload {", "if false {")],
+    ),
+    (
+        "a preload passes the cache's budget",
+        [(WRITER, "|| self.cache.inodes() >= budget.inodes", "")],
+    ),
+    (
+        "a preload completes a directory that began before its page",
+        [(PRELOAD, "let begun = index > 0 || start <= keys::entry_prefix(dir).as_slice();",
+          "let begun = true;")],
+    ),
+    (
+        "a preload completes a directory that fills its page",
+        [(PRELOAD, "Some((last, _)) if full && groups.len() == 1 => (Cursor::Entries(after(last)), false),",
+          "Some((last, _)) if full && groups.len() == 1 => (Cursor::Entries(after(last)), true),")],
+    ),
+    (
+        "a preload leaves empty directories incomplete",
+        [(PRELOAD, "facts.extend(empty);", "drop(empty);")],
+    ),
+    (
+        "a preload empties directories past its page",
+        [(PRELOAD, "start <= prefix.as_slice() && keys::prefix_end(&prefix) <= covered",
+          "start <= prefix.as_slice()")],
+    ),
+    (
+        "a server ignores cache.preload",
+        [(CONFIG, "preload: self.cache.preload,", "")],
     ),
     (
         "a handle's MAC goes unchecked",

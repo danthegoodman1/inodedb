@@ -816,6 +816,8 @@ async fn run<S: Storage + Clone>(
     let mut next_token: Token = 1;
     // The era whose writer has said it writes.
     let mut announced = None;
+    // When the writer of an era began preloading.
+    let mut preloading: Option<(u64, std::time::Instant)> = None;
     tokio::spawn({
         let commands = commands.clone();
         async move {
@@ -880,6 +882,22 @@ async fn run<S: Storage + Clone>(
                 "level=info msg=writing epoch={} version={}",
                 writer.head().epoch,
                 writer.version()
+            );
+            if writer.is_preloading() {
+                preloading = Some((node.era, std::time::Instant::now()));
+            }
+        }
+        if let (Role::Write(writer), Some((era, started))) = (&node.role, preloading)
+            && era == node.era
+            && !writer.is_preloading()
+        {
+            preloading = None;
+            let cache = writer.cache();
+            eprintln!(
+                "level=info msg=preloaded inodes={} dirs={} ms={}",
+                cache.inodes(),
+                cache.dirs(),
+                started.elapsed().as_millis()
             );
         }
         let (version, keep) = match &node.role {
