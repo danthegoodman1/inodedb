@@ -72,3 +72,17 @@ fn seed_97619() {
 fn seed_7638357803986486160() {
     passes(7638357803986486160);
 }
+
+/// The model took a file's name outside a key's root to rule the file out of
+/// it, so it refused the stat by inode the core rightly answered through a
+/// link that a removed subtree under the key's root still held.
+#[test]
+fn seed_927052834940686739() {
+    passes(927052834940686739);
+}
+
+/// The same, on another run.
+#[test]
+fn seed_927052834940736596() {
+    passes(927052834940736596);
+}

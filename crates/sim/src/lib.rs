@@ -664,6 +664,8 @@ pub struct Simulator {
     floors: Prng,
     /// Which reads go to a standby, and to which.
     standby_reads: Prng,
+    /// Which reads a server answers from its cache on the request's thread.
+    cached_reads: Prng,
     /// Which stats go by inode.
     handles: Prng,
     /// Which crashes are clean shutdowns.
@@ -874,6 +876,7 @@ impl Simulator {
             faults: Prng::stream(seed, "faults"),
             floors: Prng::stream(seed, "floors"),
             standby_reads: Prng::stream(seed, "standby reads"),
+            cached_reads: Prng::stream(seed, "cached reads"),
             handles: Prng::stream(seed, "handles"),
             releases: Prng::stream(seed, "releases"),
             releasing: None,
@@ -1088,7 +1091,7 @@ impl Simulator {
     fn handle(&mut self, event: Event) -> Result<(), Failure> {
         match event {
             Event::Submit { client } => self.submit(client),
-            Event::Deliver { token } => self.deliver(token),
+            Event::Deliver { token } => self.deliver(token)?,
             Event::Timeout { request, attempt } => self.timeout(request, attempt),
             Event::StorageRead {
                 generation,
@@ -2044,15 +2047,15 @@ impl Simulator {
         );
     }
 
-    fn deliver(&mut self, token: u64) {
+    fn deliver(&mut self, token: u64) -> Result<(), Failure> {
         let Some(attempt) = self.attempts.get(&token) else {
-            return;
+            return Ok(());
         };
         let cut = self.clients[attempt.client].cut_until > self.now;
         let Some(request) = self.requests.get_mut(&attempt.request).filter(|_| !cut) else {
             // Answered already, or the client is cut off.
             self.attempts.remove(&token);
-            return;
+            return Ok(());
         };
         let first_floor = *request.floor.get_or_insert(self.acked);
         // Most reads ask for nothing; some for what clients have seen, and
@@ -2112,17 +2115,33 @@ impl Simulator {
                 let index = ready[self.standby_reads.below(ready.len() as u64) as usize];
                 let attempt = self.attempts.get_mut(&token).expect("checked");
                 attempt.generation = None;
+                let now = self.standbys[index].clock.at(self.now);
                 let follower = self.standbys[index].follower.as_mut().expect("follows");
+                if self.cached_reads.percent(50)
+                    && let Some(answer) = follower.answer_cached(&caller, query, at_least, now)
+                {
+                    return self.answer(None, token, answer);
+                }
                 follower.query(token, caller, query.clone(), at_least);
-                return;
+                return Ok(());
             }
         }
-        let writer = &mut self.procs.get_mut(&generation).expect("runs").writer;
+        let proc = self.procs.get_mut(&generation).expect("runs");
+        let now = proc.clock.at(self.now);
+        let writer = &mut proc.writer;
         match what {
             Kindof::Batch(batch) => writer.submit(token, caller, batch),
-            Kindof::Query(query) => writer.query(token, caller, query, at_least),
+            Kindof::Query(query) => {
+                if self.cached_reads.percent(50)
+                    && let Some(answer) = writer.answer_cached(&caller, &query, at_least, now)
+                {
+                    return self.answer(Some(generation), token, answer);
+                }
+                writer.query(token, caller, query, at_least)
+            }
             Kindof::Key(op) => writer.submit_key(token, caller, op),
         }
+        Ok(())
     }
 
     /// How long a client retries: less than a request record lasts, as
@@ -3002,22 +3021,30 @@ impl Simulator {
             )));
         };
         // A stat by inode reaches what any of its names puts under the
-        // key's root, nothing a name outside puts, and possibly a file no
-        // name holds, which reads until it is freed.
+        // key's root, nothing a name outside puts, and possibly a file a
+        // removed subtree still links or no name holds, which reads until it
+        // is freed.
         if let Query::Stat(Target::Ino(ino)) = query {
             let node = self.mapping.node(*ino).expect("asked by a bound inode");
             let paths = model.paths_of(node);
+            let root_node = model.node_at_path(&root);
+            let known = model.nodes.get(&node);
+            // A link inside a removed subtree lies under the directories above
+            // it as it detached, until freeing reaches the link.
+            let linked = known.filter(|known| {
+                known.detached_links > 0
+                    && root_node.is_some_and(|top| known.detached_under.contains(&top))
+            });
             let expected = if paths.iter().any(|path| path.starts_with(&root)) {
                 ModelAnswer::Stat(node)
-            } else if !paths.is_empty() {
+            } else if !paths.is_empty() && linked.is_none() {
                 ModelAnswer::Failed(Error::NotFound)
             } else {
                 // A file unlinked, or a directory removed, reads by inode
                 // until it is freed, for keys above a name it last had or a
                 // link of it that a removed subtree held; one not yet made
                 // doesn't.
-                let root_node = model.node_at_path(&root);
-                let reached = model.nodes.get(&node).filter(|known| {
+                let reached = known.filter(|known| {
                     key.is_none()
                         || root_node.is_some_and(|top| {
                             known.lost_under.contains(&top) || known.detached_under.contains(&top)
@@ -3034,8 +3061,8 @@ impl Simulator {
                         Ok(())
                     }
                     (other, _) => Err(self.fail(format!(
-                        "a stat of unnamed inode {ino} at {version} by key {key:x?} under {root:?} answered {other:?}; the model has {:?}",
-                        model.nodes.get(&node)
+                        "a stat of inode {ino} with no name under its key at {version} by key {key:x?} under {root:?} answered {other:?}; model {:?}",
+                        known
                     ))),
                 };
             };

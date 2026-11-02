@@ -13,7 +13,7 @@ use inodedb_storage::{Storage, StorageError};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tonic::Status;
@@ -91,9 +91,10 @@ const READ_BATCH: usize = 256;
 const TAIL_ENTRIES: usize = 4_096;
 const TAIL_BYTES: usize = 64 << 20;
 
-/// The newest committed log entries, decoded, in version order with no
-/// gaps. The engine adds each entry its writer commits or its standby
-/// reads, so streams that keep up read neither storage nor a decoder. It
+/// The newest committed log entries, in version order with no gaps. The
+/// engine adds each entry its writer commits or its standby reads, so streams
+/// that keep up read no storage, and the first stream to read an entry
+/// decodes it for the rest, so a server with no streams decodes nothing. It
 /// serves entries only while they are younger than half the log's minimum
 /// retention, which truncation never takes, so a stream sees `Compacted`
 /// exactly when storage no longer holds where it starts.
@@ -104,8 +105,24 @@ pub struct Tail {
 
 #[derive(Default)]
 struct Entries {
-    held: VecDeque<(Version, Arc<LogEntry>, usize)>,
+    held: VecDeque<(Version, Arc<Slot>, usize)>,
     bytes: usize,
+}
+
+/// An entry as committed, and decoded once a stream asks for it.
+struct Slot {
+    bytes: Vec<u8>,
+    decoded: OnceLock<Option<Arc<LogEntry>>>,
+}
+
+impl Slot {
+    /// The decoded entry; an entry that fails to decode is left to storage's
+    /// copy, which reports it.
+    fn entry(&self, version: Version) -> Option<Arc<LogEntry>> {
+        self.decoded
+            .get_or_init(|| decode(version, &self.bytes).ok().map(Arc::new))
+            .clone()
+    }
 }
 
 impl Tail {
@@ -116,28 +133,29 @@ impl Tail {
         }
     }
 
-    /// Adds the entries of versions after the newest held, decoding each;
-    /// one that leaves a gap starts the tail over from it.
-    pub fn extend<'a>(&self, entries: impl IntoIterator<Item = &'a (Version, Vec<u8>)>) {
+    /// Adds the entries of versions after the newest held; one that leaves a
+    /// gap starts the tail over from it.
+    pub fn extend(&self, entries: impl IntoIterator<Item = (Version, Vec<u8>)>) {
         let mut tail = self
             .entries
             .lock()
             .expect("no thread panics holding the tail");
         for (version, bytes) in entries {
-            let Ok(entry) = decode(*version, bytes) else {
-                continue;
-            };
             match tail.held.back() {
-                Some((last, _, _)) if *version <= *last => continue,
-                Some((last, _, _)) if *version != last + 1 => {
+                Some((last, _, _)) if version <= *last => continue,
+                Some((last, _, _)) if version != last + 1 => {
                     tail.held.clear();
                     tail.bytes = 0;
                 }
                 _ => {}
             }
-            tail.held
-                .push_back((*version, Arc::new(entry), bytes.len()));
-            tail.bytes += bytes.len();
+            let size = bytes.len();
+            let slot = Slot {
+                bytes,
+                decoded: OnceLock::new(),
+            };
+            tail.held.push_back((version, Arc::new(slot), size));
+            tail.bytes += size;
             while tail.held.len() > TAIL_ENTRIES || tail.bytes > TAIL_BYTES {
                 let Some((_, _, size)) = tail.held.pop_front() else {
                     break;
@@ -145,6 +163,16 @@ impl Tail {
                 tail.bytes -= size;
             }
         }
+    }
+
+    /// Whether the tail holds an entry at or past `version`.
+    pub fn holds(&self, version: Version) -> bool {
+        self.entries
+            .lock()
+            .expect("no thread panics holding the tail")
+            .held
+            .back()
+            .is_some_and(|(last, _, _)| *last >= version)
     }
 
     /// Up to `limit` entries from version `from` on, if the tail holds it;
@@ -156,24 +184,31 @@ impl Tail {
         limit: usize,
         reached: Version,
     ) -> Option<Vec<(Version, Arc<LogEntry>)>> {
-        let tail = self
-            .entries
-            .lock()
-            .expect("no thread panics holding the tail");
-        let (first, _, _) = tail.held.front()?;
-        let skip = usize::try_from(from.checked_sub(*first)?).ok()?;
-        if skip == tail.held.len() && reached < from {
-            return Some(Vec::new());
-        }
-        let (_, entry, _) = tail.held.get(skip)?;
-        (now().saturating_sub(entry.time) < self.young).then(|| {
+        let slots: Vec<(Version, Arc<Slot>)> = {
+            let tail = self
+                .entries
+                .lock()
+                .expect("no thread panics holding the tail");
+            let (first, _, _) = tail.held.front()?;
+            let skip = usize::try_from(from.checked_sub(*first)?).ok()?;
+            if skip == tail.held.len() && reached < from {
+                return Some(Vec::new());
+            }
+            tail.held.get(skip)?;
             tail.held
                 .iter()
                 .skip(skip)
                 .take(limit)
-                .map(|(version, entry, _)| (*version, entry.clone()))
+                .map(|(version, slot, _)| (*version, slot.clone()))
                 .collect()
-        })
+        };
+        // Decoded outside the lock, so commits never wait on a stream.
+        let entries: Vec<_> = slots
+            .iter()
+            .map(|(version, slot)| Some((*version, slot.entry(*version)?)))
+            .collect::<Option<_>>()?;
+        let (_, entry) = entries.first()?;
+        (now().saturating_sub(entry.time) < self.young).then_some(entries)
     }
 }
 
@@ -475,7 +510,7 @@ mod tests {
     fn the_tail_holds_the_newest_young_entries_without_gaps() {
         let tail = Tail::new(&Retention::default());
         let now = now();
-        tail.extend(&[entry(5, now), entry(6, now), entry(7, now)]);
+        tail.extend([entry(5, now), entry(6, now), entry(7, now)]);
         assert_eq!(versions(tail.read(6, 10, 7)), Some(vec![6, 7]));
         assert_eq!(versions(tail.read(5, 2, 7)), Some(vec![5, 6]));
         assert_eq!(versions(tail.read(4, 10, 7)), None, "before the tail");
@@ -491,12 +526,12 @@ mod tests {
         );
         assert_eq!(versions(tail.read(9, 10, 9)), None, "past the tail");
         // A gap starts the tail over.
-        tail.extend(&[entry(9, now)]);
+        tail.extend([entry(9, now)]);
         assert_eq!(versions(tail.read(7, 10, 9)), None);
         assert_eq!(versions(tail.read(9, 10, 9)), Some(vec![9]));
         // An entry as old as half the minimum retention is storage's to give.
         let old = now - Retention::default().min.as_millis() as u64 / 2;
-        tail.extend(&[entry(10, old)]);
+        tail.extend([entry(10, old)]);
         assert_eq!(versions(tail.read(10, 10, 10)), None);
         assert_eq!(versions(tail.read(9, 10, 10)), Some(vec![9, 10]));
     }
@@ -508,7 +543,7 @@ mod tests {
         let entries: Vec<_> = (1..=TAIL_ENTRIES as u64 + 10)
             .map(|version| entry(version, now))
             .collect();
-        tail.extend(&entries);
+        tail.extend(entries);
         assert_eq!(versions(tail.read(10, 1, 0)), None);
         assert_eq!(versions(tail.read(11, 1, 0)), Some(vec![11]));
     }
@@ -517,7 +552,7 @@ mod tests {
     async fn a_stream_that_keeps_up_reads_no_storage() {
         let tail = Tail::new(&Retention::default());
         let log = Counted::default();
-        tail.extend(&[entry(1, now()), entry(2, now())]);
+        tail.extend([entry(1, now()), entry(2, now())]);
         let read = entries(&log, &tail, 1, READ_BATCH, 2).await.expect("reads");
         assert_eq!(read.len(), 2);
         assert!(

@@ -1,50 +1,133 @@
 #!/bin/bash
 # Runs InodeDB's benchmarks with every store on one device at a time: the
 # local NVMe drive, then the gp3 volume, as scripts/ec2/setup mounted them.
-# Run from the instance with the repository at ~/inodedb; results go to
-# ~/results/<device>.
+# FoundationDB runs one process per role. Cores stay out of idle states
+# slower than C1, then a last pass on local NVMe leaves them the instance's
+# default states. Run from the instance; results go to ~/results/<device>.
 set -euo pipefail
 source ~/.cargo/env
-cd ~/inodedb
+cd "$(dirname "$0")/../.."
 cargo build -q --release -p inodedb-tests --examples --features rocksdb,fdb
 ops=target/release/examples/ops
 commits=target/release/examples/commits
 
-# Points FoundationDB at a fresh data directory on $1 with the ssd engine.
+# Allows (0) or forbids (1) idle states that take over a microsecond to leave:
+# C1E and C6 on this instance. C6 takes 190 us, and every thread a request
+# wakes on an idle core pays it.
+deep_idle_off() {
+  local state
+  for state in /sys/devices/system/cpu/cpu*/cpuidle/state*; do
+    if [ "$(cat "$state/latency")" -gt 1 ]; then
+      echo "$1" | sudo tee "$state/disable" > /dev/null
+    fi
+  done
+}
+
+# The cluster's roles, one process each, from port 4500 up. The first port is
+# the coordinator that /etc/foundationdb/fdb.cluster names.
+FDB_CLASSES="coordinator cluster_controller master commit_proxy grv_proxy resolution log storage ratekeeper data_distributor consistency_scan"
+
+# Points FoundationDB at a fresh data directory on $1 with the ssd engine, one
+# process per role, and records where each role runs in $2.
 fdb_on() {
   sudo systemctl stop foundationdb
   sudo rm -rf "$1/fdb"
   sudo mkdir -p "$1/fdb/data" "$1/fdb/log"
   sudo chown -R foundationdb:foundationdb "$1/fdb"
-  sudo sed -i "s#^datadir = .*#datadir = $1/fdb/data/\$ID#; s#^logdir = .*#logdir = $1/fdb/log#" /etc/foundationdb/foundationdb.conf
+  {
+    cat <<EOF
+[fdbmonitor]
+user = foundationdb
+group = foundationdb
+
+[general]
+restart-delay = 60
+cluster-file = /etc/foundationdb/fdb.cluster
+
+[fdbserver]
+command = /usr/sbin/fdbserver
+public-address = auto:\$ID
+listen-address = public
+datadir = $1/fdb/data/\$ID
+logdir = $1/fdb/log
+EOF
+    local port=4500 class
+    for class in $FDB_CLASSES; do
+      printf '\n[fdbserver.%s]\nclass = %s\n' "$port" "$class"
+      port=$((port + 1))
+    done
+  } | sudo tee /etc/foundationdb/foundationdb.conf > /dev/null
   sudo systemctl start foundationdb
   sleep 3
-  fdbcli --exec "configure new single ssd" --timeout 60
+  fdbcli --exec "configure new single ssd-2 logs=1 commit_proxies=1 grv_proxies=1 resolvers=1" --timeout 60
   until fdbcli --exec "status minimal" --timeout 10 | grep -q "is available"; do sleep 1; done
+  fdb_roles "$2/fdb-roles.txt"
 }
 
-# A 4 KiB write followed by fsync, one at a time: what each durable commit pays at least.
-fio_sync() {
-  fio --name=sync --filename="$1/fio.dat" --size=1G --rw=randwrite --bs=4k --ioengine=psync \
-    --fsync=1 --runtime=15 --time_based --output-format=json > "$2/fio.json"
-  python3 - "$2/fio.json" <<'PY'
+# Waits for each role to settle on its own process, and records them.
+fdb_roles() {
+  local tries=0
+  until fdbcli --exec "status json" --timeout 10 | python3 -c '
 import json, sys
-job = json.load(open(sys.argv[1]))["jobs"][0]["write"]
-sync = json.load(open(sys.argv[1]))["jobs"][0]["sync"]
-print(f"write+fsync: {job['iops']:.0f}/s, fsync p50 {sync['lat_ns']['percentile']['50.000000']/1000:.0f} us, p99 {sync['lat_ns']['percentile']['99.000000']/1000:.0f} us")
+processes = json.load(sys.stdin)["cluster"]["processes"].values()
+roles = sorted((p["address"].rsplit(":")[-1], p.get("class_type"), sorted(r["role"] for r in p["roles"])) for p in processes)
+for role in roles:
+    print(*role)
+held = [name for _, _, names in roles for name in names]
+wanted = {"coordinator", "cluster_controller", "master", "commit_proxy", "grv_proxy", "resolver", "log", "storage", "ratekeeper", "data_distributor", "consistency_scan"}
+sys.exit(0 if wanted <= set(held) and all(len(names) <= 1 for _, _, names in roles) else 1)
+' > "$1"; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 60 ]; then
+      echo "FoundationDB never placed each role on its own process:" >&2
+      cat "$1" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  cat "$1"
+}
+
+# What one durable 4 KiB write costs, by whether the journal must commit too.
+fio_sync() {
+  local mount=$1 out=$2
+  sync_case() { # label, then fio's arguments
+    local label=$1
+    shift
+    fio --name=sync --filename="$mount/fio.dat" --size=1G --bs=4k --ioengine=psync --runtime=15 \
+      --time_based --output-format=json "$@" > "$out/fio.json"
+    python3 - "$label" "$out/fio.json" <<'PY'
+import json, sys
+job = json.load(open(sys.argv[2]))["jobs"][0]
+sync = job["sync"]["lat_ns"]["percentile"]
+print(f"{sys.argv[1]}: {job['write']['iops']:.0f}/s, sync p50 {sync['50.000000']/1000:.0f} us, p99 {sync['99.000000']/1000:.0f} us")
 PY
-  rm -f "$1/fio.dat"
+    rm -f "$mount/fio.dat"
+  }
+  sync_case "appending, fdatasync" --rw=write --fallocate=none --file_append=1 --fdatasync=1
+  sync_case "new blocks of an allocated file, fdatasync" --rw=randwrite --fdatasync=1
+  dd if=/dev/zero of="$mount/fio.dat" bs=1M count=1024 oflag=direct status=none
+  sync_case "written blocks, fdatasync" --rw=randwrite --fallocate=none --overwrite=1 --fdatasync=1
+  dd if=/dev/zero of="$mount/fio.dat" bs=1M count=1024 oflag=direct status=none
+  sync_case "written blocks, fsync" --rw=randwrite --fallocate=none --overwrite=1 --fsync=1
 }
 
 run() { # device mount order
   local device=$1 mount=$2 order=$3 out=~/results/$1
   mkdir -p "$out" "$mount/tmp"
-  fdb_on "$mount"
+  fdb_on "$mount" "$out"
   fio_sync "$mount" "$out" | tee "$out/fio.txt"
   TMPDIR="$mount/tmp" "$ops" 5 "$order" 2>/dev/null | grep '^|' | tee "$out/ops.md"
   TMPDIR="$mount/tmp" "$commits" 3 2>/dev/null | grep '^|' | tee "$out/commits.md"
 }
 
+mkdir -p ~/results
+deep_idle_off 1
 run nvme /mnt/nvme memory,sqlite,rocksdb,fdb
 run ebs /mnt/ebs fdb,rocksdb,sqlite,memory
+
+# The same run on local NVMe with the instance's default idle states.
+deep_idle_off 0
+fdb_on /mnt/nvme ~/results/nvme
+TMPDIR=/mnt/nvme/tmp "$ops" 5 memory,sqlite,rocksdb,fdb 2>/dev/null | grep '^|' | tee ~/results/nvme/ops-default-idle.md
 touch ~/results/done

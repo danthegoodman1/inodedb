@@ -185,6 +185,29 @@ fn records(storage: &Memory) -> BTreeMap<u128, usize> {
     found
 }
 
+/// An owner that hands the writer several batches before asking for its
+/// actions gets one transaction holding them all.
+#[test]
+fn batches_queued_before_a_drain_commit_together() {
+    let mut d = Driver::new(Memory::new(), Config::default(), 1);
+    d.submit([mkdir("a")]);
+    d.settle(true, CommitOutcome::Committed);
+    assert!(d.commits.is_empty());
+    for (token, name) in (100..).zip(["a/1", "a/2", "a/3"]) {
+        let batch = Batch {
+            ops: vec![mkdir(name)],
+            ..Batch::default()
+        };
+        d.writer
+            .submit(token, inodedb_core::auth::Caller::Trusted(ROOT), batch);
+    }
+    d.pump();
+    assert_eq!(d.commits.len(), 1, "one transaction");
+    let writes = d.settle(true, CommitOutcome::Committed);
+    assert_eq!(writes.log.len(), 3, "holding every batch");
+    assert!(d.commits.is_empty(), "and nothing behind it");
+}
+
 #[test]
 fn batches_wait_for_their_group_and_groups_close_at_their_size() {
     let config = Config {
@@ -625,6 +648,42 @@ fn a_detached_subtree_stays_within_the_directories_above_it_as_it_detached() {
         d.query(q, stat),
         QueryResult::Failed(Error::NotFound),
         "q came above p only after the subtree detached"
+    );
+}
+
+/// A link inside a removed subtree keeps its file under the directories above
+/// the subtree, whatever names the file keeps elsewhere, until freeing reaches
+/// the link.
+#[test]
+fn a_detached_link_keeps_its_file_under_the_directories_above_it_until_freed() {
+    let mut d = Driver::new(Memory::new(), Config::default(), 1);
+    d.submit([mkdir_p("p/t"), put("p/t/f", "v"), mkdir("q")]);
+    d.settle(true, CommitOutcome::Committed);
+    d.submit([link("p/t/f", "q/f")]);
+    d.settle(true, CommitOutcome::Committed);
+    let (p, q, f) = (d.ino("p"), d.ino("q"), d.ino("p/t/f"));
+    d.submit([remove_all("p/t")]);
+    d.settle(true, CommitOutcome::Committed);
+    let stat = Query::Stat(Target::Ino(f));
+    // The freeing waits behind the commit in flight, so the link stays.
+    assert_eq!(d.commits.len(), 1, "the freeing's commit is held");
+    assert!(
+        matches!(d.query(p, stat.clone()), QueryResult::Stat { ino, .. } if ino == f),
+        "p held the link as it detached"
+    );
+    assert!(
+        matches!(d.query(q, stat.clone()), QueryResult::Stat { ino, .. } if ino == f),
+        "q holds the file's other name"
+    );
+    d.settle(true, CommitOutcome::Committed);
+    assert_eq!(
+        d.query(p, stat.clone()),
+        QueryResult::Failed(Error::NotFound),
+        "freeing the link leaves the file outside p"
+    );
+    assert!(
+        matches!(d.query(q, stat), QueryResult::Stat { ino, .. } if ino == f),
+        "q still holds the file's other name"
     );
 }
 

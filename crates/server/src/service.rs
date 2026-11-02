@@ -46,6 +46,8 @@ pub struct Faults {
     pub cut_listings: AtomicU32,
     /// Lease openings held 200 ms before they reach the writer.
     pub slow_lease_opens: AtomicU32,
+    /// `Watch` streams running, which a test reads to see one end.
+    pub watches: AtomicU32,
 }
 
 impl Faults {
@@ -452,7 +454,7 @@ impl InodeDb for Service {
             from => from,
         };
         let (changes, stream) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(feed::watch(
+        let watching = feed::watch(
             self.log.clone(),
             self.tail.clone(),
             feed::Watcher {
@@ -467,7 +469,13 @@ impl InodeDb for Service {
             from,
             version,
             changes,
-        ));
+        );
+        let faults = self.faults.clone();
+        faults.watches.fetch_add(1, Ordering::AcqRel);
+        tokio::spawn(async move {
+            watching.await;
+            faults.watches.fetch_sub(1, Ordering::AcqRel);
+        });
         Ok(Response::new(Box::pin(
             tokio_stream::wrappers::ReceiverStream::new(stream),
         )))

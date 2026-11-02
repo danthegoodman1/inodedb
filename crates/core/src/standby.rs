@@ -8,11 +8,12 @@ use crate::codec::DecodeError;
 use crate::feed::{Change, Subscriber};
 use crate::keys::{self, KvRead, KvResult};
 use crate::log::LogEntry;
+use crate::preload::Cursor;
 use crate::query::{self, Query};
-use crate::types::{Millis, ROOT, Version};
+use crate::types::{Ino, Millis, ROOT, Version};
 use crate::view::{Fact, Read};
 use crate::writer::{Action, Answer, Config, Head, Takeover, Token};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Watches the head record, which every commit rewrites, and says when it
 /// has gone unchanged for `wait` on the standby's own clock. An empty
@@ -90,6 +91,10 @@ pub struct Follower {
     queries: BTreeMap<u64, Waiting>,
     /// The query each read in progress serves.
     reads: BTreeMap<u64, (u64, Vec<Read>)>,
+    /// The page of the preload being read, by its read's id, and the
+    /// directories the preload knows of.
+    preloading: Option<(u64, Cursor)>,
+    preload_dirs: BTreeSet<Ino>,
     actions: Vec<Action>,
     next_id: u64,
 }
@@ -109,6 +114,8 @@ impl Follower {
             successor,
             queries: BTreeMap::new(),
             reads: BTreeMap::new(),
+            preloading: None,
+            preload_dirs: BTreeSet::new(),
             actions: vec![Action::Read {
                 id: STARTUP,
                 reads: vec![
@@ -187,6 +194,26 @@ impl Follower {
     /// The caller's scope under the keys as of the follower's version.
     pub fn authorize(&self, caller: &Caller, need: Grant) -> Result<Scope, Denied> {
         auth::authorize(self.subscriber.cache(), caller, self.now, need)
+    }
+
+    /// The answer to a read the cache holds at `at_least` or later, as of
+    /// `now`, or None when the read needs `query`. It changes nothing, so an
+    /// owner can run it on any thread between the follower's other calls.
+    pub fn answer_cached(
+        &self,
+        caller: &Caller,
+        query: &Query,
+        at_least: Version,
+        now: Millis,
+    ) -> Option<Answer> {
+        let version = self.version();
+        if !self.started || at_least == 0 || at_least > version {
+            return None;
+        }
+        let now = now.max(self.now);
+        let scope = auth::authorize(self.subscriber.cache(), caller, now, Grant::Read).ok()?;
+        let result = query::run(self.subscriber.cache(), scope.root, query).ok()?;
+        Some(Answer::Query { version, result })
     }
 
     /// Answers a read at `at_least` or later once the follower reaches it.
@@ -313,7 +340,18 @@ impl Follower {
             self.head = head.or(self.head.take());
             self.started = true;
             self.run_waiting();
+            if self.config.preload {
+                self.preload_dirs = BTreeSet::from([ROOT]);
+                self.preload_page(Cursor::start());
+            }
             return Ok(());
+        }
+        if self
+            .preloading
+            .as_ref()
+            .is_some_and(|(read, _)| *read == id)
+        {
+            return self.preload_read(results, at);
         }
         let Some((query, reads)) = self.reads.remove(&id) else {
             return Ok(());
@@ -335,6 +373,47 @@ impl Follower {
             waiting.reading = false;
         }
         self.run(query);
+        Ok(())
+    }
+
+    /// Reads the preload's next page.
+    fn preload_page(&mut self, cursor: Cursor) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.actions.push(Action::Read {
+            id,
+            reads: vec![KvRead::Get(keys::head()), cursor.read()],
+        });
+        self.preloading = Some((id, cursor));
+    }
+
+    /// Takes a page of the preload, read at version `at`, and asks for the
+    /// next. It stops at the first record the budget has no room for, so it
+    /// never evicts what it read before.
+    fn preload_read(
+        &mut self,
+        mut results: impl Iterator<Item = KvResult>,
+        at: Version,
+    ) -> Result<(), DecodeError> {
+        let Some((_, cursor)) = self.preloading.take() else {
+            return Ok(());
+        };
+        let Some(KvResult::Scan(pairs)) = results.next() else {
+            return Err(DecodeError);
+        };
+        let page = cursor.page(pairs, &self.preload_dirs)?;
+        self.preload_dirs.extend(page.dirs);
+        for fact in page.facts {
+            if !self.subscriber.cache().has_room(&fact) {
+                self.preload_dirs.clear();
+                return Ok(());
+            }
+            self.subscriber.fill(fact, at);
+        }
+        match page.next {
+            Some(next) => self.preload_page(next),
+            None => self.preload_dirs.clear(),
+        }
         Ok(())
     }
 

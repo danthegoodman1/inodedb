@@ -4,18 +4,18 @@
 
 InodeDB is a transactional metadata database whose keyspace is a tree of inodes, so renaming a directory rewrites one entry however much lies beneath it. It is built for systems that keep their data in object storage and commit by renaming directories, such as a ClickHouse object-storage disk, with InodeDB holding the file tree and S3 the blobs. Clients speak gRPC to a Rust server. One server writes at a time, keeping its records in SQLite, RocksDB or FoundationDB behind one storage trait.
 
-Every commit goes through the writer's in-memory cache, so the writer answers reads from memory, at the same rate on every backend: 230,000 a second from 64 clients on an EC2 i7ie.6xlarge. Writes gather into one storage transaction at a time, so with every store on local NVMe, 64 clients create 18,500 files a second on RocksDB and 7,300 on FoundationDB. [BENCHMARKS.md](BENCHMARKS.md) has every result and the commands to reproduce them, and [DESIGN.md](DESIGN.md) is the design.
+Every commit goes through the writer's in-memory cache, so the writer answers reads from memory, at the same rate on every backend: 440,000 a second from 64 clients on an EC2 i7ie.6xlarge, and in 23 µs for one client. Writes gather into one storage transaction at a time, so with every store on local NVMe, 64 clients create 62,000 files a second on RocksDB, 36,000 on SQLite and 20,000 on FoundationDB. [BENCHMARKS.md](BENCHMARKS.md) has every result and the commands to reproduce them, and [DESIGN.md](DESIGN.md) is the design.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/ops-dark.png">
-  <img src="docs/images/ops-light.png" alt="Operations a second through gRPC at 64 clients on an EC2 i7ie.6xlarge, every store on local NVMe, for memory, SQLite, RocksDB and FoundationDB: stat by path 236,623, 239,433, 237,995 and 229,883; read a 100-byte value 229,966, 236,875, 236,487 and 233,663; list 100 entries 40,120, 43,614, 43,360 and 40,122; put a new 100-byte file 34,881, 13,612, 18,476 and 7,310; rename a file 38,516, 15,289, 20,788 and 8,313.">
+  <img src="docs/images/ops-light.png" alt="Operations a second through gRPC at 64 clients on an EC2 i7ie.6xlarge, every store on local NVMe, for memory, SQLite, RocksDB and FoundationDB: stat by path 440,140, 438,301, 436,641 and 436,267; read a 100-byte value 433,266, 442,188, 440,804 and 433,089; list 100 entries 171,899, 176,663, 175,845 and 182,617; put a new 100-byte file 71,769, 35,985, 62,314 and 19,638; rename a file 81,029, 40,099, 64,141 and 18,048; nine stats for each put 301,852, 252,981, 287,955 and 159,879.">
 </picture>
 
-**Status: experimental.** InodeDB passes its storage and API conformance suites on memory, SQLite, RocksDB and FoundationDB, a 100,000-seed simulation sweep, and a run of 116 planted bugs, and has run in tests and benchmarks only. The ClickHouse integration is unbuilt.
+**Status: experimental.** InodeDB passes its storage and API conformance suites on memory, SQLite, RocksDB and FoundationDB, a 100,000-seed simulation sweep, and a run of 189 planted bugs, and has run in tests and benchmarks only. The ClickHouse integration is unbuilt.
 
 ## Features
 
-**O(1) directory rename.** Directories map names to inodes, and an inode knows its parent, so a rename moves one entry. Paths resolve through the cache one directory at a time: a six-level path takes 197 ns.
+**O(1) directory rename.** Directories map names to inodes, and an inode knows its parent, so a rename moves one entry. Paths resolve through the cache one directory at a time: a six-level path takes under 200 ns.
 
 **Atomic batches with conditions.** A batch holds POSIX-style ops: `Mkdir`, `Put`, `Link`, `Unlink`, `Rmdir`, `RemoveAll`, `Rename` with `Replace`, `NoReplace` or `Exchange`, and `SetAttr`. Each op can carry a condition on a path's existence, kind, emptiness or version, or on whether an earlier op applied. A `when` condition fences the whole batch, and `all_or_nothing` applies every op or none. Renames follow `rename(2)`, down to Linux's error order, and a differential test checks them against a real filesystem.
 
@@ -29,66 +29,74 @@ Every commit goes through the writer's in-memory cache, so the writer answers re
 
 **Safe freeing.** A freed file's bytes, and whatever they name outside InodeDB, outlive every reader that might still use them. Readers hold leases, and a consumer claims freed files once no lease can reach them, deletes their blobs, and acknowledges them.
 
-**Group commit and fenced failover.** One storage transaction is in flight at a time, and the batches that arrive meanwhile commit together in the next. On FoundationDB, standbys follow the log and take over once the writer's lease lapses, keeping their caches warm. Every commit expects the head record its writer last wrote, so an old writer can never commit after its successor.
+**Group commit and fenced failover.** One storage transaction is in flight at a time, and the batches that arrive meanwhile commit together in the next. On FoundationDB, standbys follow the log and take over once the writer's lease lapses, or at once when it stops cleanly, keeping their caches warm. Every commit expects the head record its writer last wrote, so an old writer can never commit after its successor.
 
-**Checked by deterministic simulation.** Each seed runs random batches from several clients through writer crashes, storage faults and stalls, network loss and reordering, drifting clocks, and standby takeovers, and checks every answer against a naive path model. A failing seed replays exactly, and each of 116 planted bugs must be caught by some test.
+**Reads with no hop.** A read the cache holds answers on the request's own task, under a shared lock on the writer, so reads scale with the server's threads. `crates/transport` drives HTTP/2 directly: a reply's headers and data leave in one write, and a request whose answer is ready needs no task of its own.
+
+**Commits that overwrite.** SQLite and RocksDB write their log files when a store opens and overwrite them from then on, so a durable write costs one 4 KiB write and no file-system journal commit: 17 µs on EC2 instance store. On RocksDB, one client's put takes 90 µs.
+
+**A warm start.** A starting writer or standby reads the tree into its cache while it serves, directories first and up to its budget, so 16 clients stat 194,000 to 290,000 files a second as a server starts.
+
+**Checked by deterministic simulation.** Each seed runs random batches from several clients through writer crashes, storage faults and stalls, network loss and reordering, drifting clocks, and standby takeovers, and checks every answer against a naive path model. A failing seed replays exactly, and each of 189 planted bugs must be caught by some test.
 
 ## Performance
 
-These runs used an EC2 i7ie.6xlarge (24 vCPUs, 192 GiB), with every store on one device at a time: one of its local NVMe drives, or a gp3 volume provisioned at gp3's maximum of 80,000 IOPS and 2,000 MiB/s. FoundationDB ran as one process on its `ssd-2` engine, with its data on the same device. The server ran on 8 threads and the clients on 8 more, each client on its own connection. The tree held 10,000 files of 100 bytes.
+These runs used an EC2 i7ie.6xlarge (24 vCPUs, 192 GiB), with every store on one device at a time: one of its local NVMe drives, or a gp3 volume provisioned at gp3's maximum of 80,000 IOPS and 2,000 MiB/s. FoundationDB ran one process per role on its `ssd-2` engine, with its data on the same device. The server ran on 8 threads and the clients on 8 more, each client on its own connection. The tree held 10,000 files of 100 bytes. Cores stayed out of idle states deeper than C1, as a running server asks by default.
 
 Operations a second at 64 clients, on a warm cache, with every store on local NVMe:
 
 | Operation | memory | SQLite | RocksDB | FoundationDB |
 |---|--:|--:|--:|--:|
-| Stat | 236,623 | 239,433 | 237,995 | 229,883 |
-| Read a 100-byte value | 229,966 | 236,875 | 236,487 | 233,663 |
-| List 100 entries | 40,120 | 43,614 | 43,360 | 40,122 |
-| Put a new 100-byte file | 34,881 | 13,612 | 18,476 | 7,310 |
-| Rename a file | 38,516 | 15,289 | 20,788 | 8,313 |
+| Stat | 440,140 | 438,301 | 436,641 | 436,267 |
+| Read a 100-byte value | 433,266 | 442,188 | 440,804 | 433,089 |
+| List 100 entries | 171,899 | 176,663 | 175,845 | 182,617 |
+| Put a new 100-byte file | 71,769 | 35,985 | 62,314 | 19,638 |
+| Rename a file | 81,029 | 40,099 | 64,141 | 18,048 |
+| Nine stats for each put | 301,852 | 252,981 | 287,955 | 159,879 |
 
 Latency, for reads and writes, at one client's p50 and 64 clients' p99:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/latency-dark.png">
-  <img src="docs/images/latency-light.png" alt="Latency in ms on an EC2 i7ie.6xlarge, every store on local NVMe, for memory, SQLite, RocksDB and FoundationDB, each panel on its own linear scale. Reads, one client, p50: stat 0.316, 0.318, 0.130 and 0.318; read 0.338, 0.312, 0.316 and 0.333; list 100 entries 0.458, 0.419, 0.439 and 0.465. Reads, 64 clients, p99: stat 0.498, 0.500, 0.559 and 0.684; read 0.604, 0.475, 0.469 and 0.497; list 2.254, 1.977, 2.061 and 2.238. Writes, one client, p50: put a new file 0.408, 1.941, 1.701 and 3.933; rename 0.361, 1.581, 1.499 and 3.186. Writes, 64 clients, p99: put 2.835, 8.299, 5.061 and 12.174; rename 2.465, 7.418, 4.626 and 11.848.">
+  <img src="docs/images/latency-light.png" alt="Latency in ms on an EC2 i7ie.6xlarge, every store on local NVMe, for memory, SQLite, RocksDB and FoundationDB, each panel on its own linear scale. Reads, one client, p50: stat 0.023 on all four; read 0.023, 0.024, 0.023 and 0.023; list 100 entries 0.062, 0.062, 0.061 and 0.062. Reads, 64 clients, p99: stat 0.242, 0.244, 0.247 and 0.248; read 0.246, 0.238, 0.243 and 0.247; list 0.730, 0.704, 0.709 and 0.662. Writes, one client, p50: put a new file 0.046, 0.172, 0.090 and 1.004; rename 0.043, 0.165, 0.095 and 1.006. Writes, 64 clients, p99: put 1.258, 3.753, 1.405 and 3.764; rename 1.036, 2.268, 1.209 and 4.185.">
 </picture>
 
 p50 latency for one client, in ms, with every store on local NVMe:
 
 | Operation | memory | SQLite | RocksDB | FoundationDB |
 |---|--:|--:|--:|--:|
-| Stat | 0.316 | 0.318 | 0.130 | 0.318 |
-| List 100 entries | 0.458 | 0.419 | 0.439 | 0.465 |
-| Put a new 100-byte file | 0.408 | 1.941 | 1.701 | 3.933 |
-| Rename a file | 0.361 | 1.581 | 1.499 | 3.186 |
+| Stat | 0.023 | 0.023 | 0.023 | 0.023 |
+| List 100 entries | 0.062 | 0.062 | 0.061 | 0.062 |
+| Put a new 100-byte file | 0.046 | 0.172 | 0.090 | 1.004 |
+| Rename a file | 0.043 | 0.165 | 0.095 | 1.006 |
 
-Reads cost the same on every backend because the writer answers them from memory. One client's read takes about 0.3 ms, nearly all of it the gRPC round trip, which varied from run to run on this instance: two runs measured 0.11 to 0.13 ms. Writes cost a durable commit, and a put first reads storage once to learn its new name is absent.
+Reads cost the same on every backend because the writer answers them from memory, and nearly all of one client's 23 µs is the gRPC round trip. Writes cost a durable commit, and a put first reads storage once to learn its new name is absent. FoundationDB's 1.0 ms is the window in which its commit proxy gathers transactions; with that window at 0.1 ms, a put took 0.49 ms.
 
-A synced 4 KiB write takes 322 µs on local NVMe and 2.2 ms on gp3, even at gp3's maximum provisioning, since each crosses the network. Grouping hides most of the difference:
+Syncing an overwritten 4 KiB block takes 17 µs on local NVMe and 668 µs on gp3, even at gp3's maximum provisioning, since each crosses the network. Grouping hides most of the difference:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/devices-dark.png">
-  <img src="docs/images/devices-light.png" alt="Puts of a new 100-byte file on an EC2 i7ie.6xlarge, on local NVMe and on gp3 at 80,000 IOPS and 2,000 MiB/s. Puts a second at 64 clients: SQLite 13,612 and 5,718; RocksDB 18,476 and 10,582; FoundationDB 7,310 and 6,052. One client's p50 latency in ms: SQLite 1.94 and 3.75; RocksDB 1.70 and 3.34; FoundationDB 3.93 and 5.77.">
+  <img src="docs/images/devices-light.png" alt="Puts of a new 100-byte file on an EC2 i7ie.6xlarge, on local NVMe and on gp3 at 80,000 IOPS and 2,000 MiB/s. Puts a second at 64 clients: SQLite 35,985 and 11,972; RocksDB 62,314 and 24,504; FoundationDB 19,638 and 10,292. One client's p50 latency in ms: SQLite 0.17 and 1.12; RocksDB 0.09 and 0.76; FoundationDB 1.00 and 2.22.">
 </picture>
 
 | Put a new 100-byte file | SQLite | RocksDB | FoundationDB |
 |---|--:|--:|--:|
-| Puts a second at 64 clients, local NVMe | 13,612 | 18,476 | 7,310 |
-| Puts a second at 64 clients, gp3 | 5,718 | 10,582 | 6,052 |
-| One client's p50, local NVMe | 1.94 ms | 1.70 ms | 3.93 ms |
-| One client's p50, gp3 | 3.75 ms | 3.34 ms | 5.77 ms |
+| Puts a second at 64 clients, local NVMe | 35,985 | 62,314 | 19,638 |
+| Puts a second at 64 clients, gp3 | 11,972 | 24,504 | 10,292 |
+| One client's p50, local NVMe | 0.17 ms | 0.09 ms | 1.00 ms |
+| One client's p50, gp3 | 1.12 ms | 0.76 ms | 2.22 ms |
 
-At 128 clients, grouping multiplies commit throughput 13 to 30 times on local NVMe and 27 to 49 times on gp3. Failover takes the writer's lease plus a margin: 6.1 s by default, and 0.9 s with a 600 ms lease, measured on a Mac.
+At 128 clients on gp3, grouping multiplies commit throughput 17 to 18 times. Failover takes the writer's lease plus a margin: 6.2 s by default on FoundationDB, and 0.9 s with a 600 ms lease. A clean stop hands the store to a standby at once.
 
 ### Trade-offs
 
-- **One writer.** Every write goes through one server, so write throughput is one machine's, and each group waits a full commit: on FoundationDB, about 14,000 batches a second at most here.
-- **Cold starts.** A restarted writer reads storage for what its cache lacks: on FoundationDB, 16 clients stat 7,200 files a second until the cache warms, against 230,000 after. A standby that takes over brings its cache with it.
+- **One writer.** Every write goes through one server, so write throughput is one machine's: 72,000 puts a second on the memory backend at 64 clients, and each group waits a full commit, so about 25,000 batches a second at most on FoundationDB.
+- **Cold starts.** A restarted server reads storage for what its cache lacks until its preload finishes. A tree larger than `cache.tree_bytes` stays partly cold: on FoundationDB, 16 clients stat 28,000 files a second on a cold cache, and 64 clients stat 436,000 on a warm one. A standby that takes over brings its cache with it.
 - **Memory.** The cache charges each record at least what it holds, a cached file about 980 bytes, so the default `tree_bytes` of 1 GiB holds about a million files in at most 1 GiB. Raising the `[cache]` budgets keeps more of the tree in memory.
-- **Network storage.** On gp3, each sync takes about 7 times as long as on local NVMe, so a single client's write takes 1.5 to 2 times as long.
+- **Network storage.** On gp3, one client's put takes 2.2 to 8.4 times as long as on local NVMe, and 64 clients' puts run at about a third to a half the rate.
+- **Disk at open.** Opening a store writes its log files: 128 MiB on SQLite and 235 MiB on RocksDB. They stay at about that size whatever the store holds.
+- **Idle power.** A running server keeps every core out of idle states deeper than C1, which costs power. Without that, a put on RocksDB takes 9 times as long ([Idle states](BENCHMARKS.md#idle-states)). `shallow_idle = false` leaves the states alone.
 - **Small values.** A file holds up to 64 KiB. Larger data belongs in object storage, with its location in the file.
-- **Planned restarts.** Shutting down leaves the writer's lease to run out, so a planned restart waits the lease plus the margin, as a crash does.
 - **Replication.** Standbys need FoundationDB. SQLite and RocksDB keep one copy on one host.
 
 ## Compared with ZooKeeper and etcd
@@ -165,6 +173,7 @@ The server reads one TOML file. Fields, with defaults:
 |---|---|---|
 | `listen` | | The address to serve gRPC on |
 | `advertise` | `http://` and `listen` | The address standbys send clients to for this server |
+| `shallow_idle` | on | Keep every core out of idle states deeper than C1 while the server runs; it needs root or a device rule for `/dev/cpu_dma_latency` |
 | `storage.backend` | | `memory`, `sqlite` or `rocksdb` with a `path`, or `fdb` with a `prefix` and an optional `cluster_file` |
 | `writer.group_max_bytes` | 9 MB | The most one group commits, under FoundationDB's 10 MB transaction limit |
 | `writer.request_ttl_ms` | 10 min | How long a request id answers retries |
@@ -175,6 +184,7 @@ The server reads one TOML file. Fields, with defaults:
 | `writer.claim_ttl_ms` | 60 s | How long a consumer's claim on freed files lasts past its last acknowledgment |
 | `log.min_retention_ms`, `max_retention_ms` | 5 min, 1 h | How long the changefeed keeps entries, and how long a reader's lease may hold them |
 | `cache.tree_bytes`, `value_bytes` | 1 GiB, 256 MiB | What the writer's cache, and a standby's, holds |
+| `cache.preload` | on | Read the tree into the cache as the server starts, up to those budgets |
 
 [deploy/kubernetes](deploy/kubernetes/README.md) runs a writer and standbys on FoundationDB as a StatefulSet.
 
@@ -197,7 +207,9 @@ cargo run --release -p inodedb-sim -- --seeds 10000      # 10,000 simulation see
 cargo run --release -p inodedb-sim -- 541                # replay one seed
 scripts/posix                                            # the POSIX differential test on Linux, in Docker
 scripts/mutants                                          # every planted bug against every test layer
-scripts/ec2/setup && scripts/ec2/bench                  # the benchmarks on an EC2 instance with local NVMe and gp3
+scripts/mutants --rocksdb                                # the planted bugs in the RocksDB backend
+scripts/fdb python3 scripts/mutants --fdb                # the planted bugs in the FoundationDB backend
+scripts/ec2/setup && scripts/ec2/bench                   # the benchmarks on an EC2 instance with local NVMe and gp3
 node docs/images/render.mjs                              # the README's charts, from docs/images/charts.html
 ```
 
@@ -210,6 +222,7 @@ The README's charts come from the data in `docs/images/charts.html`; after editi
 | `crates/storage-sqlite`, `storage-rocksdb`, `storage-fdb` | The backends |
 | `crates/storage-conformance` | The storage contract as a test suite for any backend |
 | `crates/server` | The gRPC service, auth, the writer with group commit and fencing, standbys |
+| `crates/transport` | gRPC over `h2`, for the server and the client: one write per reply, and no task for a request whose answer is ready |
 | `crates/client` | The Rust client, with its cache, leases and snapshots |
 | `crates/cli` | `idb`, with `fsck`, `watch` and a read-only FUSE `mount` |
 | `crates/sim` | The deterministic simulator and its scenarios |

@@ -1,22 +1,24 @@
-//! Reading the tree into a writer's cache at startup, a page of keys at a
-//! time: every directory's entries, then every inode record, then every
-//! file's back-pointers, so a tree larger than the cache resolves paths
-//! from it. A directory whose entries all fall in one page arrives
+//! Reading the tree into a cache at startup, a page of keys at a time: every
+//! directory's entries, then every inode record, then every file's
+//! back-pointers, then every value, so a tree larger than the cache resolves
+//! paths from it. A directory whose entries all fall in one page arrives
 //! complete, so the cache answers that a name is absent without a read,
 //! and so does an empty directory the entries pass over once an entry has
 //! named it; a larger one arrives as known names. Each page is one read
-//! like any other, moved to the writer's version through the commits
-//! since.
+//! like any other, moved to the cache's version through the commits since.
 
 use crate::codec::DecodeError;
 use crate::keys::{self, KeyRange, KvRead, Pairs, Parsed};
 use crate::types::{Entry, Ino, Inode, Kind, Name};
 use crate::view::Fact;
+use bytes::Bytes;
 use std::collections::BTreeSet;
 
 /// Keys one page reads: a directory of up to this many entries can arrive
 /// complete. A page of entries takes a few megabytes.
 pub const PAGE: usize = 16_384;
+/// Values one page reads, at most 64 MiB of them.
+pub const VALUE_PAGE: usize = 1_024;
 
 /// Where the next page starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,6 +26,7 @@ pub enum Cursor {
     Entries(Vec<u8>),
     Inodes(Vec<u8>),
     Backptrs(Vec<u8>),
+    Values(Vec<u8>),
 }
 
 /// What one page read: its facts, the directories its entries name, and
@@ -41,17 +44,18 @@ impl Cursor {
 
     /// The read for this page.
     pub fn read(&self) -> KvRead {
-        let (start, range) = match self {
-            Cursor::Entries(start) => (start, keys::entry_range()),
-            Cursor::Inodes(start) => (start, keys::inode_range()),
-            Cursor::Backptrs(start) => (start, keys::backptr_range()),
+        let (start, range, limit) = match self {
+            Cursor::Entries(start) => (start, keys::entry_range(), PAGE),
+            Cursor::Inodes(start) => (start, keys::inode_range(), PAGE),
+            Cursor::Backptrs(start) => (start, keys::backptr_range(), PAGE),
+            Cursor::Values(start) => (start, keys::value_range(), VALUE_PAGE),
         };
         KvRead::Scan {
             range: KeyRange {
                 start: start.clone(),
                 end: range.end,
             },
-            limit: PAGE,
+            limit,
         }
     }
 
@@ -60,6 +64,7 @@ impl Cursor {
     pub fn page(&self, pairs: Pairs, dirs: &BTreeSet<Ino>) -> Result<Page, DecodeError> {
         let full = pairs.len() >= PAGE;
         match self {
+            Cursor::Values(_) => values(pairs),
             Cursor::Inodes(_) => {
                 let next = match pairs.last() {
                     Some((last, _)) if full => Cursor::Inodes(after(last)),
@@ -202,7 +207,7 @@ fn backptrs(start: &[u8], pairs: Pairs, full: bool) -> Result<Page, DecodeError>
         _ => Err(DecodeError),
     })?;
     let next = match groups.len() {
-        _ if !full => None,
+        _ if !full => Some(Cursor::Values(keys::value_range().start)),
         1 => {
             let (ino, _) = groups.pop().ok_or(DecodeError)?;
             Some(Cursor::Backptrs(keys::prefix_end(&keys::backptr_prefix(
@@ -220,6 +225,29 @@ fn backptrs(start: &[u8], pairs: Pairs, full: bool) -> Result<Page, DecodeError>
         .filter(|(index, (ino, _))| *index > 0 || start <= keys::backptr_prefix(*ino).as_slice())
         .map(|(_, (ino, links))| Fact::Backptrs(ino, links.into_iter().collect::<BTreeSet<_>>()))
         .collect();
+    Ok(Page {
+        facts,
+        dirs: Vec::new(),
+        next,
+    })
+}
+
+/// A page of values. An old value a file's readers may still use comes along
+/// with its file's current one, each under its own version.
+fn values(pairs: Pairs) -> Result<Page, DecodeError> {
+    let next = match pairs.last() {
+        Some((last, _)) if pairs.len() >= VALUE_PAGE => Some(Cursor::Values(after(last))),
+        _ => None,
+    };
+    let facts = pairs
+        .into_iter()
+        .map(|(key, value)| match keys::parse(&key) {
+            Some(Parsed::Value(ino, version)) => {
+                Ok(Fact::Value(ino, version, Some(Bytes::from(value))))
+            }
+            _ => Err(DecodeError),
+        })
+        .collect::<Result<_, _>>()?;
     Ok(Page {
         facts,
         dirs: Vec::new(),

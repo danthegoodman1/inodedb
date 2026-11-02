@@ -7,10 +7,10 @@ use crate::snapshot::Kept;
 use crate::types::{Entry, Ino, Inode, Kind, Name, Version};
 use crate::view::{Fact, Lookup, Read, View};
 use bytes::Bytes;
-use std::cell::Cell;
 use std::collections::btree_map;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How much a cache holds before it evicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,25 +158,34 @@ struct Order {
 }
 
 /// A cached record, and whether a read used it since eviction's hand last
-/// passed it.
+/// passed it. Reads may run on any thread that shares the cache, so the mark
+/// is atomic; it is a hint, so relaxed ordering serves, and a read writes it
+/// only when it changes, which keeps the record's cache line shared.
 #[derive(Debug)]
 struct Held<T> {
     record: T,
-    used: Cell<bool>,
+    used: AtomicBool,
 }
 
 impl<T> Held<T> {
     fn new(record: T) -> Held<T> {
         Held {
             record,
-            used: Cell::new(false),
+            used: AtomicBool::new(false),
         }
     }
 
     /// The record, for a read.
     fn read(&self) -> &T {
-        self.used.set(true);
+        if !self.used.load(Ordering::Relaxed) {
+            self.used.store(true, Ordering::Relaxed);
+        }
         &self.record
+    }
+
+    /// Whether a read used it since the last call.
+    fn take_used(&self) -> bool {
+        self.used.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -350,10 +359,10 @@ impl Cache {
     pub fn evict(&mut self, spare: u64) {
         while self.tree_bytes > self.budget.tree_bytes {
             let Some(record) = self.order.tree.next(spare, |record| match record {
-                Record::Entries(dir) => self.dirs.get(dir).is_some_and(|held| held.used.take()),
+                Record::Entries(dir) => self.dirs.get(dir).is_some_and(Held::take_used),
                 Record::Inode(ino) => {
-                    let inode = self.inodes.get(ino).is_some_and(|held| held.used.take());
-                    let links = self.backptrs.get(ino).is_some_and(|held| held.used.take());
+                    let inode = self.inodes.get(ino).is_some_and(Held::take_used);
+                    let links = self.backptrs.get(ino).is_some_and(Held::take_used);
                     inode || links
                 }
             }) else {
@@ -372,7 +381,7 @@ impl Cache {
         }
         while self.value_bytes > self.budget.value_bytes {
             let Some(key) = self.order.values.next(spare, |key| {
-                self.values.get(key).is_some_and(|held| held.used.take())
+                self.values.get(key).is_some_and(Held::take_used)
             }) else {
                 break;
             };
@@ -671,6 +680,9 @@ impl Cache {
 
     /// Whether `fact` fits in what the tree budget has left.
     pub fn has_room(&self, fact: &Fact) -> bool {
+        if let Fact::Value(_, _, value) = fact {
+            return self.value_bytes + value_bytes(value) <= self.budget.value_bytes;
+        }
         let bytes = match fact {
             Fact::Listing { entries, .. } => {
                 DIR_BYTES

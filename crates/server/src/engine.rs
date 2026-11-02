@@ -1,6 +1,8 @@
 //! The writer's task: it owns the core's writer, carries out the actions
 //! it returns over a storage backend, and routes answers back to the
-//! requests waiting on them.
+//! requests waiting on them. A read the cache holds never reaches the task:
+//! the request's own task answers it under a shared lock, which the task
+//! takes exclusively only while the writer changes.
 
 use crate::feed::Tail;
 use inodedb_core::auth::{Caller, Denied, Grant, KeyOp, Scope};
@@ -16,6 +18,7 @@ use inodedb_core::writer::{Action, Answer, CommitOutcome, Config, Takeover, Toke
 use inodedb_storage::{Storage, StorageError};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -105,6 +108,11 @@ enum Command {
 /// and commits heartbeats, and a standby reads the head record.
 const TICK: Duration = Duration::from_millis(100);
 
+/// The most commands the engine takes at once. Those it takes together share
+/// one look at the clock and one trip through the writer's actions, so
+/// batches that queued while it worked commit as one group.
+const BURST: usize = 256;
+
 /// What a server that can answer reports: a started writer, or a standby
 /// that has read the store.
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +130,8 @@ pub struct Engine {
     stopped: watch::Receiver<bool>,
     committed: watch::Receiver<Version>,
     keep: watch::Receiver<Option<Keep>>,
+    /// The writer or standby, for reads the cache holds.
+    role: Arc<RwLock<Role>>,
 }
 
 /// What log truncation must keep, which only a writer within its lease
@@ -192,10 +202,16 @@ impl Engine {
         let (stop, stopped) = watch::channel(false);
         let (publish, committed) = watch::channel(0);
         let (keeps, keep) = watch::channel(None);
+        let role = Arc::new(RwLock::new(if standby {
+            Role::Follow(Box::new(Follower::new(config.clone(), steady())))
+        } else {
+            Role::Write(Box::new(writer(&config, random_secret())))
+        }));
         let task = tokio::spawn(run(
             storage,
             config,
             standby,
+            role.clone(),
             commands.downgrade(),
             inbox,
             stop,
@@ -211,6 +227,7 @@ impl Engine {
                 stopped,
                 committed,
                 keep,
+                role,
             },
             task,
         )
@@ -277,12 +294,26 @@ impl Engine {
             .await
     }
 
+    /// The answer to a read the cache holds, without a trip to the engine's
+    /// task. The task holds the lock for microseconds at a time, while the
+    /// writer changes, so waiting for it beats queuing behind it.
+    fn answer_cached(&self, caller: &Caller, query: &Query, at_least: Version) -> Option<Answer> {
+        let role = self.role.read().ok()?;
+        match &*role {
+            Role::Write(writer) => writer.answer_cached(caller, query, at_least, writer_now()),
+            Role::Follow(follower) => follower.answer_cached(caller, query, at_least, steady()),
+        }
+    }
+
     pub async fn query(
         &self,
         caller: Caller,
         query: Query,
         at_least: Version,
     ) -> Result<Answer, Status> {
+        if let Some(answer) = self.answer_cached(&caller, &query, at_least) {
+            return Ok(answer);
+        }
         self.answer(|reply| Command::Query {
             caller,
             query,
@@ -397,7 +428,6 @@ struct Node<S> {
     /// rather than stopping.
     standby: bool,
     commands: mpsc::WeakSender<Command>,
-    role: Role,
     /// Counts roles, so a storage call's result reaches only the role that
     /// asked for it.
     era: u64,
@@ -430,7 +460,15 @@ fn writer(config: &Config, secret: [u8; 32]) -> Writer {
 }
 
 impl<S: Storage + Clone> Node<S> {
-    fn follow(&mut self) {
+    /// Carries out what a role has said so far: it is about to be replaced,
+    /// and a burst's earlier commands may have left it answers to give.
+    fn flush(&mut self, role: &mut Role) {
+        let (actions, writing) = self.actions(role);
+        self.carry_out(actions, writing);
+    }
+
+    fn follow(&mut self, role: &mut Role) {
+        self.flush(role);
         self.era += 1;
         self.polling = false;
         if let Some(task) = self.following.take() {
@@ -439,7 +477,7 @@ impl<S: Storage + Clone> Node<S> {
         let follower = Role::Follow(Box::new(Follower::new(self.config.clone(), steady())));
         // A follower starting over takes the reads its predecessor kept.
         if let (Role::Follow(old), Role::Follow(new)) =
-            (std::mem::replace(&mut self.role, follower), &mut self.role)
+            (std::mem::replace(role, follower), &mut *role)
         {
             for read in old.hand_over().waiting {
                 new.query(read.token, read.caller, read.query, read.at_least);
@@ -448,9 +486,10 @@ impl<S: Storage + Clone> Node<S> {
     }
 
     /// Becomes the writer, with the follower's cache and its waiting reads.
-    fn take_over(&mut self, takeover: Takeover) {
+    fn take_over(&mut self, role: &mut Role, takeover: Takeover) {
+        self.flush(role);
         let Role::Follow(follower) = std::mem::replace(
-            &mut self.role,
+            role,
             Role::Follow(Box::new(Follower::new(self.config.clone(), steady()))),
         ) else {
             return;
@@ -470,7 +509,7 @@ impl<S: Storage + Clone> Node<S> {
             task.abort();
         }
         self.writing = self.storage.for_writer();
-        self.role = Role::Write(Box::new(writer));
+        *role = Role::Write(Box::new(writer));
     }
 
     /// Answers a request only the writer takes.
@@ -480,9 +519,9 @@ impl<S: Storage + Clone> Node<S> {
         });
     }
 
-    fn handle(&mut self, command: Command, next: &mut Token) {
+    fn handle(&mut self, role: &mut Role, command: Command, next: &mut Token) {
         let waiting = &mut self.waiting;
-        match (&mut self.role, command) {
+        match (&mut *role, command) {
             (
                 Role::Write(writer),
                 Command::Submit {
@@ -544,7 +583,7 @@ impl<S: Storage + Clone> Node<S> {
                 | Command::Ack { reply, .. },
             ) => Node::<S>::not_writer(follower, reply),
             (
-                role,
+                current,
                 Command::Query {
                     caller,
                     query,
@@ -553,7 +592,7 @@ impl<S: Storage + Clone> Node<S> {
                 },
             ) => {
                 let token = token(waiting, next, reply);
-                match role {
+                match current {
                     Role::Write(writer) => writer.query(token, caller, query, at_least),
                     Role::Follow(follower) => follower.query(token, caller, query, at_least),
                 }
@@ -593,14 +632,14 @@ impl<S: Storage + Clone> Node<S> {
                 });
             }
             (_, Command::Ready { .. }) => unreachable!("the run loop keeps these"),
-            (role, Command::ReadDone { era, id, results }) if era == self.era => match role {
+            (current, Command::ReadDone { era, id, results }) if era == self.era => match current {
                 Role::Write(writer) => writer.read_done(id, results),
                 Role::Follow(follower) => {
                     if follower.read_done(id, results).is_err() {
                         eprintln!(
                             "level=error msg=\"storage holds what the standby can't read; starting over\""
                         );
-                        self.follow();
+                        self.follow(role);
                     }
                 }
             },
@@ -631,7 +670,7 @@ impl<S: Storage + Clone> Node<S> {
             (Role::Follow(follower), Command::Head { era, head }) if era == self.era => {
                 self.polling = false;
                 match follower.observe(head) {
-                    Ok(Some(takeover)) => self.take_over(takeover),
+                    Ok(Some(takeover)) => self.take_over(role, takeover),
                     Ok(None) => {}
                     Err(_) => eprintln!("level=error msg=\"the head record doesn't decode\""),
                 }
@@ -650,7 +689,7 @@ impl<S: Storage + Clone> Node<S> {
                             eprintln!(
                                 "level=warn msg=\"the standby fell behind the log; starting over\""
                             );
-                            return self.follow();
+                            return self.follow(role);
                         }
                     }
                 }
@@ -660,10 +699,10 @@ impl<S: Storage + Clone> Node<S> {
         }
     }
 
-    /// Carries out the role's actions, and starts following the log once
-    /// a follower knows where it continues.
-    fn carry_out(&mut self) {
-        if let Role::Follow(follower) = &self.role
+    /// Starts following the log once a follower knows where it continues,
+    /// and takes the role's actions.
+    fn actions(&mut self, role: &mut Role) -> (Vec<Action>, bool) {
+        if let Role::Follow(follower) = &*role
             && follower.is_started()
             && self.following.is_none()
         {
@@ -672,47 +711,48 @@ impl<S: Storage + Clone> Node<S> {
             let tail = self.tail.clone();
             self.following = Some(tokio::spawn(follow_log(storage, tail, commands, era, from)));
         }
-        loop {
-            let actions = match &mut self.role {
-                Role::Write(writer) => writer.drain(),
-                Role::Follow(follower) => follower.drain(),
-            };
-            if actions.is_empty() {
-                return;
-            }
-            let storage = match &self.role {
-                Role::Write(_) => &self.writing,
-                Role::Follow(_) => &self.storage,
-            };
-            for action in actions {
-                let era = self.era;
-                match action {
-                    Action::Read { id, reads } => {
-                        let (storage, commands) = (storage.clone(), self.commands.clone());
-                        tokio::spawn(async move {
-                            let results = persist(|| storage.snapshot_read(reads.clone())).await;
-                            report(commands, Command::ReadDone { era, id, results }).await;
-                        });
-                    }
-                    Action::Commit { id, expect, writes } => {
-                        let (storage, commands) = (storage.clone(), self.commands.clone());
-                        let (failures, tail) = (self.failures.clone(), self.tail.clone());
-                        tokio::spawn(async move {
-                            let outcome = commit(&storage, expect, writes, &failures, &tail).await;
-                            report(commands, Command::CommitDone { era, id, outcome }).await;
-                        });
-                    }
-                    Action::Resolve { id } => {
-                        let (storage, commands) = (storage.clone(), self.commands.clone());
-                        tokio::spawn(async move {
-                            let head = persist(|| inodedb_storage::resolve(&storage)).await;
-                            report(commands, Command::ResolveDone { era, id, head }).await;
-                        });
-                    }
-                    Action::Answer { token, answer } => {
-                        if let Some(reply) = self.waiting.remove(&token) {
-                            let _ = reply.send(answer);
-                        }
+        match role {
+            Role::Write(writer) => (writer.drain(), true),
+            Role::Follow(follower) => (follower.drain(), false),
+        }
+    }
+
+    /// Carries out a role's actions, outside the lock, so the answers wake
+    /// requests that can read at once.
+    fn carry_out(&mut self, actions: Vec<Action>, writing: bool) {
+        let storage = if writing {
+            &self.writing
+        } else {
+            &self.storage
+        };
+        for action in actions {
+            let era = self.era;
+            match action {
+                Action::Read { id, reads } => {
+                    let (storage, commands) = (storage.clone(), self.commands.clone());
+                    tokio::spawn(async move {
+                        let results = persist(|| storage.snapshot_read(reads.clone())).await;
+                        report(commands, Command::ReadDone { era, id, results }).await;
+                    });
+                }
+                Action::Commit { id, expect, writes } => {
+                    let (storage, commands) = (storage.clone(), self.commands.clone());
+                    let (failures, tail) = (self.failures.clone(), self.tail.clone());
+                    tokio::spawn(async move {
+                        let outcome = commit(&storage, expect, writes, &failures, &tail).await;
+                        report(commands, Command::CommitDone { era, id, outcome }).await;
+                    });
+                }
+                Action::Resolve { id } => {
+                    let (storage, commands) = (storage.clone(), self.commands.clone());
+                    tokio::spawn(async move {
+                        let head = persist(|| inodedb_storage::resolve(&storage)).await;
+                        report(commands, Command::ResolveDone { era, id, head }).await;
+                    });
+                }
+                Action::Answer { token, answer } => {
+                    if let Some(reply) = self.waiting.remove(&token) {
+                        let _ = reply.send(answer);
                     }
                 }
             }
@@ -720,8 +760,8 @@ impl<S: Storage + Clone> Node<S> {
     }
 
     /// What a server that can answer reports, once it can.
-    fn ready(&self) -> Option<Ready> {
-        match &self.role {
+    fn ready(&self, role: &Role) -> Option<Ready> {
+        match role {
             Role::Write(writer) if writer.is_ready() => Some(Ready {
                 secret: writer.handle_secret(),
                 keys: writer.keys().len(),
@@ -764,7 +804,7 @@ async fn follow_log<S: Storage>(
             persist(|| storage.wait_past(from - 1)).await;
             continue;
         };
-        tail.extend(&entries);
+        tail.extend(entries.iter().cloned());
         from = last + 1;
         let Some(commands) = commands.upgrade() else {
             return;
@@ -782,27 +822,23 @@ async fn follow_log<S: Storage>(
 /// Log entries a follower reads at once.
 const LOG_BATCH: usize = 256;
 
+#[allow(clippy::too_many_arguments)]
 async fn run<S: Storage + Clone>(
     storage: S,
     config: Config,
     standby: bool,
+    role: Arc<RwLock<Role>>,
     commands: mpsc::WeakSender<Command>,
     mut inbox: mpsc::Receiver<Command>,
     stop: watch::Sender<bool>,
     published: Published,
 ) {
-    let role = if standby {
-        Role::Follow(Box::new(Follower::new(config.clone(), steady())))
-    } else {
-        Role::Write(Box::new(writer(&config, random_secret())))
-    };
     let mut node = Node {
         writing: storage.for_writer(),
         storage,
         config,
         standby,
         commands: commands.clone(),
-        role,
         era: 0,
         waiting: BTreeMap::new(),
         failures: Arc::new(AtomicU32::new(0)),
@@ -834,27 +870,36 @@ async fn run<S: Storage + Clone>(
             }
         }
     });
-    node.carry_out();
-    while let Some(command) = inbox.recv().await {
-        match &mut node.role {
+    {
+        let mut held = role.write().expect("no thread panics holding the role");
+        let (actions, writing) = node.actions(&mut held);
+        drop(held);
+        node.carry_out(actions, writing);
+    }
+    let mut burst = Vec::with_capacity(BURST);
+    while inbox.recv_many(&mut burst, BURST).await > 0 {
+        let mut held = role.write().expect("no thread panics holding the role");
+        match &mut *held {
             Role::Write(writer) => writer.set_now(writer_now()),
             Role::Follow(follower) => follower.set_now(steady()),
         }
-        match command {
-            Command::Ready { reply } => readying.push(reply),
-            Command::Release { reply } => match &mut node.role {
-                Role::Write(writer) => {
-                    writer.release();
-                    node.releasing = Some(reply);
-                }
-                Role::Follow(_) => {
-                    let _ = reply.send(());
-                }
-            },
-            command => node.handle(command, &mut next_token),
+        for command in burst.drain(..) {
+            match command {
+                Command::Ready { reply } => readying.push(reply),
+                Command::Release { reply } => match &mut *held {
+                    Role::Write(writer) => {
+                        writer.release();
+                        node.releasing = Some(reply);
+                    }
+                    Role::Follow(_) => {
+                        let _ = reply.send(());
+                    }
+                },
+                command => node.handle(&mut held, command, &mut next_token),
+            }
         }
-        node.carry_out();
-        if let Role::Write(writer) = &node.role
+        let (mut actions, mut writing) = node.actions(&mut held);
+        if let Role::Write(writer) = &*held
             && writer.is_stopped()
             && !node.released
         {
@@ -866,14 +911,17 @@ async fn run<S: Storage + Clone>(
                 let _ = reply.send(());
             } else if node.standby {
                 eprintln!("level=warn msg=\"another writer took over; following it\"");
-                node.follow();
-                node.carry_out();
+                // What the stopped writer said before `actions` was taken goes
+                // out first.
+                node.carry_out(std::mem::take(&mut actions), writing);
+                node.follow(&mut held);
+                (actions, writing) = node.actions(&mut held);
             } else {
                 readying.clear();
                 stop.send_replace(true);
             }
         }
-        if let Role::Write(writer) = &node.role
+        if let Role::Write(writer) = &*held
             && writer.is_ready()
             && announced != Some(node.era)
         {
@@ -887,7 +935,7 @@ async fn run<S: Storage + Clone>(
                 preloading = Some((node.era, std::time::Instant::now()));
             }
         }
-        if let (Role::Write(writer), Some((era, started))) = (&node.role, preloading)
+        if let (Role::Write(writer), Some((era, started))) = (&*held, preloading)
             && era == node.era
             && !writer.is_preloading()
         {
@@ -901,7 +949,7 @@ async fn run<S: Storage + Clone>(
                 started.elapsed().as_millis()
             );
         }
-        let (version, keep) = match &node.role {
+        let (version, keep) = match &*held {
             Role::Write(writer) => (
                 writer.version(),
                 (writer.is_ready() && writer.is_fresh()).then(|| Keep {
@@ -910,6 +958,8 @@ async fn run<S: Storage + Clone>(
             ),
             Role::Follow(follower) => (follower.version(), None),
         };
+        let ready = node.ready(&held);
+        drop(held);
         published.committed.send_if_modified(|published| {
             let changed = *published != version;
             *published = version;
@@ -920,7 +970,8 @@ async fn run<S: Storage + Clone>(
             *published = keep;
             changed
         });
-        if let Some(ready) = node.ready() {
+        node.carry_out(actions, writing);
+        if let Some(ready) = ready {
             for reply in readying.drain(..) {
                 let _ = reply.send(ready);
             }
@@ -945,7 +996,8 @@ async fn commit<S: Storage>(
     failures: &AtomicU32,
     tail: &Tail,
 ) -> CommitOutcome {
-    let outcome = inodedb_storage::commit(storage, expect.as_deref(), &writes).await;
+    let writes = Arc::new(writes);
+    let outcome = storage.commit_group(expect, writes.clone()).await;
     match outcome {
         // An unknown outcome often resolves as a failure, which the writer
         // runs again at once, so it waits as a failure does.
@@ -963,8 +1015,138 @@ async fn commit<S: Storage>(
         CommitOutcome::Committed => {
             failures.store(0, Ordering::Release);
             // Streams find the entries before the writer announces them.
-            tail.extend(&writes.log);
+            tail.extend(match Arc::try_unwrap(writes) {
+                Ok(writes) => writes.log,
+                Err(writes) => writes.log.clone(),
+            });
         }
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feed::Retention;
+    use inodedb_core::types::{Path, ROOT};
+    use inodedb_storage::Memory;
+
+    fn stat_root() -> Query {
+        Query::Stat(inodedb_core::query::Target::Path(Path::root()))
+    }
+
+    /// A read the cache holds answers on the request's own task, so it needs
+    /// nothing from the engine's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_the_cache_holds_needs_no_engine_task() {
+        let tail = Arc::new(Tail::new(&Retention::default()));
+        let (engine, task) = Engine::spawn(Memory::new(), Config::default(), false, tail);
+        engine.ready().await.expect("starts");
+        task.abort();
+        let _ = task.await;
+        let answer = engine
+            .query(Caller::Trusted(ROOT), stat_root(), 0)
+            .await
+            .expect("answers");
+        assert!(matches!(answer, Answer::Query { .. }), "{answer:?}");
+    }
+
+    /// Sends a standby a read and then `change` in one burst: the role changes
+    /// after the read's answer has gone into its actions, and the answer still
+    /// comes.
+    async fn a_burst_answers_as_its_role_changes(change: Command) {
+        let store = Memory::new();
+        let config = Config {
+            address: "http://writer".to_string(),
+            ..Config::default()
+        };
+        let retention = Retention::default();
+        let (writer, _writer_task) = Engine::spawn(
+            store.clone(),
+            config.clone(),
+            false,
+            Arc::new(Tail::new(&retention)),
+        );
+        writer.ready().await.expect("starts");
+        let (standby, _standby_task) =
+            Engine::spawn(store, config, true, Arc::new(Tail::new(&retention)));
+        standby.ready().await.expect("starts");
+        let (reply, answer) = oneshot::channel();
+        {
+            // The engine waits on this lock, so both commands queue for one burst.
+            let _held = standby.role.write().expect("no thread panics");
+            standby
+                .commands
+                .try_send(Command::Query {
+                    caller: Caller::Trusted(ROOT),
+                    query: stat_root(),
+                    at_least: 0,
+                    reply,
+                })
+                .expect("room");
+            standby.commands.try_send(change).expect("room");
+        }
+        let answer = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the read hears back")
+            .expect("the read's reply stays open");
+        assert!(matches!(answer, Answer::NotWriter { .. }), "{answer:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_burst_answers_as_a_standby_takes_over() {
+        a_burst_answers_as_its_role_changes(Command::Head { era: 0, head: None }).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_burst_answers_as_a_standby_starts_over() {
+        a_burst_answers_as_its_role_changes(Command::Entries {
+            era: 0,
+            entries: vec![(u64::MAX, Vec::new())],
+        })
+        .await;
+    }
+
+    /// A standby's reads of the log fill its tail, so its streams read no
+    /// storage either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_standbys_reads_fill_its_tail() {
+        let store = Memory::new();
+        let config = Config {
+            address: "http://writer".to_string(),
+            ..Config::default()
+        };
+        let retention = Retention::default();
+        let writing = Arc::new(Tail::new(&retention));
+        let (writer, _writer_task) = Engine::spawn(store.clone(), config.clone(), false, writing);
+        writer.ready().await.expect("starts");
+        let following = Arc::new(Tail::new(&retention));
+        let (standby, _standby_task) = Engine::spawn(store, config, true, following.clone());
+        standby.ready().await.expect("starts");
+        let batch = Batch {
+            ops: vec![inodedb_core::ops::OpSpec::new(
+                inodedb_core::ops::Op::Mkdir {
+                    path: Path::parse(b"d").expect("a path"),
+                    parents: false,
+                    if_absent: false,
+                },
+            )],
+            ..Batch::default()
+        };
+        let Answer::Commit(result) = writer
+            .submit(Caller::Trusted(ROOT), batch)
+            .await
+            .expect("answers")
+        else {
+            panic!("a commit answers with its result");
+        };
+        let filled = async {
+            while !following.holds(result.version) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), filled)
+            .await
+            .expect("the standby's tail reaches the commit");
+    }
 }

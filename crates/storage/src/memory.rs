@@ -80,7 +80,7 @@ impl State {
         for (version, entry) in log {
             self.log.insert(*version, entry.clone());
         }
-        self.validator.record(written);
+        self.validator.record(|| written);
         self.latest()
     }
 

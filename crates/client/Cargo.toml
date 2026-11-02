@@ -13,6 +13,7 @@ bytes.workspace = true
 getrandom.workspace = true
 inodedb-core.workspace = true
 inodedb-proto.workspace = true
+inodedb-transport.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-stream.workspace = true
 tonic.workspace = true

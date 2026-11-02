@@ -179,3 +179,147 @@ fn a_preload_takes_the_commits_made_while_it_reads() {
     assert_eq!(stat(&mut h, "e/y"), (false, 0));
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
+
+#[test]
+fn a_preloaded_writer_answers_reads_of_values_without_reads() {
+    let mut h = Harness::new();
+    h.ops([mkdir("a"), put("a/f", "one"), put("a/g", "two")]);
+    let mut h = Harness::with(h.storage.clone(), preloading());
+    let reads = h.reads;
+    let (_, result) = h.query(Query::Read {
+        target: Target::Path(p("a/g")),
+        version: None,
+    });
+    match result {
+        QueryResult::Read { value, .. } => assert_eq!(&value[..], b"two"),
+        other => panic!("expected a value, got {other:?}"),
+    }
+    assert_eq!(h.reads, reads, "the value came with the preload");
+}
+
+#[test]
+fn a_preload_stops_at_the_value_budget() {
+    let mut h = Harness::new();
+    h.ops([put("f", "one"), put("g", "two"), put("h", "three")]);
+    let room = inodedb_core::cache::VALUE_BYTES + 3;
+    let config = Config {
+        preload: true,
+        cache: Budget {
+            value_bytes: room,
+            ..Budget::default()
+        },
+        ..Config::default()
+    };
+    let h = Harness::with(h.storage.clone(), config);
+    assert!(h.writer.cache().value_bytes() <= room, "within its budget");
+    assert!(h.writer.cache().value_bytes() > 0, "up to it");
+    assert!(stat_holds_every_file(&h));
+}
+
+fn stat_holds_every_file(h: &Harness) -> bool {
+    h.writer.cache().inodes() >= 4
+}
+
+#[test]
+fn a_standbys_preload_stops_at_its_budget() {
+    use inodedb_core::standby::Follower;
+    let mut h = Harness::new();
+    h.ops([
+        mkdir("a"),
+        put("a/f", "1"),
+        put("a/g", "2"),
+        put("a/h", "3"),
+    ]);
+    let room = DIR_BYTES + 4 * (NAME_BYTES + 1) + INODE_BYTES;
+    let config = Config {
+        preload: true,
+        cache: Budget {
+            tree_bytes: room,
+            ..Budget::default()
+        },
+        ..Config::default()
+    };
+    let mut follower = Follower::new(config, 1_000);
+    loop {
+        let actions = follower.drain();
+        if actions.is_empty() {
+            break;
+        }
+        for action in actions {
+            let Action::Read { id, reads } = action else {
+                panic!("a follower only reads: {action:?}");
+            };
+            follower
+                .read_done(id, h.storage.read_now(&reads))
+                .expect("reads what it wrote");
+        }
+    }
+    let cache = follower.hand_over().cache;
+    assert!(
+        cache.tree_bytes() <= room,
+        "{} of {room}",
+        cache.tree_bytes()
+    );
+    assert!(cache.dirs() > 0, "the entries came first");
+}
+
+/// A standby starts as warm as a writer does: once it has read the store, a
+/// read at a version it has reached needs no storage.
+#[test]
+fn a_standby_preloads_the_tree() {
+    use inodedb_core::auth::Caller;
+    use inodedb_core::standby::Follower;
+    use inodedb_core::types::ROOT;
+    use inodedb_core::writer::Answer;
+    let mut h = Harness::new();
+    h.ops([mkdir("a"), put("a/f", "one")]);
+    let version = h.writer.version();
+    let mut follower = Follower::new(preloading(), 1_000);
+    loop {
+        let actions = follower.drain();
+        if actions.is_empty() {
+            break;
+        }
+        for action in actions {
+            let Action::Read { id, reads } = action else {
+                panic!("a follower only reads: {action:?}");
+            };
+            follower
+                .read_done(id, h.storage.read_now(&reads))
+                .expect("reads what it wrote");
+        }
+    }
+    let caller = Caller::Trusted(ROOT);
+    let stat = Query::Stat(Target::Path(p("a/f")));
+    let read = Query::Read {
+        target: Target::Path(p("a/f")),
+        version: None,
+    };
+    for query in [stat, read] {
+        assert!(
+            matches!(
+                follower.answer_cached(&caller, &query, version, 1_000),
+                Some(Answer::Query { .. })
+            ),
+            "{query:?}"
+        );
+    }
+    let mut cold = Follower::new(Config::default(), 1_000);
+    for action in cold.drain() {
+        let Action::Read { id, reads } = action else {
+            panic!("a follower only reads");
+        };
+        cold.read_done(id, h.storage.read_now(&reads))
+            .expect("reads what it wrote");
+    }
+    assert!(
+        cold.answer_cached(
+            &caller,
+            &Query::Stat(Target::Path(p("a/f"))),
+            version,
+            1_000
+        )
+        .is_none(),
+        "without the preload its cache starts empty"
+    );
+}

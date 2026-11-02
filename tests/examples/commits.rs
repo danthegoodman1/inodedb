@@ -5,6 +5,9 @@
 //! Each client commits one small file per batch into its own directory, as
 //! fast as answers come back. "One per group" caps groups at one batch.
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use inodedb::{Client, Op};
 use inodedb_core::writer::Config;
 use inodedb_storage::Storage;

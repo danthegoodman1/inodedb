@@ -10,3 +10,6 @@ inodedb-core.workspace = true
 inodedb-storage.workspace = true
 rocksdb.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }
+
+[dev-dependencies]
+tempfile.workspace = true

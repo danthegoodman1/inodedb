@@ -23,9 +23,12 @@ inodedb-sim = { path = "../crates/sim" }
 inodedb-storage.workspace = true
 inodedb-storage-conformance.workspace = true
 inodedb-storage-rocksdb = { workspace = true, optional = true }
+inodedb-transport.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
 inodedb-storage-sqlite.workspace = true
+mimalloc = { version = "0.1.52", default-features = false }
 tempfile.workspace = true

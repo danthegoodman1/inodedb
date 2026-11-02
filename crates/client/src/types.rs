@@ -65,8 +65,6 @@ pub enum Error {
     Rejected(Rejection),
     /// The server refused the request, or retries ran out.
     Status(tonic::Status),
-    /// The endpoint is malformed or unreachable.
-    Transport(tonic::transport::Error),
     /// The lease ran out; the reader drops its handles and reloads.
     LeaseExpired,
     /// The snapshot ended: its undo records outgrew the cache's budget,
@@ -83,7 +81,6 @@ impl std::fmt::Display for Error {
             Error::Fs(error) => error.fmt(f),
             Error::Rejected(rejection) => write!(f, "batch rejected: {rejection:?}"),
             Error::Status(status) => write!(f, "{}: {}", status.code(), status.message()),
-            Error::Transport(error) => write!(f, "transport: {error}"),
             Error::LeaseExpired => write!(f, "the lease ran out"),
             Error::SnapshotTooOld => write!(f, "the snapshot is too old"),
             Error::Compacted => write!(f, "the log no longer holds that version"),
@@ -102,12 +99,6 @@ impl From<FsError> for Error {
 impl From<tonic::Status> for Error {
     fn from(status: tonic::Status) -> Error {
         Error::Status(status)
-    }
-}
-
-impl From<tonic::transport::Error> for Error {
-    fn from(error: tonic::transport::Error) -> Error {
-        Error::Transport(error)
     }
 }
 

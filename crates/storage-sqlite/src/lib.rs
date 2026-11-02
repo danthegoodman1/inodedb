@@ -3,23 +3,40 @@
 //! file admits one process. Commits apply one at a time under a mutex and
 //! are validated optimistically; snapshot reads run in one read
 //! transaction on a pooled connection. A thread of the store's own copies
-//! the WAL into the database file, so commits never wait on a checkpoint.
+//! the WAL into the database file, so commits rarely wait on a checkpoint.
+//!
+//! A sync that must also grow a file commits the file system's journal, which
+//! costs up to three times the write itself on local NVMe and twice on gp3
+//! (`BENCHMARKS.md`, "Devices"). So the WAL file is written to its full size
+//! when the store opens, and the thread sends commits back to its start before
+//! they pass its end, so they overwrite written blocks. `.cargo/config.toml`
+//! builds SQLite to sync its WAL with `fdatasync`, which leaves timestamps to
+//! the journal's own time.
 
-use inodedb_core::keys::{KeyRange, KvRead, KvResult, KvWrite, Pairs};
+use inodedb_core::keys::{self, KeyRange, KvRead, KvResult, KvWrite, Pairs, WriteSet};
 use inodedb_core::types::Version;
+use inodedb_core::writer::CommitOutcome;
 use inodedb_storage::occ::{ReadSet, Validator, Written};
 use inodedb_storage::{CommitError, Storage, StorageError, Txn, check_limits};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// How often the checkpointing thread looks for new commits.
-const CHECKPOINT_EVERY: Duration = Duration::from_millis(100);
+/// How often the checkpointing thread looks for new commits. A test's WAL is
+/// small, and fills between looks at the usual pace.
+const CHECKPOINT_EVERY: Duration = Duration::from_millis(if cfg!(test) { 5 } else { 100 });
+/// The size the WAL file is written to.
+const WAL_BYTES: u64 = if cfg!(test) { 8 << 20 } else { 128 << 20 };
+/// The WAL's frames past which the checkpointing thread sends commits back to
+/// its start, leaving room for what commits write until it next looks. Frames
+/// are SQLite's default 4 KiB page and a small header.
+const WAL_WRAP: i64 = (WAL_BYTES / 2 / 4120) as i64;
 
 struct Shared {
     path: PathBuf,
@@ -124,6 +141,9 @@ impl Sqlite {
                  CREATE TABLE IF NOT EXISTS log (version INTEGER PRIMARY KEY, entry BLOB NOT NULL);",
             )
             .map_err(unavailable)?;
+        // SQLite deletes a WAL it finds beside an empty database, so this comes
+        // after the tables.
+        write_wal(&path).map_err(unavailable)?;
         let latest: Option<i64> = writer
             .query_row("SELECT max(version) FROM log", [], |row| row.get(0))
             .map_err(unavailable)?;
@@ -249,6 +269,13 @@ impl Storage for Sqlite {
         .await
         .map_err(unavailable)?
     }
+
+    async fn commit_group(&self, expect: Option<Vec<u8>>, writes: Arc<WriteSet>) -> CommitOutcome {
+        let shared = self.shared.clone();
+        tokio::task::spawn_blocking(move || commit_group(&shared, expect.as_deref(), &writes))
+            .await
+            .unwrap_or(CommitOutcome::Failed)
+    }
 }
 
 pub struct SqliteTxn {
@@ -340,8 +367,31 @@ impl Txn for SqliteTxn {
     }
 }
 
+/// Writes the WAL file to its full size, so commits overwrite written blocks.
+/// It only adds zeros past the file's end, where SQLite reads no frames, so
+/// what a crash left in the file stays, and commits go on from where the log
+/// ends, back to the start once the checkpointing thread sends them there.
+fn write_wal(database: &Path) -> std::io::Result<()> {
+    let mut path = database.as_os_str().to_owned();
+    path.push("-wal");
+    let mut wal = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let mut length = wal.metadata()?.len();
+    let zeros = vec![0u8; 1 << 20];
+    while length < WAL_BYTES {
+        wal.write_all(&zeros)?;
+        length += zeros.len() as u64;
+    }
+    wal.sync_all()
+}
+
 /// Copies committed pages from the WAL into the database file while the
-/// store lives, without blocking commits or readers.
+/// store lives, without blocking commits or readers. Under steady commits a
+/// passive checkpoint never catches up, and the WAL would grow without end, so
+/// once it reaches `WAL_WRAP` frames the thread takes the writer's lock for
+/// long enough to finish the copy, and commits go back to the WAL's start.
 fn checkpoint(shared: Weak<Shared>, conn: Connection) {
     let mut seen = 0;
     loop {
@@ -350,11 +400,21 @@ fn checkpoint(shared: Weak<Shared>, conn: Connection) {
             return;
         };
         let commits = shared.commits.load(Ordering::Relaxed);
-        drop(shared);
         if commits != seen {
             seen = commits;
             // A busy or failed checkpoint leaves the WAL for the next one.
-            let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+            let frames = conn
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    row.get::<_, i64>(1)
+                })
+                .unwrap_or(0);
+            if frames >= WAL_WRAP {
+                // A second pass leaves the writer's wait only what commits
+                // wrote during the first.
+                let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+                let _writer = shared.writer.lock().expect("no panics hold the writer");
+                let _ = conn.query_row("PRAGMA wal_checkpoint(RESTART)", [], |_| Ok(()));
+            }
         }
     }
 }
@@ -378,28 +438,57 @@ fn apply(
     {
         return Err(CommitError::Conflict);
     }
+    write(shared, &mut conn, writes, log)
+}
+
+/// Commits a group if the head record holds `expect`, reading and writing
+/// under the writer's lock, so nothing commits between them.
+fn commit_group(shared: &Shared, expect: Option<&[u8]>, writes: &WriteSet) -> CommitOutcome {
+    let mut conn = shared
+        .writer
+        .lock()
+        .expect("no thread panics holding the writer");
+    match get(&conn, &keys::head()) {
+        Ok(head) if head.as_deref() == expect => {}
+        Ok(_) => return CommitOutcome::Fenced,
+        Err(_) => return CommitOutcome::Failed,
+    }
+    let log = writes.log.iter().map(|(_, entry)| entry.as_slice());
+    if check_limits(&writes.writes, log).is_err() {
+        return CommitOutcome::Failed;
+    }
+    match write(shared, &mut conn, &writes.writes, &writes.log) {
+        Ok(()) => CommitOutcome::Committed,
+        Err(CommitError::Unknown) => CommitOutcome::Unknown,
+        Err(_) => CommitOutcome::Failed,
+    }
+}
+
+/// Applies writes in one synced transaction on the writer's connection.
+fn write(
+    shared: &Shared,
+    conn: &mut Connection,
+    writes: &[KvWrite],
+    log: &[(Version, Vec<u8>)],
+) -> Result<(), CommitError> {
     let failed = |error: rusqlite::Error| CommitError::Unavailable(error.to_string());
     let txn = conn.transaction().map_err(failed)?;
-    let mut written = Vec::with_capacity(writes.len());
     for write in writes {
         match write {
             KvWrite::Set(key, value) => {
                 txn.prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?1, ?2)")
                     .and_then(|mut statement| statement.execute(params![key, value]))
                     .map_err(failed)?;
-                written.push(Written::Key(key.clone()));
             }
             KvWrite::Clear(key) => {
                 txn.prepare_cached("DELETE FROM kv WHERE k = ?1")
                     .and_then(|mut statement| statement.execute(params![key]))
                     .map_err(failed)?;
-                written.push(Written::Key(key.clone()));
             }
             KvWrite::ClearRange(range) => {
                 txn.prepare_cached("DELETE FROM kv WHERE k >= ?1 AND k < ?2")
                     .and_then(|mut statement| statement.execute(params![range.start, range.end]))
                     .map_err(failed)?;
-                written.push(Written::Range(range.clone()));
             }
         }
     }
@@ -413,7 +502,11 @@ fn apply(
     // A commit that fails may still have reached the disk. Later
     // transactions treat its writes as made, so they conflict with it.
     let committed = txn.commit();
-    shared.validator.lock().expect("validator").record(written);
+    shared
+        .validator
+        .lock()
+        .expect("validator")
+        .record(|| writes.iter().map(Written::of).collect());
     committed.map_err(|_| CommitError::Unknown)?;
     shared.commits.fetch_add(1, Ordering::Relaxed);
     if let Some(latest) = latest {
@@ -458,5 +551,67 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), checkpointed)
             .await
             .expect("the database file takes the WAL's pages");
+    }
+
+    fn wal_bytes(path: &Path) -> u64 {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        std::fs::metadata(wal).expect("the WAL").len()
+    }
+
+    /// Commits find the WAL written, and under steady commits the thread sends
+    /// them back to its start, so they keep overwriting it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commits_keep_overwriting_a_written_wal() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("store.db");
+        let store = Sqlite::open(&path).expect("opens");
+        assert!(wal_bytes(&path) >= WAL_BYTES, "the WAL starts written");
+        // Small commits without a pause, so a passive checkpoint never finds
+        // the WAL all copied, and the thread gets several turns.
+        let value = vec![7; 2_000];
+        let started = std::time::Instant::now();
+        let mut written = 0;
+        let mut round = 0u32;
+        while written < 3 * WAL_BYTES && started.elapsed() < Duration::from_secs(5) {
+            let mut txn = store.begin().await.expect("begins");
+            txn.set(&round.to_be_bytes(), &value);
+            txn.commit().await.expect("commits");
+            written += 4096;
+            round += 1;
+        }
+        assert!(wal_bytes(&path) < 2 * WAL_BYTES, "{}", wal_bytes(&path));
+    }
+
+    /// What a crash leaves in the WAL survives the next open, which only adds
+    /// to a file that came up short.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commits_in_the_wal_survive_a_crash() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("store.db");
+        let store = Sqlite::open(&path).expect("opens");
+        let mut txn = store.begin().await.expect("begins");
+        txn.set(b"k", b"v");
+        txn.commit().await.expect("commits");
+        // Copies of the files as a crash would leave them, with the WAL cut
+        // to what it holds.
+        let copy = dir.path().join("copy.db");
+        std::fs::copy(&path, &copy).expect("copies the database");
+        let mut from = path.as_os_str().to_owned();
+        from.push("-wal");
+        let mut to = copy.as_os_str().to_owned();
+        to.push("-wal");
+        let mut wal = std::fs::read(from).expect("reads the WAL");
+        wal.truncate(1 << 20);
+        std::fs::write(to, wal).expect("writes the copy");
+        let reopened = Sqlite::open(&copy).expect("opens the copy");
+        assert_eq!(
+            reopened
+                .snapshot_read(vec![KvRead::Get(b"k".to_vec())])
+                .await
+                .expect("reads"),
+            vec![KvResult::Get(Some(b"v".to_vec()))]
+        );
+        drop(store);
     }
 }

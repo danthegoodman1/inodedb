@@ -29,12 +29,12 @@ pub use types::*;
 
 use inodedb_proto as pb;
 use inodedb_proto::inode_db_client::InodeDbClient;
+use inodedb_transport::Channel;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tonic::metadata::{Ascii, MetadataValue};
-use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
 /// The largest message either side sends.
@@ -85,7 +85,7 @@ impl Builder {
     }
 
     pub async fn connect(self) -> Result<Client, Error> {
-        let channel = endpoint(&self.endpoint)?.connect().await?;
+        let channel = Channel::connect(&self.endpoint).await?;
         let auth = format!("Bearer {}", self.key).parse().map_err(|_| {
             Error::Status(Status::invalid_argument(
                 "the key holds characters a header cannot",
@@ -102,13 +102,6 @@ impl Builder {
             retry: self.retry,
         })
     }
-}
-
-fn endpoint(address: &str) -> Result<Endpoint, Error> {
-    Ok(Endpoint::from_shared(address.to_string())?
-        .tcp_nodelay(true)
-        .http2_keep_alive_interval(Duration::from_secs(20))
-        .keep_alive_while_idle(true))
 }
 
 fn rpc(channel: Channel) -> InodeDbClient<Channel> {
@@ -137,26 +130,12 @@ pub struct Client {
 }
 
 /// Whether an attempt's failure may have left the request unanswered
-/// rather than refused.
+/// rather than refused. A connection that fails reads as `Unavailable`.
 pub(crate) fn retriable(status: &Status) -> bool {
     matches!(
         status.code(),
         Code::Unavailable | Code::Unknown | Code::DeadlineExceeded | Code::Cancelled
-    ) || transport(status)
-}
-
-/// Whether the connection failed rather than the server answering, as
-/// when a server going away cuts off HTTP/2 streams in flight, which
-/// arrive as `Internal`.
-fn transport(status: &Status) -> bool {
-    let mut source = std::error::Error::source(status);
-    while let Some(error) = source {
-        if error.is::<tonic::transport::Error>() {
-            return true;
-        }
-        source = error.source();
-    }
-    false
+    )
 }
 
 fn jitter(delay: Duration) -> Duration {
@@ -254,10 +233,10 @@ impl Client {
         if conn.endpoint == address {
             return false;
         }
-        let Ok(endpoint) = endpoint(address) else {
+        let Ok(channel) = Channel::lazy(address) else {
             return false;
         };
-        conn.rpc = rpc(endpoint.connect_lazy());
+        conn.rpc = rpc(channel);
         conn.endpoint = address.to_string();
         true
     }

@@ -274,12 +274,14 @@ enum Work {
 /// The token of the writer's own work, whose answers go to no one.
 const INTERNAL: Token = Token::MAX;
 
+/// A request in the writer's hands. Its work is shared, so holding it for
+/// its answer, or to run again after a failed group, copies nothing.
 #[derive(Clone, Debug)]
 struct Submitted {
     seq: u64,
     token: Token,
     caller: Caller,
-    work: Work,
+    work: Arc<Work>,
 }
 
 /// A batch run and waiting for its group to commit.
@@ -477,6 +479,8 @@ pub struct Writer {
     next_id: u64,
     next_seq: u64,
     actions: Vec<Action>,
+    /// Batches have joined the queue since the last `send`.
+    send_due: bool,
 }
 
 impl Writer {
@@ -543,6 +547,7 @@ impl Writer {
             next_id: 1,
             next_seq: 0,
             actions: Vec::new(),
+            send_due: false,
         };
         let id = writer.id();
         writer.reads.insert(
@@ -895,9 +900,14 @@ impl Writer {
         }
     }
 
-    /// The actions to carry out, in order. The cache evicts here, after
-    /// each input, sparing what reads in progress fetched.
+    /// The actions to carry out, in order. Batches queued since the last
+    /// call go out here as one group, and the cache evicts here, sparing what
+    /// reads in progress fetched. An owner may hand over several inputs
+    /// between calls.
     pub fn drain(&mut self) -> Vec<Action> {
+        if self.send_due {
+            self.send();
+        }
         self.cache.evict(self.spare());
         std::mem::take(&mut self.actions)
     }
@@ -938,9 +948,11 @@ impl Writer {
             seq,
             token,
             caller,
-            work,
+            work: Arc::new(work),
         });
-        self.pump();
+        // Everything queued before the next `drain` commits together.
+        self.run_queue();
+        self.send_due = true;
     }
 
     /// The caller's scope under the committed keys, if it holds `need`.
@@ -983,6 +995,35 @@ impl Writer {
                 self.send();
             }
         }
+    }
+
+    /// The answer to a query the cache holds, as of `now`, or None when the
+    /// query needs `query`: the writer isn't ready or its lease has lapsed,
+    /// the floor is past the committed version, the key is refused, or the
+    /// cache lacks a record. It changes nothing, so an owner can run it on
+    /// any thread between the writer's other calls. A read answered here
+    /// costs no trip to the thread that runs the writer.
+    pub fn answer_cached(
+        &self,
+        caller: &Caller,
+        query: &Query,
+        at_least: Version,
+        now: Millis,
+    ) -> Option<Answer> {
+        let now = now.max(self.now);
+        let fresh = self.releasing.is_none()
+            && self
+                .renewed_at
+                .is_some_and(|at| now < at + self.config.writer_lease);
+        if self.phase != Phase::Ready || !fresh || at_least > self.version {
+            return None;
+        }
+        let scope = auth::authorize(&self.cache, caller, now, Grant::Read).ok()?;
+        let result = query::run(&self.cache, scope.root, query).ok()?;
+        Some(Answer::Query {
+            version: self.version,
+            result,
+        })
     }
 
     fn answer(&mut self, token: Token, answer: Answer) {
@@ -1066,6 +1107,12 @@ impl Writer {
     /// Runs queued batches until one needs a read or the queue empties,
     /// then commits whatever is ready.
     fn pump(&mut self) {
+        self.run_queue();
+        self.send();
+    }
+
+    /// Runs queued batches until one needs a read or the queue empties.
+    fn run_queue(&mut self) {
         while self.phase == Phase::Ready && self.blocked.is_none() {
             let Some(sub) = self.queue.pop_front() else {
                 break;
@@ -1082,7 +1129,6 @@ impl Writer {
                 }
             }
         }
-        self.send();
     }
 
     /// `reads`, which the batch at the queue's front needs, and what the
@@ -1102,7 +1148,7 @@ impl Writer {
             if wanted.len() >= exec::MAX_READS {
                 break;
             }
-            let Work::Batch(batch) = &sub.work else {
+            let Work::Batch(batch) = &*sub.work else {
                 continue;
             };
             let cost = batch.ops.len().max(1);
@@ -1149,7 +1195,7 @@ impl Writer {
     }
 
     fn prepare(&mut self, sub: &Submitted) -> Result<(), Vec<Read>> {
-        let need = match sub.work {
+        let need = match *sub.work {
             Work::Batch(_) | Work::Ack(_) | Work::Reap(..) => Grant::Write,
             Work::Key(_) => Grant::Admin,
             Work::Lease(..) => Grant::Read,
@@ -1170,7 +1216,7 @@ impl Writer {
                 return Ok(());
             }
         };
-        match &sub.work {
+        match &*sub.work {
             Work::Batch(batch) => self.prepare_batch(sub, batch, &scope),
             Work::Key(op) => self.prepare_key(sub, op, &scope),
             Work::Lease(id, record) => {
@@ -1431,6 +1477,7 @@ impl Writer {
     }
 
     fn send(&mut self) {
+        self.send_due = false;
         if self.phase != Phase::Ready {
             return;
         }
@@ -1452,9 +1499,8 @@ impl Writer {
         {
             self.reaping = true;
             self.reaped_at = self.now;
-            // Queuing it pumps, which sends.
             self.enqueue(INTERNAL, Caller::Trusted(ROOT), Work::Reap(at, top));
-            return;
+            return self.send();
         }
         if self.in_flight.is_some() {
             return;
@@ -1482,8 +1528,9 @@ impl Writer {
                 ))));
         }
         group.expiring = expiring;
-        for prepared in &group.batches {
-            writes.extend(prepared.writes.clone());
+        // A group goes out once: one that fails runs its batches again.
+        for prepared in &mut group.batches {
+            writes.extend(std::mem::take(&mut prepared.writes));
         }
         // Heartbeats and release reach storage with the next group.
         group.leases = self.leases.take_writes(LEASE_BYTES);
@@ -1676,7 +1723,9 @@ impl Writer {
     /// to a group's share. The cache forgets them now, so a retry runs
     /// again rather than reading a record about to go.
     fn take_expired(&mut self) -> Vec<(Millis, u128)> {
-        if self.now < self.expiring_from {
+        if self.now < self.expiring_from
+            || self.expiries.first().is_none_or(|(at, _)| *at > self.now)
+        {
             return Vec::new();
         }
         let fetching: BTreeSet<u128> = self
@@ -1718,7 +1767,7 @@ impl Writer {
             }
             self.cache.apply(&prepared.delta);
             self.version = prepared.version;
-            if let Work::Ack(entries) = &prepared.sub.work {
+            if let Work::Ack(entries) = &*prepared.sub.work {
                 self.leases.acknowledged(entries);
             }
             for ino in &prepared.delta.detached {

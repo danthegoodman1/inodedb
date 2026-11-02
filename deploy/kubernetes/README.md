@@ -11,6 +11,13 @@ default ([Fencing](../../DESIGN.md#fencing)).
 production uses a cluster the FoundationDB operator runs, whose cluster
 file it publishes as the `fdb-cluster` ConfigMap.
 
+Each server asks that the node's cores stay out of deep idle states, which
+takes write access to `/dev/cpu_dma_latency`. Without it a server runs as usual,
+and each thread a request wakes on an idle core pays that core's exit latency,
+190 µs on an EC2 i7ie ([Idle states](../../BENCHMARKS.md#idle-states)). On nodes
+you control, run the node's `tuned` under its `latency-performance` profile, or
+give the pod the device.
+
 ## On a local kind cluster
 
 ```sh

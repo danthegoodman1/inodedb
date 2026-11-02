@@ -1,0 +1,4 @@
+[env]
+# SQLite syncs its WAL with fdatasync rather than fsync, which on gp3 costs half
+# as much (`BENCHMARKS.md`, "Devices"). Apple's builds of it ignore this.
+LIBSQLITE3_FLAGS = "-DHAVE_FDATASYNC=1"
