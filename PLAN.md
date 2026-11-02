@@ -480,6 +480,7 @@ Status ledger:
 | Complete | Work | S4G: Startup preload | `crates/core/src/preload.rs`; `preload::*` scripted scenarios, `api::preloaded_servers_answer_stats_without_reads` on every backend, preloading writers in the swarm over 10,000 seeds; seven mutants caught. `cache.preload` is on by default. On the Mac, a tree of 10,231 inodes preloads in 5-9 ms; 16 clients' first stats of 10,000 files run at 92,000-99,000/s as a preloading server starts, against 40,000-45,000/s cold on SQLite and RocksDB; one client's puts into a complete directory gain about 12%. Gap: standbys do not preload. |
 | Incomplete | Work | S4H: Warm reads off the engine task | Missing: a profile on Linux of one-client stats (0.3 ms on EC2 against 0.08 ms on the Mac) and of the 64-client ceiling near 235,000/s. |
 | Incomplete | Test | S4I: One-client commit trace | Missing: where a RocksDB or SQLite commit spends 1.35-1.6 ms against a 0.32 ms device sync on EC2. |
+| Complete | Test | Full mutants run after S4G | `scripts/mutants` at 264c9e3: all 137 caught. |
 | Incomplete | Gate | EC2 benchmarks after S4A-S4F | Missing: a rerun of `scripts/ec2/bench`; `README.md` and `BENCHMARKS.md` show the numbers from before. It should also show why the memory backend's cold reads ran at 28,000-31,000/s there, half SQLite's, when on the Mac they run at 77,000/s, twice SQLite's. |
 
 ## Phase 8: ClickHouse Metadata Type
