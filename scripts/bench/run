@@ -23,6 +23,17 @@ ops=target/release/examples/ops
 commits=target/release/examples/commits
 expiry=target/release/examples/expiry
 
+# Runs a benchmark once per backend, each in its own process, and joins their
+# tables under one header. In one process, a backend inherits the allocator's
+# state and any threads of the backends before it.
+each_backend() { # the benchmark and its arguments, ahead of the backend
+  local backend first=1
+  for backend in ${backends//,/ }; do
+    "$@" "$backend" 2>/dev/null | grep '^|' | tail -n +$((first ? 1 : 3))
+    first=0
+  done
+}
+
 # Whether the machine has idle states that take over a microsecond to leave.
 deep_idle_exists() {
   local state
@@ -138,9 +149,9 @@ run() { # device mount
   mkdir -p "$out" "$mount/tmp"
   if fdb_wanted; then fdb_on "$mount" "$out"; fi
   fio_sync "$mount" "$out" | tee "$out/fio.txt"
-  TMPDIR="$mount/tmp" "$ops" 5 "$backends" 2>/dev/null | grep '^|' | tee "$out/ops.md"
-  TMPDIR="$mount/tmp" "$commits" 3 "$backends" 2>/dev/null | grep '^|' | tee "$out/commits.md"
-  TMPDIR="$mount/tmp" "$expiry" 60 60 "$backends" 2>/dev/null | grep '^|' | tee "$out/expiry.md"
+  TMPDIR="$mount/tmp" each_backend "$ops" 5 | tee "$out/ops.md"
+  TMPDIR="$mount/tmp" each_backend "$commits" 3 | tee "$out/commits.md"
+  TMPDIR="$mount/tmp" each_backend "$expiry" 60 60 | tee "$out/expiry.md"
 }
 
 mkdir -p ~/results
@@ -155,6 +166,6 @@ if mountpoint -q /mnt/ebs; then run ebs /mnt/ebs; fi
 if deep_idle_exists; then
   deep_idle_off 0
   if fdb_wanted; then fdb_on /mnt/nvme ~/results/nvme; fi
-  TMPDIR=/mnt/nvme/tmp "$ops" 5 "$backends" 2>/dev/null | grep '^|' | tee ~/results/nvme/ops-default-idle.md
+  TMPDIR=/mnt/nvme/tmp each_backend "$ops" 5 | tee ~/results/nvme/ops-default-idle.md
 fi
 touch ~/results/done

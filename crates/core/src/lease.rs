@@ -241,7 +241,8 @@ impl Leases {
     }
 
     /// Takes the leases and release record storage holds, each lease with
-    /// a fresh time to live, at a store's committed version.
+    /// a fresh time to live, at a store's committed version. What storage
+    /// holds replaces all an earlier start of this writer held and queued.
     pub fn load(
         &mut self,
         stored: Vec<(LeaseId, StoredLease)>,
@@ -249,6 +250,11 @@ impl Leases {
         now: Millis,
         committed: Version,
     ) {
+        self.held.clear();
+        self.expiries.clear();
+        self.oldest = Multiset::default();
+        self.positions = Multiset::default();
+        self.writes.clear();
         let release = release.unwrap_or_default();
         self.next = self.next.max(release.next_lease);
         for (id, lease) in stored {

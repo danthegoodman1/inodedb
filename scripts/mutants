@@ -159,6 +159,43 @@ MUTANTS = [
         [(WRITER, ".take_while(|(at, _)| *at <= self.now)", ".take_while(|_| false)")],
     ),
     (
+        "an expired record leaves its later parts",
+        [(WRITER, "for part in 0..parts {\n                writes.clear(keys::request(*id, part));", "for part in 0..parts.min(1) {\n                writes.clear(keys::request(*id, part));")],
+    ),
+    (
+        "a writer forgets the parts of a record it wrote",
+        [(WRITER, """if parts > 1 {
+                    self.long_records.insert(*id, parts);
+                }""", "let _ = parts;")],
+    ),
+    (
+        "an expiry key leaves out its record's parts",
+        [(WRITER, "writes.set(keys::request_expiry(at, id), keys::encode_parts(parts));", "writes.set(keys::request_expiry(at, id), Vec::new());")],
+    ),
+    (
+        "a restarted writer forgets a record's parts",
+        [(WRITER, """if parts > 1 {
+                self.long_records.insert(id, parts);
+            }""", "let _ = parts;")],
+    ),
+    (
+        "a failed group forgets the parts it was deleting",
+        [(WRITER, """for record in &expired {
+            self.expiries.remove(record);""", """for record in &expired {
+            self.long_records.remove(&record.1);
+            self.expiries.remove(record);""")],
+    ),
+    (
+        "a record's part count outlives the record",
+        [(WRITER, """for (_, id) in &group.expiring {
+            self.long_records.remove(id);
+        }""", "")],
+    ),
+    (
+        "fsck takes any expiry key for a long record",
+        [(FSCK, "Some([value]) if keys::decode_parts(value) == Some(parts.len() as u16) => {}", "Some([_]) if !parts.is_empty() => {}")],
+    ),
+    (
         "expired records are deleted after the group's writes",
         [(WRITER, """group.expiring = expiring;
         // A group goes out once: one that fails runs its batches again.
@@ -214,6 +251,12 @@ MUTANTS = [
     (
         "a directory that leaves alive keeps what lies beneath it",
         [(FEED, "prune = true;", "")],
+    ),
+    (
+        "a child gained by a directory leaving in the same commit stays in sight",
+        [(FEED, """if directory_left {
+                gained.clear();
+            }""", "let _ = (directory_left, &mut gained);")],
     ),
     (
         "what leaves a subtree stays cached",
@@ -554,6 +597,14 @@ MUTANTS = [
     (
         "a reopened lease keeps the deletion of its earlier run",
         [(LEASE, "self.writes.remove(&id);\n            self.insert(", "self.insert(")],
+    ),
+    (
+        "a writer that starts over keeps the lease deletions it queued",
+        [(LEASE, "        self.writes.clear();\n        let release = release.unwrap_or_default();", "        let release = release.unwrap_or_default();")],
+    ),
+    (
+        "a writer that starts over keeps leases gone from storage",
+        [(LEASE, "        self.held.clear();\n        self.expiries.clear();\n        self.oldest = Multiset::default();\n        self.positions = Multiset::default();\n", "")],
     ),
     (
         "a restarted writer reuses lease ids",

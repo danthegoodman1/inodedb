@@ -4,14 +4,14 @@
 
 InodeDB is a transactional metadata database whose keyspace is a tree of inodes, so renaming a directory rewrites one entry however much lies beneath it. It is built for systems that keep their data in object storage and commit by renaming directories, such as a ClickHouse object-storage disk, with InodeDB holding the file tree and S3 the blobs. Clients speak gRPC to a Rust server. One server writes at a time, keeping its records in SQLite, RocksDB, [lionturtle](https://github.com/danthegoodman1/lionturtle) or FoundationDB behind one storage trait.
 
-Every commit goes through the writer's in-memory cache, so the writer answers reads from memory, at the same rate on every backend: 390,000 a second from 64 clients on a 16-core EPYC 4564P, and in 23 µs for one client. Writes gather into one storage transaction at a time, so with every store on one NVMe drive, 64 clients create 85,000 files a second on lionturtle, 77,000 on RocksDB, 37,000 on SQLite and 22,000 on FoundationDB. [BENCHMARKS.md](BENCHMARKS.md) has every result and the commands to reproduce them, and [DESIGN.md](DESIGN.md) is the design.
+Every commit goes through the writer's in-memory cache, so the writer answers reads from memory, at the same rate on every backend: 390,000 a second from 64 clients on a 16-core EPYC 4564P, and in 23 µs for one client. Writes gather into one storage transaction at a time, so with every store on one NVMe drive, 64 clients create 84,000 files a second on lionturtle, 78,000 on RocksDB, 37,000 on SQLite and 20,000 on FoundationDB. [BENCHMARKS.md](BENCHMARKS.md) has every result and the commands to reproduce them, and [DESIGN.md](DESIGN.md) is the design.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/ops-dark.png">
-  <img src="docs/images/ops-light.png" alt="Operations a second through gRPC at 64 clients on a 16-core EPYC 4564P, every store on one NVMe drive, for memory, SQLite, RocksDB, lionturtle and FoundationDB: stat by path 391,408, 386,452, 405,771, 400,452 and 401,548; read a 100-byte value 396,139, 387,216, 389,128, 390,745 and 386,393; list 100 entries 174,657, 176,427, 172,275, 165,375 and 169,371; put a new 100-byte file 84,763, 37,048, 76,684, 85,133 and 21,513; rename a file 101,990, 43,643, 88,521, 108,677 and 24,298; nine stats for each put 305,159, 243,786, 287,207, 278,286 and 180,604.">
+  <img src="docs/images/ops-light.png" alt="Operations a second through gRPC at 64 clients on a 16-core EPYC 4564P, every store on one NVMe drive, for memory, SQLite, RocksDB, lionturtle and FoundationDB: stat by path 392,246, 395,010, 385,828, 391,561 and 392,963; read a 100-byte value 391,525, 384,247, 382,179, 385,833 and 384,266; list 100 entries 164,491, 168,794, 171,567, 160,286 and 167,933; put a new 100-byte file 87,239, 36,512, 78,083, 83,742 and 19,764; rename a file 100,868, 42,461, 91,475, 110,152 and 22,882; nine stats for each put 300,787, 241,484, 282,664, 280,302 and 175,813.">
 </picture>
 
-**Status: experimental.** InodeDB passes its storage and API conformance suites on memory, SQLite, RocksDB, lionturtle and FoundationDB, a 100,000-seed simulation sweep, and a run of 200 planted bugs, and has run in tests and benchmarks only. The ClickHouse integration is unbuilt.
+**Status: experimental.** InodeDB passes its storage and API conformance suites on memory, SQLite, RocksDB, lionturtle and FoundationDB, a 100,000-seed simulation sweep, and a run of 210 planted bugs, and has run in tests and benchmarks only. The ClickHouse integration is unbuilt.
 
 ## Features
 
@@ -33,32 +33,32 @@ Every commit goes through the writer's in-memory cache, so the writer answers re
 
 **Reads with no hop.** A read the cache holds answers on the request's own task, under a shared lock on the writer, so reads scale with the server's threads. `crates/transport` drives HTTP/2 directly: a reply's headers and data leave in one write, and a request whose answer is ready needs no task of its own.
 
-**Commits that overwrite.** SQLite and RocksDB write their log files when a store opens, and lionturtle zero-fills each log segment ahead of its writes, so a durable write costs one 4 KiB write and no file-system journal commit: 24 µs on an enterprise NVMe drive. On lionturtle, one client's put takes 105 µs.
+**Commits that overwrite.** SQLite and RocksDB write their log files when a store opens, and lionturtle zero-fills each log segment ahead of its writes, so a durable write costs one 4 KiB write and no file-system journal commit: 24 µs on an enterprise NVMe drive. On lionturtle, one client's put takes 101 µs.
 
-**A warm start.** A starting writer or standby reads the tree into its cache while it serves, directories first and up to its budget, so 16 clients stat 117,000 to 280,000 files a second as a server starts.
+**A warm start.** A starting writer or standby reads the tree into its cache while it serves, directories first and up to its budget, so 16 clients stat 220,000 to 253,000 files a second as a server starts.
 
-**Checked by deterministic simulation.** Each seed runs random batches from several clients through writer crashes, storage faults and stalls, network loss and reordering, drifting clocks, and standby takeovers, and checks every answer against a naive path model. A failing seed replays exactly, and each of 200 planted bugs must be caught by some test.
+**Checked by deterministic simulation.** Each seed runs random batches from several clients through writer crashes, storage faults and stalls, network loss and reordering, drifting clocks, and standby takeovers, and checks every answer against a naive path model. A failing seed replays exactly, and each of 210 planted bugs must be caught by some test.
 
 ## Performance
 
-These runs used a Latitude.sh `f4.metal.medium` (16-core EPYC 4564P, 187 GiB), with every store on one Micron 7450 NVMe drive, which has power-loss protection. FoundationDB ran one process per role on its `ssd-2` engine, with its data on the same drive. The server ran on 8 threads and the clients on 8 more, each client on its own connection. The tree held 10,000 files of 100 bytes.
+These runs used a Latitude.sh `f4.metal.medium` (16-core EPYC 4564P, 187 GiB), with every store on one Micron NVMe drive that reports no volatile write cache. FoundationDB ran one process per role on its `ssd-2` engine, with its data on the same drive. The server ran on 8 threads and the clients on 8 more, each client on its own connection. The tree held 10,000 files of 100 bytes. Each backend ran in its own process, and each cell is the median of three passes.
 
 Operations a second at 64 clients, on a warm cache:
 
 | Operation | memory | SQLite | RocksDB | lionturtle | FoundationDB |
 |---|--:|--:|--:|--:|--:|
-| Stat | 391,408 | 386,452 | 405,771 | 400,452 | 401,548 |
-| Read a 100-byte value | 396,139 | 387,216 | 389,128 | 390,745 | 386,393 |
-| List 100 entries | 174,657 | 176,427 | 172,275 | 165,375 | 169,371 |
-| Put a new 100-byte file | 84,763 | 37,048 | 76,684 | 85,133 | 21,513 |
-| Rename a file | 101,990 | 43,643 | 88,521 | 108,677 | 24,298 |
-| Nine stats for each put | 305,159 | 243,786 | 287,207 | 278,286 | 180,604 |
+| Stat | 392,246 | 395,010 | 385,828 | 391,561 | 392,963 |
+| Read a 100-byte value | 391,525 | 384,247 | 382,179 | 385,833 | 384,266 |
+| List 100 entries | 164,491 | 168,794 | 171,567 | 160,286 | 167,933 |
+| Put a new 100-byte file | 87,239 | 36,512 | 78,083 | 83,742 | 19,764 |
+| Rename a file | 100,868 | 42,461 | 91,475 | 110,152 | 22,882 |
+| Nine stats for each put | 300,787 | 241,484 | 282,664 | 280,302 | 175,813 |
 
 Latency, for reads and writes, at one client's p50 and 64 clients' p99:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/latency-dark.png">
-  <img src="docs/images/latency-light.png" alt="Latency in ms on a 16-core EPYC 4564P, every store on one NVMe drive, for memory, SQLite, RocksDB, lionturtle and FoundationDB, each panel on its own linear scale. Reads, one client, p50: stat 0.023, 0.023, 0.023, 0.023 and 0.023; read 0.023, 0.023, 0.023, 0.023 and 0.023; list 100 entries 0.057, 0.057, 0.057, 0.057 and 0.056. Reads, 64 clients, p99: stat 0.282, 0.300, 0.297, 0.285 and 0.285; read 0.287, 0.288, 0.290, 0.294 and 0.280; list 0.747, 0.730, 0.775, 0.812 and 0.798. Writes, one client, p50: put a new file 0.048, 0.171, 0.113, 0.105 and 1.004; rename 0.062, 0.156, 0.112, 0.096 and 1.004. Writes, 64 clients, p99: put 1.447, 3.250, 1.151, 1.181 and 3.690; rename 1.035, 1.866, 0.942, 1.062 and 3.513.">
+  <img src="docs/images/latency-light.png" alt="Latency in ms on a 16-core EPYC 4564P, every store on one NVMe drive, for memory, SQLite, RocksDB, lionturtle and FoundationDB, each panel on its own linear scale. Reads, one client, p50: stat 0.023, 0.023, 0.023, 0.023 and 0.023; read 0.023, 0.023, 0.023, 0.023 and 0.023; list 100 entries 0.057, 0.057, 0.057, 0.058 and 0.057. Reads, 64 clients, p99: stat 0.293, 0.287, 0.287, 0.283 and 0.291; read 0.297, 0.293, 0.289, 0.287 and 0.289; list 0.814, 0.783, 0.753, 0.836 and 0.799. Writes, one client, p50: put a new file 0.049, 0.167, 0.109, 0.101 and 1.004; rename 0.047, 0.155, 0.108, 0.098 and 1.003. Writes, 64 clients, p99: put 1.356, 3.361, 1.308, 1.294 and 3.930; rename 1.037, 1.997, 0.953, 1.053 and 3.674.">
 </picture>
 
 p50 latency for one client, in ms:
@@ -66,32 +66,32 @@ p50 latency for one client, in ms:
 | Operation | memory | SQLite | RocksDB | lionturtle | FoundationDB |
 |---|--:|--:|--:|--:|--:|
 | Stat | 0.023 | 0.023 | 0.023 | 0.023 | 0.023 |
-| List 100 entries | 0.057 | 0.057 | 0.057 | 0.057 | 0.056 |
-| Put a new 100-byte file | 0.048 | 0.171 | 0.113 | 0.105 | 1.004 |
-| Rename a file | 0.062 | 0.156 | 0.112 | 0.096 | 1.004 |
+| List 100 entries | 0.057 | 0.057 | 0.057 | 0.058 | 0.057 |
+| Put a new 100-byte file | 0.049 | 0.167 | 0.109 | 0.101 | 1.004 |
+| Rename a file | 0.047 | 0.155 | 0.108 | 0.098 | 1.003 |
 
-Reads cost the same on every backend because the writer answers them from memory, and nearly all of one client's 23 µs is the gRPC round trip. Writes cost a durable commit, and a put first reads storage once to learn its new name is absent. lionturtle is the fastest durable backend for writes: over four passes each, it led RocksDB by 11% on puts and 21% on renames at 64 clients, and its puts match the memory backend's, which mark the writer's own limit. RocksDB led the mixed workload by 3%. FoundationDB's 1.0 ms is the window in which its commit proxy gathers transactions; with that window at 0.1 ms, a put took 0.59 ms.
+Reads cost the same on every backend because the writer answers them from memory, and nearly all of one client's 23 µs is the gRPC round trip. Writes cost a durable commit, and a put first reads storage once to learn its new name is absent. lionturtle is the fastest durable backend for writes: over six alternating passes, it won every pass against RocksDB on puts and renames, by 8% and 18% at 64 clients and by 11% and 10% at one client. Its puts come within 4% of the memory backend's, and its renames pass them. Warm reads and the mixed workload ran level, and RocksDB kept the lower write p99 at 64 clients: 0.94 ms against 1.08 ms on renames. FoundationDB's 1.0 ms is the window in which its commit proxy gathers transactions; with that window at 0.1 ms, a put took 0.58 ms.
 
-Every batch leaves a request record, and once records reach their lifetime, each group deletes as many as it writes. A server under steady load stays in that state, and it separates the backends:
+Every batch leaves a request record, and once records reach their lifetime, each group deletes as many as it writes. A server under steady load stays in that state. Each group names every key it deletes, which keeps the cost to 8% to 21% of the rate:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/expiry-dark.png">
-  <img src="docs/images/expiry-light.png" alt="Commits at 64 clients on a 16-core EPYC 4564P, before request records expire and while they do. Batches a second: memory 43,716 and 41,481; SQLite 26,775 and 19,946; RocksDB 35,033 and 2,013; lionturtle 36,726 and 24,862; FoundationDB 18,967 and 16,144. p99 latency in ms: memory 2.26 and 2.66; SQLite 5.42 and 27.06; RocksDB 2.53 and 129.97; lionturtle 2.47 and 12.17; FoundationDB 3.99 and 4.78.">
+  <img src="docs/images/expiry-light.png" alt="Commits at 64 clients on a 16-core EPYC 4564P, before request records expire and while they do. Batches a second: memory 44,226 and 40,711; SQLite 26,530 and 21,068; RocksDB 36,978 and 32,751; lionturtle 37,828 and 33,430; FoundationDB 19,363 and 16,908. p99 latency in ms: memory 2.26 and 2.62; SQLite 4.99 and 26.83; RocksDB 2.44 and 2.79; lionturtle 2.44 and 2.86; FoundationDB 3.93 and 4.60.">
 </picture>
 
 | 64 clients, batches a second | memory | SQLite | RocksDB | lionturtle | FoundationDB |
 |---|--:|--:|--:|--:|--:|
-| Before records expire | 43,716 | 26,775 | 35,033 | 36,726 | 18,967 |
-| While records expire | 41,481 | 19,946 | 2,013 | 24,862 | 16,144 |
+| Before records expire | 44,226 | 26,530 | 36,978 | 37,828 | 19,363 |
+| While records expire | 40,711 | 21,068 | 32,751 | 33,430 | 16,908 |
 
-Grouping hides most of a sync's cost: at 128 clients it multiplies FoundationDB's commit throughput by 30, even on a drive this fast. On gp3 at its maximum provisioning, where a sync costs 28 times this drive's, it multiplied SQLite's, RocksDB's and FoundationDB's by 17 to 18 ([Network storage](BENCHMARKS.md#network-storage)). Failover takes the writer's lease plus a margin: 6.2 s by default on FoundationDB, and 0.9 s with a 600 ms lease. A clean stop hands the store to a standby at once.
+Grouping hides most of a sync's cost: at 128 clients it multiplies FoundationDB's commit throughput by 28, even on a drive this fast. On gp3 at its maximum provisioning, where a sync costs 28 times this drive's, it multiplied SQLite's, RocksDB's and FoundationDB's by 17 to 18 ([Network storage](BENCHMARKS.md#network-storage)). Failover takes the writer's lease plus a margin: 6.2 s by default on FoundationDB, and 0.9 s with a 600 ms lease. A clean stop hands the store to a standby at once.
 
 ### Trade-offs
 
-- **One writer.** Every write goes through one server, so write throughput is one machine's: 85,000 puts a second at 64 clients on the memory backend or lionturtle, and each group waits a full commit, so about 30,000 batches a second at most on FoundationDB.
-- **Cold starts.** A restarted server reads storage for what its cache lacks until its preload finishes. A tree larger than `cache.tree_bytes` stays partly cold: on FoundationDB, 16 clients stat 34,000 files a second on a cold cache, and 64 clients stat 400,000 on a warm one. A standby that takes over brings its cache with it.
+- **One writer.** Every write goes through one server, so write throughput is one machine's: 84,000 to 87,000 puts a second at 64 clients on lionturtle and the memory backend, and each group waits a full commit, so about 28,000 batches a second at most on FoundationDB.
+- **Cold starts.** A restarted server reads storage for what its cache lacks until its preload finishes. A tree larger than `cache.tree_bytes` stays partly cold: on FoundationDB, 16 clients stat 32,000 files a second on a cold cache, and 64 clients stat 390,000 on a warm one. A standby that takes over brings its cache with it.
 - **Memory.** The cache charges each record at least what it holds, a cached file about 980 bytes, so the default `tree_bytes` of 1 GiB holds about a million files in at most 1 GiB. Raising the `[cache]` budgets keeps more of the tree in memory.
-- **Expiring records.** RocksDB's rate falls 94% once records begin to expire, which is 10 minutes in by default, and lionturtle's falls 32%, since it reads each record's range to delete it ([Expiring records](BENCHMARKS.md#expiring-records)).
+- **Expiring records.** Once records begin to expire, which is 10 minutes in by default, each group also deletes as many as it writes. That costs lionturtle and RocksDB about 12%, and SQLite 21% with its p99 at 27 ms ([Expiring records](BENCHMARKS.md#expiring-records)).
 - **Network storage.** On EC2's gp3, one client's put took 2.2 to 8.4 times as long as on local NVMe, and 64 clients' puts ran at about a third to a half the rate. lionturtle hasn't run there.
 - **Disk at open.** Opening a store writes its log files: 128 MiB on SQLite and 235 MiB on RocksDB. They stay at about that size whatever the store holds. lionturtle fills its log as it goes.
 - **A failed write on lionturtle.** It stops the store, which answers `Unavailable` until the server restarts and recovers from its log.

@@ -359,10 +359,9 @@ fn error(outcome: &Outcome) -> Option<Error> {
     }
 }
 
-/// Inode ids near 2^62 make each outcome long enough that ten thousand of
-/// them pass one record part.
-#[test]
-fn a_long_result_spans_record_parts() {
+/// A store whose next inode id, near 2^62, makes each outcome long enough that
+/// ten thousand of them pass one record part.
+fn a_store_of_long_outcomes() -> Memory {
     let h = Harness::new();
     let head = h.storage.head_now().expect("a head");
     let mut writes = WriteSet::default();
@@ -373,14 +372,84 @@ fn a_long_result_spans_record_parts() {
         h.storage.commit_now(Some(&head), &writes),
         CommitOutcome::Committed
     );
-    let mut h = Harness::with(h.storage.clone(), Config::default());
-    let batch = Batch {
+    h.storage.clone()
+}
+
+fn a_long_batch(request_id: u128) -> Batch {
+    Batch {
         ops: (0..10_000)
             .map(|index| mkdir(&format!("d{index}")))
             .collect(),
-        request_id: 63,
+        request_id,
         ..Batch::default()
+    }
+}
+
+/// Every part of a long record goes when its lifetime ends, by the keys its
+/// writer remembers, and the writer forgets the count.
+#[test]
+fn a_long_record_goes_whole() {
+    let ttl: Millis = 10_000;
+    let config = Config {
+        request_ttl: ttl,
+        ..Config::default()
     };
+    let mut h = Harness::with(a_store_of_long_outcomes(), config);
+    assert!(h.commit(a_long_batch(63)).committed);
+    assert!(records(&h.storage)[&63] > 1, "the record spans parts");
+    assert_eq!(h.writer.long_records(), 1);
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+    h.tick(ttl);
+    h.ops([mkdir("after")]);
+    assert!(!records(&h.storage).contains_key(&63), "every part went");
+    assert_eq!(h.writer.long_records(), 0);
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// A restarted writer learns a record's parts from its expiry key.
+#[test]
+fn a_restarted_writer_deletes_every_part() {
+    let ttl: Millis = 10_000;
+    let config = Config {
+        request_ttl: ttl,
+        ..Config::default()
+    };
+    let mut h = Harness::with(a_store_of_long_outcomes(), config.clone());
+    assert!(h.commit(a_long_batch(63)).committed);
+    let mut restarted = Harness::with(h.storage.clone(), config);
+    assert_eq!(restarted.writer.long_records(), 1);
+    restarted.tick(ttl);
+    restarted.ops([mkdir("after")]);
+    assert!(!records(&restarted.storage).contains_key(&63));
+    assert!(restarted.fsck().is_empty(), "{:?}", restarted.fsck());
+}
+
+/// A group that fails puts its deletions back, with what they need to delete
+/// every part.
+#[test]
+fn a_failed_group_keeps_a_long_records_parts() {
+    let ttl: Millis = 10_000;
+    let config = Config {
+        request_ttl: ttl,
+        ..Config::default()
+    };
+    let mut d = Driver::new(a_store_of_long_outcomes(), config, 1);
+    let token = d.submit_batch(a_long_batch(63));
+    d.settle(true, CommitOutcome::Committed);
+    assert!(d.committed(token).committed);
+    d.writer.set_now(1_000 + ttl + 1);
+    let blocker = d.submit([mkdir("blocker")]);
+    d.settle(false, CommitOutcome::Failed);
+    d.settle(true, CommitOutcome::Committed);
+    assert!(d.committed(blocker).committed);
+    assert!(!records(&d.storage).contains_key(&63), "every part went");
+    assert!(d.fsck().is_empty(), "{:?}", d.fsck());
+}
+
+#[test]
+fn a_long_result_spans_record_parts() {
+    let mut h = Harness::with(a_store_of_long_outcomes(), Config::default());
+    let batch = a_long_batch(63);
     let first = h.commit(batch.clone());
     assert!(first.committed && first.outcomes.iter().all(Outcome::applied));
     assert!(records(&h.storage)[&63] > 1, "the record spans parts");
@@ -476,7 +545,7 @@ fn a_record_written_again_survives_its_old_records_deletion() {
         writes
             .writes
             .iter()
-            .any(|write| matches!(write, KvWrite::ClearRange(_)))
+            .any(|write| matches!(write, KvWrite::Clear(key) if *key == keys::request(85, 0)))
     );
     assert!(d.committed(blocker).committed);
     assert!(

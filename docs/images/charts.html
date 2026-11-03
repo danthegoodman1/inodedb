@@ -151,7 +151,7 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 
   <div class="card hero" id="expiry">
     <div class="hero-head">
-      <h1>As request records expire, lionturtle keeps <em>25k</em> batches a second and RocksDB falls to 2k</h1>
+      <h1>As request records expire, RocksDB and lionturtle keep <em>33k</em> batches a second</h1>
       <div class="hero-meta">
         <span><b>gRPC</b> · 64 clients, one file per batch</span>
         <span>Records last 60 seconds, then each group deletes them</span>
@@ -172,12 +172,12 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 const D = {
   // BENCHMARKS.md, "Operations": operations a second at 64 clients for memory, SQLite, RocksDB, lionturtle, FoundationDB
   ops: [
-    ["Stat", "by path", 391408, 386452, 405771, 400452, 401548],
-    ["Read", "a 100-byte value", 396139, 387216, 389128, 390745, 386393],
-    ["List", "100 entries with attributes", 174657, 176427, 172275, 165375, 169371],
-    ["Put", "a new 100-byte file", 84763, 37048, 76684, 85133, 21513],
-    ["Rename", "a file", 101990, 43643, 88521, 108677, 24298],
-    ["Mixed", "nine stats for each put", 305159, 243786, 287207, 278286, 180604],
+    ["Stat", "by path", 392246, 395010, 385828, 391561, 392963],
+    ["Read", "a 100-byte value", 391525, 384247, 382179, 385833, 384266],
+    ["List", "100 entries with attributes", 164491, 168794, 171567, 160286, 167933],
+    ["Put", "a new 100-byte file", 87239, 36512, 78083, 83742, 19764],
+    ["Rename", "a file", 100868, 42461, 91475, 110152, 22882],
+    ["Mixed", "nine stats for each put", 300787, 241484, 282664, 280302, 175813],
   ],
   backends: [["memory", "memory"], ["sqlite", "SQLite"], ["rocksdb", "RocksDB"], ["lionturtle", "lionturtle"], ["fdb", "FoundationDB"]],
   // BENCHMARKS.md, "Operations": latency in ms for memory, SQLite, RocksDB, lionturtle, FoundationDB
@@ -185,37 +185,37 @@ const D = {
     ["Reads", "one client, p50", 0.08, [0, 0.02, 0.04, 0.06, 0.08], [
       ["Stat", 0.023, 0.023, 0.023, 0.023, 0.023],
       ["Read", 0.023, 0.023, 0.023, 0.023, 0.023],
-      ["List", 0.057, 0.057, 0.057, 0.057, 0.056],
+      ["List", 0.057, 0.057, 0.057, 0.058, 0.057],
     ]],
     ["Reads", "64 clients, p99", 1, [0, 0.25, 0.5, 0.75, 1], [
-      ["Stat", 0.282, 0.300, 0.297, 0.285, 0.285],
-      ["Read", 0.287, 0.288, 0.290, 0.294, 0.280],
-      ["List", 0.747, 0.730, 0.775, 0.812, 0.798],
+      ["Stat", 0.293, 0.287, 0.287, 0.283, 0.291],
+      ["Read", 0.297, 0.293, 0.289, 0.287, 0.289],
+      ["List", 0.814, 0.783, 0.753, 0.836, 0.799],
     ]],
     ["Writes", "one client, p50", 1.2, [0, 0.3, 0.6, 0.9, 1.2], [
-      ["Put", 0.048, 0.171, 0.113, 0.105, 1.004],
-      ["Rename", 0.062, 0.156, 0.112, 0.096, 1.004],
+      ["Put", 0.049, 0.167, 0.109, 0.101, 1.004],
+      ["Rename", 0.047, 0.155, 0.108, 0.098, 1.003],
     ]],
     ["Writes", "64 clients, p99", 5, [0, 1, 2, 3, 4, 5], [
-      ["Put", 1.447, 3.250, 1.151, 1.181, 3.690],
-      ["Rename", 1.035, 1.866, 0.942, 1.062, 3.513],
+      ["Put", 1.356, 3.361, 1.308, 1.294, 3.930],
+      ["Rename", 1.037, 1.997, 0.953, 1.053, 3.674],
     ]],
   ],
   // BENCHMARKS.md, "Expiring records": before records expire, then while they do, by backend
   expiry: [
     ["Batches a second", "64 clients", 50000, [0, 10000, 20000, 30000, 40000, 50000], [
-      ["memory", 43716, 41481],
-      ["SQLite", 26775, 19946],
-      ["RocksDB", 35033, 2013],
-      ["lionturtle", 36726, 24862],
-      ["FoundationDB", 18967, 16144],
+      ["memory", 44226, 40711],
+      ["SQLite", 26530, 21068],
+      ["RocksDB", 36978, 32751],
+      ["lionturtle", 37828, 33430],
+      ["FoundationDB", 19363, 16908],
     ]],
-    ["Commit latency", "64 clients, p99", 150, [0, 50, 100, 150], [
-      ["memory", 2.26, 2.66],
-      ["SQLite", 5.42, 27.06],
-      ["RocksDB", 2.53, 129.97],
-      ["lionturtle", 2.47, 12.17],
-      ["FoundationDB", 3.99, 4.78],
+    ["Commit latency", "64 clients, p99", 30, [0, 10, 20, 30], [
+      ["memory", 2.26, 2.62],
+      ["SQLite", 4.99, 26.83],
+      ["RocksDB", 2.44, 2.79],
+      ["lionturtle", 2.44, 2.86],
+      ["FoundationDB", 3.93, 4.60],
     ]],
   ],
 };
