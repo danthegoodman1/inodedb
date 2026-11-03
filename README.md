@@ -11,7 +11,7 @@ Every commit goes through the writer's in-memory cache, so the writer answers re
   <img src="docs/images/ops-light.png" alt="Operations a second through gRPC at 64 clients on a 16-core EPYC 4564P, every store on one NVMe drive, for memory, SQLite, RocksDB, lionturtle and FoundationDB: stat by path 392,246, 395,010, 385,828, 391,561 and 392,963; read a 100-byte value 391,525, 384,247, 382,179, 385,833 and 384,266; list 100 entries 164,491, 168,794, 171,567, 160,286 and 167,933; put a new 100-byte file 87,239, 36,512, 78,083, 83,742 and 19,764; rename a file 100,868, 42,461, 91,475, 110,152 and 22,882; nine stats for each put 300,787, 241,484, 282,664, 280,302 and 175,813.">
 </picture>
 
-**Status: experimental.** InodeDB passes its storage and API conformance suites on memory, SQLite, RocksDB, lionturtle and FoundationDB, a 100,000-seed simulation sweep, and a run of 210 planted bugs, and has run in tests and benchmarks only. The ClickHouse integration is unbuilt.
+**Status: experimental.** InodeDB passes its storage and API conformance suites on memory, SQLite, RocksDB, lionturtle and FoundationDB, a 100,000-seed simulation sweep, and a run of 211 planted bugs, and has run in tests and benchmarks only. The ClickHouse integration is unbuilt.
 
 ## Features
 
@@ -37,7 +37,7 @@ Every commit goes through the writer's in-memory cache, so the writer answers re
 
 **A warm start.** A starting writer or standby reads the tree into its cache while it serves, directories first and up to its budget, so 16 clients stat 220,000 to 253,000 files a second as a server starts.
 
-**Checked by deterministic simulation.** Each seed runs random batches from several clients through writer crashes, storage faults and stalls, network loss and reordering, drifting clocks, and standby takeovers, and checks every answer against a naive path model. A failing seed replays exactly, and each of 210 planted bugs must be caught by some test.
+**Checked by deterministic simulation.** Each seed runs random batches from several clients through writer crashes, storage faults and stalls, network loss and reordering, drifting clocks, and standby takeovers, and checks every answer against a naive path model. A failing seed replays exactly, and each of 211 planted bugs must be caught by some test.
 
 ## Performance
 

@@ -885,6 +885,10 @@ MUTANTS = [
         [(SQLITE, ".record(|| writes.iter().map(Written::of).collect());", ".record(Vec::new);")],
     ),
     (
+        "a dropped SQLite store leaves its lock to the checkpointing thread",
+        [(SQLITE, "let _ = thread.join();", "drop(thread);")],
+    ),
+    (
         "SQLite's WAL never goes back to its start",
         [(SQLITE, "if frames >= WAL_WRAP {", "if false && frames >= WAL_WRAP {")],
     ),
