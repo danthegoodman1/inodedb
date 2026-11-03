@@ -1026,6 +1026,23 @@ async fn next_change(changes: &mut tonic::Streaming<pb::Change>) -> pb::Change {
     }
 }
 
+/// What a watch from `from` reports once truncation has passed it, which takes
+/// as long as storage takes to commit the deletion.
+async fn compacted(server: &inodedb_server::Running, path: &str, from: u64) -> pb::Change {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let change = next_change(&mut watch(server, path, from).await).await;
+        if change.compacted {
+            return change;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "truncation passes {from}: {change:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 fn names_changed(change: &pb::Change) -> Vec<String> {
     change
         .entries
@@ -1129,10 +1146,8 @@ pub async fn watch_reports_compaction<B: Backend>(backend: &mut B) {
     let Fixture { db, server, .. } = start_with(backend.fresh(), settings).await;
     db.commit([Op::mkdir("t")]).await.expect("commits");
     db.commit([Op::put("t/a", "1")]).await.expect("commits");
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let mut changes = watch(&server, "t", 1).await;
-    let change = next_change(&mut changes).await;
-    assert!(change.compacted && change.version == 1, "{change:?}");
+    let change = compacted(&server, "t", 1).await;
+    assert_eq!(change.version, 1, "{change:?}");
     // A watch from now still works, under a lease whose position keeps
     // what it has yet to read.
     let at = db.version();
@@ -1166,9 +1181,7 @@ pub async fn leases_hold_the_log<B: Backend>(backend: &mut B) {
     assert!(!change.compacted, "the lease holds the log past {at}");
     assert_eq!(names_changed(&change), ["a"]);
     lease.release().await;
-    tokio::time::sleep(pause).await;
-    let mut changes = watch(&server, "t", at + 1).await;
-    assert!(next_change(&mut changes).await.compacted);
+    compacted(&server, "t", at + 1).await;
 }
 
 /// A cached client's lease holds what it frees until the cache is dropped.
@@ -1269,7 +1282,7 @@ pub async fn snapshots_hold_what_they_read<B: Backend>(backend: &mut B) {
         store,
         Settings {
             writer: inodedb_core::writer::Config {
-                lease_ttl: 300,
+                lease_ttl: 1_500,
                 ..Default::default()
             },
             ..Settings::default()
@@ -1284,8 +1297,8 @@ pub async fn snapshots_hold_what_they_read<B: Backend>(backend: &mut B) {
     let snapshot = cached.snapshot().await.expect("opens");
     db.commit([Op::unlink("t/f")]).await.expect("commits");
     caught_up(&cached, db.version()).await;
-    // Several heartbeats pass.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Past the lease's time to live, which only heartbeats extend.
+    tokio::time::sleep(std::time::Duration::from_millis(1_800)).await;
     assert_eq!(db.claim_freed(10).await.expect("claims").entries, []);
     assert_eq!(&snapshot.read("t/f").await.expect("reads").value[..], b"v");
     drop(snapshot);
@@ -1853,6 +1866,7 @@ pub async fn inodes_share_their_handle<B: Backend>(backend: &mut B) {
 struct Counted<S> {
     inner: S,
     snapshot_reads: Arc<std::sync::atomic::AtomicUsize>,
+    snapshot_reads_done: Arc<std::sync::atomic::AtomicUsize>,
     log_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -1861,6 +1875,7 @@ impl<S> Counted<S> {
         Counted {
             inner,
             snapshot_reads: Arc::default(),
+            snapshot_reads_done: Arc::default(),
             log_reads: Arc::default(),
         }
     }
@@ -1874,7 +1889,9 @@ impl<S: inodedb_storage::Storage + Clone> inodedb_storage::Storage for Counted<S
         reads: Vec<inodedb_core::keys::KvRead>,
     ) -> Result<Vec<inodedb_core::keys::KvResult>, inodedb_storage::StorageError> {
         self.snapshot_reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.snapshot_read(reads).await
+        let results = self.inner.snapshot_read(reads).await;
+        self.snapshot_reads_done.fetch_add(1, Ordering::Relaxed);
+        results
     }
 
     async fn begin(&self) -> Result<S::Txn, inodedb_storage::StorageError> {
@@ -2099,14 +2116,18 @@ pub async fn preloaded_servers_answer_without_reads<B: Backend>(backend: &mut B)
     let db = Client::connect(server.endpoint(), KEY)
         .await
         .expect("connects");
-    // The preload is done once storage reads stop.
+    // The preload is done once storage reads stop, with none under way.
     let mut settled = usize::MAX;
-    loop {
-        let now = store.snapshot_reads.load(Ordering::Relaxed);
-        if now == settled {
-            break;
-        }
-        settled = now;
+    let mut quiet = 0;
+    while quiet < 5 {
+        let done = store.snapshot_reads_done.load(Ordering::Relaxed);
+        let under_way = store.snapshot_reads.load(Ordering::Relaxed) != done;
+        quiet = if done == settled && !under_way {
+            quiet + 1
+        } else {
+            0
+        };
+        settled = done;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     for path in ["p", "p/a", "p/q", "p/q/b", "empty"] {
