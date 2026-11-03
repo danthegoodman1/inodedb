@@ -76,3 +76,8 @@ xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
 [profile.release]
 debug = "line-tables-only"
+
+# RocksDB's C++ debug info takes 1.6 GB per build and swells every binary that
+# links it, which fills a CI runner's disk.
+[profile.dev.package.librocksdb-sys]
+debug = false

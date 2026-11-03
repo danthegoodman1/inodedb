@@ -12,6 +12,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # A cold build on top of a restored cache can fill the image's free disk.
+      - name: Free disk from SDKs this job leaves unused
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
