@@ -348,10 +348,10 @@ fn main() {
 async fn run() {
     let mut args = std::env::args().skip(1);
     let seconds = args.next().and_then(|arg| arg.parse().ok()).unwrap_or(3);
-    // The backends to run, in order: memory, sqlite, rocksdb, fdb.
+    // The backends to run, in order: memory, sqlite, rocksdb, lionturtle, fdb.
     let order = args
         .next()
-        .unwrap_or_else(|| "memory,sqlite,rocksdb,fdb".to_string());
+        .unwrap_or_else(|| "memory,sqlite,rocksdb,lionturtle,fdb".to_string());
     let chosen = args.next();
     let chosen = chosen.as_deref();
     println!("| Backend | Operation | Clients | Ops/s | p50 ms | p99 ms |");
@@ -364,6 +364,12 @@ async fn run() {
                 let path = dir.path().join("db.sqlite");
                 let storage = inodedb_storage_sqlite::Sqlite::open(path).expect("opens");
                 bench("SQLite", storage, seconds, chosen).await;
+            }
+            "lionturtle" => {
+                let dir = tempfile::tempdir().expect("a scratch directory");
+                let storage = inodedb_storage_lionturtle::Lionturtle::open(dir.path().join("db"))
+                    .expect("opens");
+                bench("lionturtle", storage, seconds, chosen).await;
             }
             #[cfg(feature = "rocksdb")]
             "rocksdb" => {

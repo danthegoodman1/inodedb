@@ -6,7 +6,7 @@
 //! the WAL into the database file, so commits rarely wait on a checkpoint.
 //!
 //! A sync that must also grow a file commits the file system's journal, which
-//! costs up to three times the write itself on local NVMe and twice on gp3
+//! costs up to four times the write itself on local NVMe and twice on gp3
 //! (`BENCHMARKS.md`, "Devices"). So the WAL file is written to its full size
 //! when the store opens, and the thread sends commits back to its start before
 //! they pass its end, so they overwrite written blocks. `.cargo/config.toml`
@@ -24,13 +24,18 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::watch;
 
 /// How often the checkpointing thread looks for new commits. A test's WAL is
 /// small, and fills between looks at the usual pace.
 const CHECKPOINT_EVERY: Duration = Duration::from_millis(if cfg!(test) { 5 } else { 100 });
+/// How long a test's checkpoint pass lasts at least, so a test can drop a store
+/// partway through one.
+const PASS_AT_LEAST: Duration = Duration::from_millis(if cfg!(test) { 5 } else { 0 });
 /// The size the WAL file is written to.
 const WAL_BYTES: u64 = if cfg!(test) { 8 << 20 } else { 128 << 20 };
 /// The WAL's frames past which the checkpointing thread sends commits back to
@@ -49,8 +54,27 @@ struct Shared {
     _lock: File,
 }
 
+/// Ends the checkpointing thread with the last handle. The thread holds the
+/// store during a pass, so the store's connections and lock could otherwise
+/// outlast that handle's drop, and an open right after it would fail.
+struct Checkpointer {
+    stop: Option<Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for Checkpointer {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Sqlite {
+    // Drops ahead of `shared`, so the last handle holds the last reference.
+    _checkpointer: Arc<Checkpointer>,
     shared: Arc<Shared>,
 }
 
@@ -158,11 +182,18 @@ impl Sqlite {
             _lock: lock,
         });
         let weak = Arc::downgrade(&shared);
-        std::thread::Builder::new()
+        let (stop, stopped) = mpsc::channel();
+        let thread = std::thread::Builder::new()
             .name("sqlite-checkpoint".into())
-            .spawn(move || checkpoint(weak, checkpoints))
+            .spawn(move || checkpoint(weak, checkpoints, stopped))
             .map_err(unavailable)?;
-        Ok(Sqlite { shared })
+        Ok(Sqlite {
+            _checkpointer: Arc::new(Checkpointer {
+                stop: Some(stop),
+                thread: Some(thread),
+            }),
+            shared,
+        })
     }
 
     fn validator(&self) -> MutexGuard<'_, Validator> {
@@ -392,10 +423,9 @@ fn write_wal(database: &Path) -> std::io::Result<()> {
 /// passive checkpoint never catches up, and the WAL would grow without end, so
 /// once it reaches `WAL_WRAP` frames the thread takes the writer's lock for
 /// long enough to finish the copy, and commits go back to the WAL's start.
-fn checkpoint(shared: Weak<Shared>, conn: Connection) {
+fn checkpoint(shared: Weak<Shared>, conn: Connection, stop: Receiver<()>) {
     let mut seen = 0;
-    loop {
-        std::thread::sleep(CHECKPOINT_EVERY);
+    while stop.recv_timeout(CHECKPOINT_EVERY) == Err(RecvTimeoutError::Timeout) {
         let Some(shared) = shared.upgrade() else {
             return;
         };
@@ -415,6 +445,7 @@ fn checkpoint(shared: Weak<Shared>, conn: Connection) {
                 let _writer = shared.writer.lock().expect("no panics hold the writer");
                 let _ = conn.query_row("PRAGMA wal_checkpoint(RESTART)", [], |_| Ok(()));
             }
+            std::thread::sleep(PASS_AT_LEAST);
         }
     }
 }
@@ -522,6 +553,24 @@ fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last handle's drop closes the store, lock and all, even with the
+    /// checkpointing thread partway through a pass, so the next open finds
+    /// it free. The drop comes when any pass over the commit is under way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_last_handle_frees_the_store() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("db.sqlite");
+        for round in 0..20 {
+            let storage = Sqlite::open(&path)
+                .unwrap_or_else(|error| panic!("round {round} finds the store free: {error:?}"));
+            let mut txn = storage.begin().await.expect("begins");
+            txn.set(b"key", b"value");
+            txn.commit().await.expect("commits");
+            tokio::time::sleep(CHECKPOINT_EVERY).await;
+            drop(storage);
+        }
+    }
 
     /// Commits leave their pages in the WAL, and the store's own thread
     /// copies them into the database file.

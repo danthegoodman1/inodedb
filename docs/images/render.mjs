@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const charts = ["ops", "latency", "devices"];
+const charts = ["ops", "latency", "expiry"];
 // Page color around the card: charts.html's capture mode sets GitHub's.
 const MARGIN = 24;
 

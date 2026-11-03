@@ -1,0 +1,17 @@
+[package]
+name = "inodedb-storage-lionturtle"
+description = "InodeDB's lionturtle backend, for single-server deployments."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+inodedb-core.workspace = true
+inodedb-storage.workspace = true
+lionturtle.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -20,8 +20,8 @@ struct Tree {
     head: Option<Head>,
     /// Request records' parts, by request id.
     records: BTreeMap<u128, BTreeMap<u16, Vec<u8>>>,
-    /// Expiry keys, by request id.
-    expiries: BTreeMap<u128, Vec<u64>>,
+    /// Expiry keys' values, by request id.
+    expiries: BTreeMap<u128, Vec<Vec<u8>>>,
     keys: BTreeMap<KeyId, KeyRecord>,
     handle_secret: Option<usize>,
 }
@@ -162,9 +162,8 @@ fn load<'a>(
                     .insert(part, value.to_vec());
             }
             Some(Parsed::System(b't', rest)) if rest.len() == 24 => {
-                let at = u64::from_be_bytes(rest[..8].try_into().expect("8 bytes"));
                 let id = u128::from_be_bytes(rest[8..].try_into().expect("16 bytes"));
-                tree.expiries.entry(id).or_default().push(at);
+                tree.expiries.entry(id).or_default().push(value.to_vec());
             }
             Some(Parsed::System(b'r' | b't', _)) => {
                 problems.push(format!("malformed request key {key:?}"))
@@ -244,11 +243,15 @@ impl Tree {
                 Ok(result) => problems.push(format!("request {id:x} records {result:?}")),
                 Err(_) => problems.push(format!("request {id:x} doesn't decode")),
             }
-            match self.expiries.get(id).map(Vec::len) {
-                Some(1) => {}
-                count => problems.push(format!(
+            match self.expiries.get(id).map(Vec::as_slice) {
+                Some([value]) if keys::decode_parts(value) == Some(parts.len() as u16) => {}
+                Some([_]) => problems.push(format!(
+                    "request {id:x} has {} parts, and its expiry key says otherwise",
+                    parts.len()
+                )),
+                found => problems.push(format!(
                     "request {id:x} has {} expiry keys",
-                    count.unwrap_or(0)
+                    found.map_or(0, <[_]>::len)
                 )),
             }
         }

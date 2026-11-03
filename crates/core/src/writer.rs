@@ -21,7 +21,7 @@ use crate::cache::{Budget, Cache, rebase};
 use crate::codec::{Dec, DecodeError, Enc};
 use crate::delta::{Delta, Freed};
 use crate::exec::{self, Input};
-use crate::keys::{self, KeyRange, KvRead, KvResult, KvWrite, Pairs, Parsed, WriteSet};
+use crate::keys::{self, KvRead, KvResult, Pairs, Parsed, WriteSet};
 use crate::lease::{
     ClaimError, ClaimId, FreeEntry, Granted, LeaseError, LeaseId, LeaseRecord, Leases, Release,
     StoredLease,
@@ -292,8 +292,9 @@ struct Prepared {
     version: Version,
     answer: Answer,
     writes: WriteSet,
-    /// When the batch's request record expires, if it writes one.
-    expires: Option<Millis>,
+    /// When the batch's request record expires, and how many parts it has,
+    /// if it writes one.
+    expires: Option<(Millis, u16)>,
 }
 
 #[derive(Debug)]
@@ -445,6 +446,9 @@ pub struct Writer {
     /// Committed deltas that outstanding reads may straddle.
     acked: VecDeque<Arc<Delta>>,
     queries: BTreeMap<u64, WaitingQuery>,
+    /// How many parts each committed request record has, for the few with
+    /// more than one.
+    long_records: BTreeMap<u128, u16>,
     /// Every committed request record, by when it expires.
     expiries: BTreeSet<(Millis, u128)>,
     /// No record expires before this: a request lifetime past the
@@ -529,6 +533,7 @@ impl Writer {
             stale: Vec::new(),
             acked: VecDeque::new(),
             queries: BTreeMap::new(),
+            long_records: BTreeMap::new(),
             expiries: BTreeSet::new(),
             expiring_from: 0,
             unchanged: BTreeMap::new(),
@@ -1039,6 +1044,11 @@ impl Writer {
         self.detached.len()
     }
 
+    /// Live request records of more than one part, for tests and metrics.
+    pub fn long_records(&self) -> usize {
+        self.long_records.len()
+    }
+
     /// Ops run ahead of batches waiting on reads, for tests and metrics.
     pub fn read_ahead_ops(&self) -> u64 {
         self.read_ahead_ops
@@ -1329,7 +1339,7 @@ impl Writer {
         version: Version,
         answer: Answer,
         writes: WriteSet,
-        expires: Option<Millis>,
+        expires: Option<(Millis, u16)>,
     ) {
         let bytes = writes.bytes();
         // The group closes before this batch's inodes count against it.
@@ -1424,12 +1434,14 @@ impl Writer {
         if id != 0 {
             delta.request = Some((id, result.clone()));
             let bytes = result.encode();
+            let mut parts = 0;
             for (part, chunk) in bytes.chunks(REQUEST_PART).enumerate() {
                 writes.set(keys::request(id, part as u16), chunk.to_vec());
+                parts += 1;
             }
             let at = self.now + self.config.request_ttl;
-            writes.set(keys::request_expiry(at, id), Vec::new());
-            expires = Some(at);
+            writes.set(keys::request_expiry(at, id), keys::encode_parts(parts));
+            expires = Some((at, parts));
         }
         writes.log.push((version, log.encode()));
         if writes.bytes() > MAX_BATCH_BYTES {
@@ -1521,11 +1533,12 @@ impl Writer {
         let mut writes = WriteSet::default();
         for (at, id) in &expiring {
             writes.clear(keys::request_expiry(*at, *id));
-            writes
-                .writes
-                .push(KvWrite::ClearRange(KeyRange::prefix(keys::request_prefix(
-                    *id,
-                ))));
+            // Each part by its key, so a group's deletions read nothing and
+            // leave no range for later reads to consult.
+            let parts = self.long_records.get(id).copied().unwrap_or(1);
+            for part in 0..parts {
+                writes.clear(keys::request(*id, part));
+            }
         }
         group.expiring = expiring;
         // A group goes out once: one that fails runs its batches again.
@@ -1761,9 +1774,17 @@ impl Writer {
             self.scan_waiting();
         }
         let keep = !self.reads.is_empty();
+        // Ahead of the batches: one of them may write an expired id again.
+        for (_, id) in &group.expiring {
+            self.long_records.remove(id);
+        }
         for prepared in group.batches {
-            if let (Some(at), Some((id, _))) = (prepared.expires, &prepared.delta.request) {
+            if let (Some((at, parts)), Some((id, _))) = (prepared.expires, &prepared.delta.request)
+            {
                 self.expiries.insert((at, *id));
+                if parts > 1 {
+                    self.long_records.insert(*id, parts);
+                }
             }
             self.cache.apply(&prepared.delta);
             self.version = prepared.version;
@@ -2077,11 +2098,15 @@ impl Writer {
     ) -> Result<(), DecodeError> {
         let prefix = keys::request_expiry_range().start.len();
         let mut ids = Vec::with_capacity(expiries.len());
-        for (key, _) in expiries {
+        for (key, value) in expiries {
             let at = key.get(prefix..prefix + 8).ok_or(DecodeError)?;
             let id = key.get(prefix + 8..prefix + 24).ok_or(DecodeError)?;
             let at = u64::from_be_bytes(at.try_into().map_err(|_| DecodeError)?);
             let id = u128::from_be_bytes(id.try_into().map_err(|_| DecodeError)?);
+            let parts = keys::decode_parts(&value).ok_or(DecodeError)?;
+            if parts > 1 {
+                self.long_records.insert(id, parts);
+            }
             self.expiries.insert((at, id));
             ids.push(id);
         }
@@ -2199,6 +2224,7 @@ impl Writer {
         self.phase = Phase::Starting;
         self.cache = Cache::with_budget(self.config.cache);
         self.detached.clear();
+        self.long_records.clear();
         self.expiries.clear();
         let id = self.id();
         self.reads.insert(

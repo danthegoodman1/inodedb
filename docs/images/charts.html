@@ -21,12 +21,13 @@
   --memory: #2a78d6;
   --sqlite: #eb6834;
   --rocksdb: #1baf7a;
+  --lionturtle: #6250d6;
   --fdb: #eda100;
-  /* The devices, in the chart that compares them. */
-  --nvme: #008300;
-  --gp3: #e87ba4;
-  /* The headline's accent, apart from every series' color. */
-  --accent: #6250d6;
+  /* Before and while records expire, in the chart that compares them. */
+  --before: #008300;
+  --during: #e87ba4;
+  /* The headline's accent, apart from every backend's color. */
+  --accent: #d55181;
   --font-display: "Archivo", system-ui, sans-serif;
   --font-body: "IBM Plex Sans", system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, monospace;
@@ -35,16 +36,16 @@
   :root:not([data-theme="light"]) {
     --bg: #0e1012; --surface: #15181a; --ink: #eef0ef; --ink-2: #b8bec2; --muted: #868c91;
     --grid: #25292c; --axis: #3a3f43; --ring: rgba(255, 255, 255, 0.10);
-    --memory: #3987e5; --sqlite: #d95926; --rocksdb: #199e70; --fdb: #c98500; --accent: #9085e9;
-    --nvme: #008300; --gp3: #d55181;
+    --memory: #3987e5; --sqlite: #d95926; --rocksdb: #199e70; --lionturtle: #9085e9; --fdb: #c98500; --accent: #e87ba4;
+    --before: #008300; --during: #d55181;
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
   --bg: #0e1012; --surface: #15181a; --ink: #eef0ef; --ink-2: #b8bec2; --muted: #868c91;
   --grid: #25292c; --axis: #3a3f43; --ring: rgba(255, 255, 255, 0.10);
-  --memory: #3987e5; --sqlite: #d95926; --rocksdb: #199e70; --fdb: #c98500; --accent: #9085e9;
-  --nvme: #008300; --gp3: #d55181;
+  --memory: #3987e5; --sqlite: #d95926; --rocksdb: #199e70; --lionturtle: #9085e9; --fdb: #c98500; --accent: #e87ba4;
+  --before: #008300; --during: #d55181;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -106,11 +107,11 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 
   <div class="card hero" id="ops">
     <div class="hero-head">
-      <h1>InodeDB reads <em>440k</em> times a second from memory on every backend</h1>
+      <h1>InodeDB reads <em>390k</em> times a second from memory on every backend</h1>
       <div class="hero-meta">
         <span><b>gRPC</b> · 64 clients, each on its own connection</span>
         <span>10,000 files of 100 bytes · a warm cache</span>
-        <span>EC2 i7ie.6xlarge · every store on local NVMe</span>
+        <span>16-core EPYC 4564P · every store on one NVMe drive</span>
       </div>
     </div>
     <div class="ops" id="ops-chart" role="img"></div>
@@ -119,6 +120,7 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
         <span><i class="sw" style="background:var(--memory)"></i>memory</span>
         <span><i class="sw" style="background:var(--sqlite)"></i>SQLite</span>
         <span><i class="sw" style="background:var(--rocksdb)"></i>RocksDB</span>
+        <span><i class="sw" style="background:var(--lionturtle)"></i>lionturtle</span>
         <span><i class="sw" style="background:var(--fdb)"></i>FoundationDB</span>
       </div>
       <span>Writes wait for a durable commit, which batches share. FoundationDB runs one process per role.</span>
@@ -131,7 +133,7 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
       <div class="hero-meta">
         <span><b>gRPC</b> · each client on its own connection</span>
         <span>10,000 files of 100 bytes · a warm cache</span>
-        <span>EC2 i7ie.6xlarge · every store on local NVMe</span>
+        <span>16-core EPYC 4564P · every store on one NVMe drive</span>
       </div>
     </div>
     <div class="multiples" id="latency-panels"></div>
@@ -140,77 +142,80 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
         <span><i class="sw" style="background:var(--memory)"></i>memory</span>
         <span><i class="sw" style="background:var(--sqlite)"></i>SQLite</span>
         <span><i class="sw" style="background:var(--rocksdb)"></i>RocksDB</span>
+        <span><i class="sw" style="background:var(--lionturtle)"></i>lionturtle</span>
         <span><i class="sw" style="background:var(--fdb)"></i>FoundationDB</span>
       </div>
       <span>Each panel has its own scale. A put also reads storage once, to find its new name absent.</span>
     </div>
   </div>
 
-  <div class="card hero" id="devices">
+  <div class="card hero" id="expiry">
     <div class="hero-head">
-      <h1>gp3 syncs <em>39×</em> slower than local NVMe, and grouping keeps puts within about 3×</h1>
+      <h1>As request records expire, RocksDB and lionturtle keep <em>33k</em> batches a second</h1>
       <div class="hero-meta">
-        <span><b>gp3</b> at its maximum: 80,000 IOPS, 2,000 MiB/s</span>
-        <span>An overwritten 4 KiB block and <b>fdatasync</b>: 17 µs on NVMe, 668 µs on gp3</span>
-        <span>EC2 i7ie.6xlarge · each store on the device</span>
+        <span><b>gRPC</b> · 64 clients, one file per batch</span>
+        <span>Records last 60 seconds, then each group deletes them</span>
+        <span>16-core EPYC 4564P · every store on one NVMe drive</span>
       </div>
     </div>
-    <div class="multiples" id="device-panels"></div>
+    <div class="multiples" id="expiry-panels"></div>
     <div class="foot">
       <div class="key">
-        <span><i class="sw" style="background:var(--nvme)"></i>local NVMe</span>
-        <span><i class="sw" style="background:var(--gp3)"></i>gp3</span>
+        <span><i class="sw" style="background:var(--before)"></i>before records expire</span>
+        <span><i class="sw" style="background:var(--during)"></i>while they expire</span>
       </div>
-      <span>A put creates a new 100-byte file. FoundationDB runs one process per role, its data on the device.</span>
+      <span>A server reaches this once its records reach <b>request_ttl</b>, 10 minutes by default.</span>
     </div>
   </div>
 
-</div>
-
 <script>
 const D = {
-  // BENCHMARKS.md, "Operations", local NVMe: operations a second at 64 clients for memory, SQLite, RocksDB, FoundationDB
+  // BENCHMARKS.md, "Operations": operations a second at 64 clients for memory, SQLite, RocksDB, lionturtle, FoundationDB
   ops: [
-    ["Stat", "by path", 440140, 438301, 436641, 436267],
-    ["Read", "a 100-byte value", 433266, 442188, 440804, 433089],
-    ["List", "100 entries with attributes", 171899, 176663, 175845, 182617],
-    ["Put", "a new 100-byte file", 71769, 35985, 62314, 19638],
-    ["Rename", "a file", 81029, 40099, 64141, 18048],
-    ["Mixed", "nine stats for each put", 301852, 252981, 287955, 159879],
+    ["Stat", "by path", 392246, 395010, 385828, 391561, 392963],
+    ["Read", "a 100-byte value", 391525, 384247, 382179, 385833, 384266],
+    ["List", "100 entries with attributes", 164491, 168794, 171567, 160286, 167933],
+    ["Put", "a new 100-byte file", 87239, 36512, 78083, 83742, 19764],
+    ["Rename", "a file", 100868, 42461, 91475, 110152, 22882],
+    ["Mixed", "nine stats for each put", 300787, 241484, 282664, 280302, 175813],
   ],
-  backends: [["memory", "memory"], ["sqlite", "SQLite"], ["rocksdb", "RocksDB"], ["fdb", "FoundationDB"]],
-  // BENCHMARKS.md, "Operations", local NVMe: latency in ms for memory, SQLite, RocksDB, FoundationDB
+  backends: [["memory", "memory"], ["sqlite", "SQLite"], ["rocksdb", "RocksDB"], ["lionturtle", "lionturtle"], ["fdb", "FoundationDB"]],
+  // BENCHMARKS.md, "Operations": latency in ms for memory, SQLite, RocksDB, lionturtle, FoundationDB
   latency: [
     ["Reads", "one client, p50", 0.08, [0, 0.02, 0.04, 0.06, 0.08], [
-      ["Stat", 0.023, 0.023, 0.023, 0.023],
-      ["Read", 0.023, 0.024, 0.023, 0.023],
-      ["List", 0.062, 0.062, 0.061, 0.062],
+      ["Stat", 0.023, 0.023, 0.023, 0.023, 0.023],
+      ["Read", 0.023, 0.023, 0.023, 0.023, 0.023],
+      ["List", 0.057, 0.057, 0.057, 0.058, 0.057],
     ]],
     ["Reads", "64 clients, p99", 1, [0, 0.25, 0.5, 0.75, 1], [
-      ["Stat", 0.242, 0.244, 0.247, 0.248],
-      ["Read", 0.246, 0.238, 0.243, 0.247],
-      ["List", 0.730, 0.704, 0.709, 0.662],
+      ["Stat", 0.293, 0.287, 0.287, 0.283, 0.291],
+      ["Read", 0.297, 0.293, 0.289, 0.287, 0.289],
+      ["List", 0.814, 0.783, 0.753, 0.836, 0.799],
     ]],
     ["Writes", "one client, p50", 1.2, [0, 0.3, 0.6, 0.9, 1.2], [
-      ["Put", 0.046, 0.172, 0.090, 1.004],
-      ["Rename", 0.043, 0.165, 0.095, 1.006],
+      ["Put", 0.049, 0.167, 0.109, 0.101, 1.004],
+      ["Rename", 0.047, 0.155, 0.108, 0.098, 1.003],
     ]],
     ["Writes", "64 clients, p99", 5, [0, 1, 2, 3, 4, 5], [
-      ["Put", 1.258, 3.753, 1.405, 3.764],
-      ["Rename", 1.036, 2.268, 1.209, 4.185],
+      ["Put", 1.356, 3.361, 1.308, 1.294, 3.930],
+      ["Rename", 1.037, 1.997, 0.953, 1.053, 3.674],
     ]],
   ],
-  // BENCHMARKS.md, "Operations": puts on local NVMe and on gp3, by backend
-  devices: [
-    ["Puts a second", "64 clients", 80000, [0, 20000, 40000, 60000, 80000], [
-      ["SQLite", 35985, 11972],
-      ["RocksDB", 62314, 24504],
-      ["FoundationDB", 19638, 10292],
+  // BENCHMARKS.md, "Expiring records": before records expire, then while they do, by backend
+  expiry: [
+    ["Batches a second", "64 clients", 50000, [0, 10000, 20000, 30000, 40000, 50000], [
+      ["memory", 44226, 40711],
+      ["SQLite", 26530, 21068],
+      ["RocksDB", 36978, 32751],
+      ["lionturtle", 37828, 33430],
+      ["FoundationDB", 19363, 16908],
     ]],
-    ["Put latency", "one client, p50", 2.5, [0, 0.5, 1, 1.5, 2, 2.5], [
-      ["SQLite", 0.172, 1.124],
-      ["RocksDB", 0.090, 0.758],
-      ["FoundationDB", 1.004, 2.220],
+    ["Commit latency", "64 clients, p99", 30, [0, 10, 20, 30], [
+      ["memory", 2.26, 2.62],
+      ["SQLite", 4.99, 26.83],
+      ["RocksDB", 2.44, 2.79],
+      ["lionturtle", 2.44, 2.86],
+      ["FoundationDB", 3.93, 4.60],
     ]],
   ],
 };
@@ -256,7 +261,7 @@ function axis(host, max, ticks, show, caption) {
   host.append(el("div", "colhead", "Operation"), el("div", "colhead", "Operations a second"));
   rows(host, D.ops.map(([n, s, ...v]) => [n, s, v]), MAX, ticks, fmt);
   axis(host, MAX, ticks, t => t ? t / 1000 + "k" : "0", "Operations a second at 64 clients");
-  host.setAttribute("aria-label", "Operations a second at 64 clients for memory, SQLite, RocksDB and FoundationDB: " +
+  host.setAttribute("aria-label", "Operations a second at 64 clients for memory, SQLite, RocksDB, lionturtle and FoundationDB: " +
     D.ops.map(([n, s, ...v]) => `${n} ${s} ${v.map(fmt).join(", ")}`).join("; ") + ".");
 })();
 
@@ -268,7 +273,7 @@ function axis(host, max, ticks, show, caption) {
     h.append(el("span", null, when));
     const chart = el("div", "ops");
     chart.setAttribute("role", "img");
-    chart.setAttribute("aria-label", `${kind}, ${when}, in ms for memory, SQLite, RocksDB and FoundationDB: ` +
+    chart.setAttribute("aria-label", `${kind}, ${when}, in ms for memory, SQLite, RocksDB, lionturtle and FoundationDB: ` +
       data.map(([n, ...v]) => `${n} ${v.map(ms).join(", ")}`).join("; ") + ".");
     rows(chart, data.map(([n, ...v]) => [n, null, v]), max, ticks, ms);
     axis(chart, max, ticks, t => String(t), "Milliseconds");
@@ -277,20 +282,20 @@ function axis(host, max, ticks, show, caption) {
   }
 })();
 
-(function devices() {
-  const host = document.getElementById("device-panels");
+(function expiry() {
+  const host = document.getElementById("expiry-panels");
   const ms = v => v.toFixed(2);
-  for (const [kind, when, max, ticks, data] of D.devices) {
+  for (const [kind, when, max, ticks, data] of D.expiry) {
     const panel = el("div", "panel"), h = el("h3", null, kind + " · ");
     h.append(el("span", null, when));
     const chart = el("div", "ops wide");
     const latency = kind.includes("latency");
     const show = latency ? ms : fmt;
     chart.setAttribute("role", "img");
-    chart.setAttribute("aria-label", `${kind}, ${when}, on local NVMe and gp3: ` +
+    chart.setAttribute("aria-label", `${kind}, ${when}, before records expire and while they do: ` +
       data.map(([n, a, b]) => `${n} ${show(a)} and ${show(b)}`).join("; ") + ".");
-    rows(chart, data.map(([n, ...v]) => [n, null, v]), max, ticks, show, ["nvme", "gp3"]);
-    axis(chart, max, ticks, t => latency ? String(t) : t ? t / 1000 + "k" : "0", latency ? "Milliseconds" : "Puts a second");
+    rows(chart, data.map(([n, ...v]) => [n, null, v]), max, ticks, show, ["before", "during"]);
+    axis(chart, max, ticks, t => latency ? String(t) : t ? t / 1000 + "k" : "0", latency ? "Milliseconds" : "Batches a second");
     panel.append(h, chart);
     host.append(panel);
   }

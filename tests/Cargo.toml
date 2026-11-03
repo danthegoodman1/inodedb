@@ -22,6 +22,7 @@ inodedb-server.workspace = true
 inodedb-sim = { path = "../crates/sim" }
 inodedb-storage.workspace = true
 inodedb-storage-conformance.workspace = true
+inodedb-storage-lionturtle.workspace = true
 inodedb-storage-rocksdb = { workspace = true, optional = true }
 inodedb-transport.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

@@ -4,7 +4,7 @@ reports whether the core's unit tests, the storage conformance suite, the
 server's tests, the API conformance suite, the simulator's tests (scenarios
 and regression seeds) or a seed sweep catch each one.
 
-    scripts/mutants [--seeds N] [--only NAME]... [--check] [--no-baseline] [--rocksdb] [--fdb]
+    scripts/mutants [--seeds N] [--only NAME]... [--check] [--no-baseline] [--rocksdb] [--lionturtle] [--fdb]
 
 A mutant is a list of replacements; each must match exactly once, ignoring
 whitespace, so formatting changes leave the mutants intact. The copy lives
@@ -15,8 +15,8 @@ would claim to catch them all. A step that hangs counts as a catch, and is
 killed with every process it started. Exits non-zero if the unmutated code
 fails, or any mutant goes uncaught or fails to build.
 
-`--rocksdb` and `--fdb` plant the bugs in that backend instead, and try them
-against its conformance suites. FoundationDB's need a cluster:
+`--rocksdb`, `--lionturtle` and `--fdb` plant the bugs in that backend instead,
+and try them against its conformance suites. FoundationDB's need a cluster:
 `scripts/fdb python3 scripts/mutants --fdb`.
 """
 
@@ -63,6 +63,7 @@ CONFIG = "crates/server/src/config.rs"
 TRANSPORT = "crates/transport/src/lib.rs"
 FDB = "crates/storage-fdb/src/lib.rs"
 ROCKSDB = "crates/storage-rocksdb/src/lib.rs"
+LIONTURTLE = "crates/storage-lionturtle/src/lib.rs"
 STEP_TIMEOUT = 900
 
 MUTANTS = [
@@ -158,6 +159,43 @@ MUTANTS = [
         [(WRITER, ".take_while(|(at, _)| *at <= self.now)", ".take_while(|_| false)")],
     ),
     (
+        "an expired record leaves its later parts",
+        [(WRITER, "for part in 0..parts {\n                writes.clear(keys::request(*id, part));", "for part in 0..parts.min(1) {\n                writes.clear(keys::request(*id, part));")],
+    ),
+    (
+        "a writer forgets the parts of a record it wrote",
+        [(WRITER, """if parts > 1 {
+                    self.long_records.insert(*id, parts);
+                }""", "let _ = parts;")],
+    ),
+    (
+        "an expiry key leaves out its record's parts",
+        [(WRITER, "writes.set(keys::request_expiry(at, id), keys::encode_parts(parts));", "writes.set(keys::request_expiry(at, id), Vec::new());")],
+    ),
+    (
+        "a restarted writer forgets a record's parts",
+        [(WRITER, """if parts > 1 {
+                self.long_records.insert(id, parts);
+            }""", "let _ = parts;")],
+    ),
+    (
+        "a failed group forgets the parts it was deleting",
+        [(WRITER, """for record in &expired {
+            self.expiries.remove(record);""", """for record in &expired {
+            self.long_records.remove(&record.1);
+            self.expiries.remove(record);""")],
+    ),
+    (
+        "a record's part count outlives the record",
+        [(WRITER, """for (_, id) in &group.expiring {
+            self.long_records.remove(id);
+        }""", "")],
+    ),
+    (
+        "fsck takes any expiry key for a long record",
+        [(FSCK, "Some([value]) if keys::decode_parts(value) == Some(parts.len() as u16) => {}", "Some([_]) if !parts.is_empty() => {}")],
+    ),
+    (
         "expired records are deleted after the group's writes",
         [(WRITER, """group.expiring = expiring;
         // A group goes out once: one that fails runs its batches again.
@@ -213,6 +251,12 @@ MUTANTS = [
     (
         "a directory that leaves alive keeps what lies beneath it",
         [(FEED, "prune = true;", "")],
+    ),
+    (
+        "a child gained by a directory leaving in the same commit stays in sight",
+        [(FEED, """if directory_left {
+                gained.clear();
+            }""", "let _ = (directory_left, &mut gained);")],
     ),
     (
         "what leaves a subtree stays cached",
@@ -555,6 +599,14 @@ MUTANTS = [
         [(LEASE, "self.writes.remove(&id);\n            self.insert(", "self.insert(")],
     ),
     (
+        "a writer that starts over keeps the lease deletions it queued",
+        [(LEASE, "        self.writes.clear();\n        let release = release.unwrap_or_default();", "        let release = release.unwrap_or_default();")],
+    ),
+    (
+        "a writer that starts over keeps leases gone from storage",
+        [(LEASE, "        self.held.clear();\n        self.expiries.clear();\n        self.oldest = Multiset::default();\n        self.positions = Multiset::default();\n", "")],
+    ),
+    (
         "a restarted writer reuses lease ids",
         [(LEASE, "self.next = self.next.max(release.next_lease);", "")],
     ),
@@ -833,6 +885,10 @@ MUTANTS = [
         [(SQLITE, ".record(|| writes.iter().map(Written::of).collect());", ".record(Vec::new);")],
     ),
     (
+        "a dropped SQLite store leaves its lock to the checkpointing thread",
+        [(SQLITE, "let _ = thread.join();", "drop(thread);")],
+    ),
+    (
         "SQLite's WAL never goes back to its start",
         [(SQLITE, "if frames >= WAL_WRAP {", "if false && frames >= WAL_WRAP {")],
     ),
@@ -922,6 +978,64 @@ ROCKSDB_MUTANTS = [
     ),
 ]
 
+# Planted in the lionturtle backend: `scripts/mutants --lionturtle`.
+LIONTURTLE_MUTANTS = [
+    (
+        "a group on lionturtle ignores the head",
+        [(LIONTURTLE, "Ok(_) => return CommitOutcome::Fenced,", "Ok(_) => {}")],
+    ),
+    (
+        "a group past the limits commits on lionturtle",
+        [(LIONTURTLE, """if check_limits(&writes.writes, log).is_err() {
+        return CommitOutcome::Failed;
+    }""", "let _ = log;")],
+    ),
+    (
+        "a commit on lionturtle answers before it is durable",
+        [(LIONTURTLE, "let committed = db.write(&ops, true);", "let committed = db.write(&ops, false);")],
+    ),
+    (
+        "a stopped lionturtle store answers reads",
+        [(LIONTURTLE, """if db.is_poisoned() {
+        return Err(unavailable(lionturtle::Error::Poisoned));
+    }""", "let _ = db;")],
+    ),
+    (
+        "a commit on a stopped lionturtle store reports it applied nothing",
+        [(LIONTURTLE, "_ => CommitError::Unknown,", "_ => CommitError::Unavailable(error.to_string()),")],
+    ),
+    (
+        "a second opener takes a lionturtle store",
+        [(LIONTURTLE, "lock.try_lock().map_err(unavailable)?;", "")],
+    ),
+    (
+        "a range on lionturtle keeps what the group set before it",
+        [(LIONTURTLE, """if any_set {
+                    ops.retain(|op| !range.contains(&op.key[1..]));
+                }""", "let _ = any_set;")],
+    ),
+    (
+        "a range on lionturtle keeps what the store holds",
+        [(LIONTURTLE, """while let Some((key, _)) = stored.next().map_err(failed)? {
+                    ops.push(WriteOp::delete(key));
+                }""", "let _ = &mut stored;")],
+    ),
+    (
+        "a transaction's scan on lionturtle runs short of its limit",
+        [(LIONTURTLE, "let wanted = limit.saturating_add(hidden);", "let wanted = limit.min(usize::MAX - hidden);")],
+    ),
+    (
+        "truncation on lionturtle stops at its first chunk",
+        [(LIONTURTLE, """db.write(&deletes, false).map_err(failed)?;
+            deletes.clear();
+            deleted = true;""", """break;""")],
+    ),
+    (
+        "lionturtle's log segments start unwritten",
+        [(LIONTURTLE, "preallocate_log: true,", "preallocate_log: false,")],
+    ),
+]
+
 # Planted in the FoundationDB backend, which needs a cluster to test:
 # `scripts/fdb python3 scripts/mutants --fdb`.
 FDB_MUTANTS = [
@@ -999,6 +1113,8 @@ def main():
                         help="skip checking that the unmutated code passes every layer")
     parser.add_argument("--rocksdb", action="store_true",
                         help="plant bugs in the RocksDB backend, testing against its suites")
+    parser.add_argument("--lionturtle", action="store_true",
+                        help="plant bugs in the lionturtle backend, testing against its suites")
     parser.add_argument("--fdb", action="store_true",
                         help="plant bugs in the FoundationDB backend, testing against a cluster")
     args = parser.parse_args()
@@ -1008,11 +1124,12 @@ def main():
     copy = work / "src"
     target = work / "target"
     results = []
-    backend = "fdb" if args.fdb else "rocksdb" if args.rocksdb else None
-    mutants = {"fdb": FDB_MUTANTS, "rocksdb": ROCKSDB_MUTANTS, None: MUTANTS}[backend]
+    backend = "fdb" if args.fdb else "rocksdb" if args.rocksdb else "lionturtle" if args.lionturtle else None
+    mutants = {"fdb": FDB_MUTANTS, "rocksdb": ROCKSDB_MUTANTS, "lionturtle": LIONTURTLE_MUTANTS,
+               None: MUTANTS}[backend]
     if args.check:
         broken = 0
-        for name, replacements in MUTANTS + ROCKSDB_MUTANTS + FDB_MUTANTS:
+        for name, replacements in MUTANTS + ROCKSDB_MUTANTS + LIONTURTLE_MUTANTS + FDB_MUTANTS:
             if args.only and name not in args.only:
                 continue
             for path, old, new in replacements:
@@ -1103,11 +1220,12 @@ def catch(copy, target, seeds, backend=None):
 
 def catch_on_backend(copy, env, backend):
     """Which of a backend's suites catches the mutant, or MISSED."""
-    features = ["--features", backend, "--test", backend]
+    # lionturtle builds with every workspace, so it needs no feature.
+    features = ["--test", backend] if backend == "lionturtle" else ["--features", backend, "--test", backend]
     suites = [("storage conformance", ["-p", "inodedb-storage-conformance", *features]),
               ("API conformance", ["-p", "inodedb-tests", *features])]
-    if backend == "rocksdb":
-        suites.append(("unit tests", ["-p", "inodedb-storage-rocksdb", "--lib"]))
+    if backend in ("rocksdb", "lionturtle"):
+        suites.append(("unit tests", ["-p", f"inodedb-storage-{backend}", "--lib"]))
     for layer, selection in suites:
         result = run(copy, env, ["cargo", "test", "-q", "--release", *selection])
         if result is None:

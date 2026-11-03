@@ -86,3 +86,20 @@ fn seed_927052834940686739() {
 fn seed_927052834940736596() {
     passes(927052834940736596);
 }
+
+/// A file moved into a directory that left the subtree in the same commit
+/// counted as gained, so the subscriber kept no record of its leaving. A
+/// snapshot from before read its later state from storage.
+#[test]
+fn seed_15179128079008634066() {
+    passes(15179128079008634066);
+}
+
+/// A starting writer's first commit failed after a lease ran out. It loaded
+/// the lease again with a fresh time to live, kept the deletion it had
+/// queued, and its next commit removed the lease from storage, so the writer
+/// after it lost a lease it had just renewed.
+#[test]
+fn seed_16586037544200087192() {
+    passes(16586037544200087192);
+}

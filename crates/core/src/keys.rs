@@ -240,6 +240,26 @@ pub fn request_prefix(id: u128) -> Vec<u8> {
     key
 }
 
+/// The value of a request's expiry key: how many parts its record has, so
+/// deleting the record reads nothing. Empty for the one part nearly every
+/// record has.
+pub fn encode_parts(parts: u16) -> Vec<u8> {
+    if parts == 1 {
+        Vec::new()
+    } else {
+        parts.to_be_bytes().to_vec()
+    }
+}
+
+/// The number of parts an expiry key's value gives.
+pub fn decode_parts(value: &[u8]) -> Option<u16> {
+    match value {
+        [] => Some(1),
+        [high, low] => Some(u16::from_be_bytes([*high, *low])),
+        _ => None,
+    }
+}
+
 /// Request records by the time they expire, so expiry scans in order.
 pub fn request_expiry(at: u64, id: u128) -> Vec<u8> {
     let mut key = system(b't', 24);

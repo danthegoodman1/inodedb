@@ -5,7 +5,7 @@
 //! optimistically; snapshot reads use a RocksDB snapshot.
 //!
 //! A sync that must also grow a file commits the file system's journal, which
-//! costs up to three times the write itself on local NVMe and twice on gp3
+//! costs up to four times the write itself on local NVMe and twice on gp3
 //! (`BENCHMARKS.md`, "Devices"). So the WAL's files are written once when the
 //! store opens and overwritten from then on.
 

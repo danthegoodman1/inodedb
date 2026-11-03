@@ -1,15 +1,47 @@
 #!/bin/bash
 # Runs InodeDB's benchmarks with every store on one device at a time: the
-# local NVMe drive, then the gp3 volume, as scripts/ec2/setup mounted them.
-# FoundationDB runs one process per role. Cores stay out of idle states
-# slower than C1, then a last pass on local NVMe leaves them the instance's
-# default states. Run from the instance; results go to ~/results/<device>.
+# local NVMe drive, then any gp3 volume, as scripts/bench/setup mounted them.
+# FoundationDB runs one process per role. Cores run at their highest speed and
+# stay out of idle states slower than C1, then, where the machine has such
+# states, a last pass on local NVMe leaves it its default ones. Run from the
+# machine; results go to ~/results/<device>.
+#
+#     scripts/bench/run [BACKENDS]
+#
+# BACKENDS, a comma-separated list, runs those alone. Numbers join a table only
+# from the same machine in the same sitting: compare one backend's against those
+# already there before trusting the rest.
 set -euo pipefail
+shopt -s nullglob
+backends=${1:-memory,sqlite,rocksdb,lionturtle,fdb}
+fdb_wanted() { case ",$backends," in *,fdb,*) return 0 ;; *) return 1 ;; esac; }
+
 source ~/.cargo/env
 cd "$(dirname "$0")/../.."
 cargo build -q --release -p inodedb-tests --examples --features rocksdb,fdb
 ops=target/release/examples/ops
 commits=target/release/examples/commits
+expiry=target/release/examples/expiry
+
+# Runs a benchmark once per backend, each in its own process, and joins their
+# tables under one header. In one process, a backend inherits the allocator's
+# state and any threads of the backends before it.
+each_backend() { # the benchmark and its arguments, ahead of the backend
+  local backend first=1
+  for backend in ${backends//,/ }; do
+    "$@" "$backend" 2>/dev/null | grep '^|' | tail -n +$((first ? 1 : 3))
+    first=0
+  done
+}
+
+# Whether the machine has idle states that take over a microsecond to leave.
+deep_idle_exists() {
+  local state
+  for state in /sys/devices/system/cpu/cpu*/cpuidle/state*; do
+    if [ "$(cat "$state/latency")" -gt 1 ]; then return 0; fi
+  done
+  return 1
+}
 
 # Allows (0) or forbids (1) idle states that take over a microsecond to leave:
 # C1E and C6 on this instance. C6 takes 190 us, and every thread a request
@@ -112,22 +144,28 @@ PY
   sync_case "written blocks, fsync" --rw=randwrite --fallocate=none --overwrite=1 --fsync=1
 }
 
-run() { # device mount order
-  local device=$1 mount=$2 order=$3 out=~/results/$1
+run() { # device mount
+  local device=$1 mount=$2 out=~/results/$1
   mkdir -p "$out" "$mount/tmp"
-  fdb_on "$mount" "$out"
+  if fdb_wanted; then fdb_on "$mount" "$out"; fi
   fio_sync "$mount" "$out" | tee "$out/fio.txt"
-  TMPDIR="$mount/tmp" "$ops" 5 "$order" 2>/dev/null | grep '^|' | tee "$out/ops.md"
-  TMPDIR="$mount/tmp" "$commits" 3 2>/dev/null | grep '^|' | tee "$out/commits.md"
+  TMPDIR="$mount/tmp" each_backend "$ops" 5 | tee "$out/ops.md"
+  TMPDIR="$mount/tmp" each_backend "$commits" 3 | tee "$out/commits.md"
+  TMPDIR="$mount/tmp" each_backend "$expiry" 60 60 | tee "$out/expiry.md"
 }
 
 mkdir -p ~/results
+for governor in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+  echo performance | sudo tee "$governor" > /dev/null
+done
 deep_idle_off 1
-run nvme /mnt/nvme memory,sqlite,rocksdb,fdb
-run ebs /mnt/ebs fdb,rocksdb,sqlite,memory
+run nvme /mnt/nvme
+if mountpoint -q /mnt/ebs; then run ebs /mnt/ebs; fi
 
-# The same run on local NVMe with the instance's default idle states.
-deep_idle_off 0
-fdb_on /mnt/nvme ~/results/nvme
-TMPDIR=/mnt/nvme/tmp "$ops" 5 memory,sqlite,rocksdb,fdb 2>/dev/null | grep '^|' | tee ~/results/nvme/ops-default-idle.md
+# The same run on local NVMe with the machine's default idle states.
+if deep_idle_exists; then
+  deep_idle_off 0
+  if fdb_wanted; then fdb_on /mnt/nvme ~/results/nvme; fi
+  TMPDIR=/mnt/nvme/tmp each_backend "$ops" 5 | tee ~/results/nvme/ops-default-idle.md
+fi
 touch ~/results/done

@@ -5,10 +5,26 @@ use inodedb_core::delta::Freed;
 use inodedb_core::lease::{ClaimError, LeaseError};
 use inodedb_core::query::{Query, QueryResult, Target};
 use inodedb_core::types::{Error, Ino, ROOT};
-use inodedb_core::writer::Config;
+use inodedb_core::writer::{Action, CommitOutcome, Config, Writer};
 use inodedb_sim::harness::*;
+use inodedb_storage::Memory;
 
 const ADMIN: Caller = Caller::Trusted(ROOT);
+
+/// A writer started over `storage`, stopped at its first commit, and that
+/// commit's id.
+fn at_its_first_commit(storage: &Memory) -> (Writer, u64) {
+    let mut writer = Writer::new(Config::default(), Harness::writer_id(), 1_000, [7; 32]);
+    loop {
+        for action in writer.drain() {
+            match action {
+                Action::Read { id, reads } => writer.read_done(id, storage.read_now(&reads)),
+                Action::Commit { id, .. } => return (writer, id),
+                other => panic!("a starting writer asked for {other:?}"),
+            }
+        }
+    }
+}
 
 fn ino(h: &mut Harness, path: &str) -> Ino {
     match h.stat(path) {
@@ -199,6 +215,51 @@ fn a_lease_survives_its_writer() {
         .beat(ADMIN, lease, restarted.writer.version())
         .expect("beats");
     assert_eq!(restarted.claim(ADMIN, 10).1.len(), 1);
+}
+
+/// A lease that runs out while a writer starts comes back when the writer
+/// starts over, with nothing queued against it.
+#[test]
+fn a_writer_that_starts_over_keeps_the_leases_it_loads() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t")]);
+    let at = h.writer.version();
+    let lease = h.open_lease(ADMIN, at).expect("opens").lease;
+    let (mut writer, commit) = at_its_first_commit(&h.storage);
+    writer.set_now(1_000 + Config::default().lease_ttl);
+    writer.commit_done(commit, CommitOutcome::Failed);
+    let mut started = Harness::with_writer(h.storage.clone(), writer);
+    let version = started.writer.version();
+    started.beat(ADMIN, lease, version).expect("beats");
+    started.ops([mkdir("after")]);
+    started.ops([mkdir("later")]);
+    let mut next = Harness::with(started.storage.clone(), Config::default());
+    let version = next.writer.version();
+    next.beat(ADMIN, lease, version)
+        .expect("the renewed lease stays in storage");
+}
+
+/// A lease another writer ended while this one started is gone when this
+/// one starts over.
+#[test]
+fn a_writer_that_starts_over_drops_a_lease_gone_from_storage() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t")]);
+    let at = h.writer.version();
+    let lease = h.open_lease(ADMIN, at).expect("opens").lease;
+    let (mut writer, commit) = at_its_first_commit(&h.storage);
+    let mut other = Harness::with(h.storage.clone(), Config::default());
+    other.writer.release_lease(1_000, ADMIN, lease);
+    other.run();
+    other.ops([mkdir("after")]);
+    writer.commit_done(commit, CommitOutcome::Failed);
+    let mut started = Harness::with_writer(other.storage.clone(), writer);
+    assert_eq!(started.writer.leases().len(), 0);
+    let version = started.writer.version();
+    assert_eq!(
+        started.beat(ADMIN, lease, version),
+        Err(LeaseError::Expired)
+    );
 }
 
 #[test]

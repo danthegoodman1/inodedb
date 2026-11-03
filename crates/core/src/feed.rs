@@ -234,11 +234,26 @@ impl Subscriber {
             // which the undo keeps while a snapshot is open. A directory
             // that enters therefore brings nothing cached with it.
             let mut prune = false;
-            let gained: BTreeSet<Ino> = change
+            let mut gained: BTreeSet<Ino> = change
                 .entries
                 .iter()
                 .filter_map(|effect| effect.after.map(|after| after.child))
                 .collect();
+            // A commit in which a directory leaves shows no gain to be safe:
+            // the directory that gained a child may have gone with it, or
+            // beneath it, and uncached, nothing else records that it left.
+            // The worst of forgetting one that stayed is a read to fill it
+            // again, or a snapshot that ends early.
+            let directory_left = change.entries.iter().any(|effect| {
+                effect.before.is_some_and(|before| {
+                    before.kind == Kind::Dir
+                        && effect.after.is_none_or(|after| after.child != before.child)
+                        && !gained.contains(&before.child)
+                })
+            });
+            if directory_left {
+                gained.clear();
+            }
             let removed: BTreeSet<Ino> = change
                 .inodes
                 .iter()

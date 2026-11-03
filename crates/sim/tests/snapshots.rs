@@ -132,6 +132,75 @@ fn a_snapshot_reads_as_of_its_version() {
     assert_eq!(value(at(&h, &subscriber, now, read("a"))), "3");
 }
 
+/// A file moved into a directory that leaves the subtree in the same commit
+/// goes with it, though a name in the commit gained it. Its later changes reach
+/// no feed, so a snapshot from before finds it lost, never its current state.
+#[test]
+fn a_file_leaving_inside_a_leaving_directory_is_lost_to_older_snapshots() {
+    let mut h = Harness::new();
+    h.ops([mkdir("r"), mkdir("r/sub"), put("r/f", "old"), mkdir("out")]);
+    let root = ino(&mut h, "r");
+    let mut subscriber = Subscriber::new(root, h.writer.version());
+    let snapshot = subscriber.open_snapshot();
+    h.ops([mv("r/f", "r/sub/f"), mv("r/sub", "out/sub")]);
+    follow(&h, &mut subscriber);
+    h.ops([put("out/sub/f", "new")]);
+    follow(&h, &mut subscriber);
+    assert_eq!(
+        at(&h, &subscriber, snapshot, read("f")),
+        Err(Miss::TooOld),
+        "the snapshot read the file's state from outside its feed"
+    );
+}
+
+/// A file gained beneath a directory whose parent leaves goes too, though the
+/// directory that gained it lost no name of its own.
+#[test]
+fn a_file_leaving_beneath_a_leaving_directory_is_lost_to_older_snapshots() {
+    let mut h = Harness::new();
+    h.ops([mkdir_p("r/sub/deep"), put("r/f", "old"), mkdir("out")]);
+    let root = ino(&mut h, "r");
+    let mut subscriber = Subscriber::new(root, h.writer.version());
+    let snapshot = subscriber.open_snapshot();
+    h.ops([mv("r/f", "r/sub/deep/f"), mv("r/sub", "out/sub")]);
+    follow(&h, &mut subscriber);
+    h.ops([put("out/sub/deep/f", "new")]);
+    follow(&h, &mut subscriber);
+    assert_eq!(at(&h, &subscriber, snapshot, read("f")), Err(Miss::TooOld));
+}
+
+/// What the cache held of such a file still answers.
+#[test]
+fn a_cached_file_leaving_inside_a_leaving_directory_reads_as_it_was() {
+    let mut h = Harness::new();
+    h.ops([mkdir("r"), mkdir("r/sub"), put("r/f", "old"), mkdir("out")]);
+    let root = ino(&mut h, "r");
+    let mut subscriber = Subscriber::new(root, h.writer.version());
+    cache_listing(&mut h, &mut subscriber, "r");
+    let snapshot = subscriber.open_snapshot();
+    h.ops([mv("r/f", "r/sub/f"), mv("r/sub", "out/sub")]);
+    follow(&h, &mut subscriber);
+    h.ops([put("out/sub/f", "new")]);
+    follow(&h, &mut subscriber);
+    assert_eq!(value(at(&h, &subscriber, snapshot, read("f"))), "old");
+}
+
+/// A rename inside the subtree in a commit where nothing leaves keeps the
+/// file in sight, so snapshots read it as before.
+#[test]
+fn a_rename_that_stays_inside_keeps_its_file_in_sight() {
+    let mut h = Harness::new();
+    h.ops([mkdir("r"), mkdir("r/sub"), put("r/f", "old")]);
+    let root = ino(&mut h, "r");
+    let mut subscriber = Subscriber::new(root, h.writer.version());
+    let snapshot = subscriber.open_snapshot();
+    h.ops([mv("r/f", "r/sub/f")]);
+    follow(&h, &mut subscriber);
+    h.ops([put("r/sub/f", "new")]);
+    follow(&h, &mut subscriber);
+    assert_eq!(value(at(&h, &subscriber, snapshot, read("f"))), "old");
+}
+
 #[test]
 fn a_removed_directory_reads_as_the_cache_held_it() {
     let mut h = Harness::new();

@@ -341,6 +341,17 @@ fn a_request_record_without_its_expiry() {
 }
 
 #[test]
+fn an_expiry_that_miscounts_its_record() {
+    finds(
+        |s| {
+            let key = matching(s, |parsed| matches!(parsed, Parsed::System(b't', _)));
+            set(s, key, 7u16.to_be_bytes().to_vec());
+        },
+        "its expiry key says otherwise",
+    );
+}
+
+#[test]
 fn an_expiry_without_its_record() {
     finds(
         |s| {

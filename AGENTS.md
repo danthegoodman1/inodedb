@@ -16,7 +16,7 @@
 - The simulator checks responses against its naive path model, never against the core's own state.
 - A seed replays its run exactly. The simulator draws from its own PRNG; give each new source of randomness its own `Prng::stream`, so it leaves existing draws unchanged.
 - A bug the simulator finds becomes a regression test in `crates/sim/tests` that runs its seed. The commit message records the seed and the commit that failed.
-- Every backend passes `storage-conformance`. A change to the storage contract lands with its conformance test, and CI runs the suite on memory, SQLite, RocksDB and FoundationDB.
+- Every backend passes `storage-conformance`. A change to the storage contract lands with its conformance test, and CI runs the suite on memory, SQLite, RocksDB, lionturtle and FoundationDB.
 - Every API behavior needs a test in `tests/` that runs against a server on each backend.
 
 ## Commands
