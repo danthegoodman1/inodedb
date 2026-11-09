@@ -208,7 +208,8 @@ pub enum Answer {
         address: String,
     },
     Denied(Denied),
-    /// A key op committed at a version, or failed.
+    /// A key op committed at a version, or failed. A mint's key takes the
+    /// version as its id, unless a trusted caller named one.
     Key(Result<Version, KeyError>),
     Lease(Result<Granted, LeaseError>),
     /// Released entries a consumer claimed; no entries, and claim zero,
@@ -281,10 +282,14 @@ enum Work {
     Ack(Vec<FreeEntry>),
     /// Frees part of the subtree detached at a version under a directory.
     Reap(Version, Ino),
+    /// Deletes these keys if they have expired, with what they minted.
+    Expire(Vec<KeyId>),
 }
 
-/// The token of the writer's own work, whose answers go to no one.
+/// The tokens of the writer's own work, whose answers go to no one: the
+/// freeing of detached subtrees, and the deletion of expired keys.
 const INTERNAL: Token = Token::MAX;
+const EXPIRY: Token = Token::MAX - 1;
 
 /// A request in the writer's hands. Its work is shared, so holding it for
 /// its answer, or to run again after a failed group, copies nothing.
@@ -346,6 +351,13 @@ const CHORE_EVERY: Millis = 1_000;
 /// The most time a detached subtree waits for its next freeing while the
 /// writer is busy.
 const REAP_EVERY: Millis = 100;
+
+/// The least time between deletions of expired keys, unless the last one
+/// left more behind.
+const EXPIRE_KEYS_EVERY: Millis = 1_000;
+
+/// The most expired keys one deletion takes, beyond what they minted.
+pub const EXPIRE_KEYS_BUDGET: usize = 1_000;
 
 /// An answer held until the writer has committed `until`.
 #[derive(Debug)]
@@ -497,6 +509,12 @@ pub struct Writer {
     /// and its top, with the directories above the top as it detached.
     detached: BTreeMap<(Version, Ino), Vec<Ino>>,
     reaping: bool,
+    /// A deletion of expired keys is in the writer's hands.
+    expiring_keys: bool,
+    /// When the last deletion of expired keys went into the queue, and
+    /// whether it took a whole budget, leaving more behind.
+    keys_expired_at: Millis,
+    keys_left: bool,
     /// Ops run ahead of a waiting batch, for tests and metrics.
     read_ahead_ops: u64,
     /// When a freeing of a detached subtree last went into the queue.
@@ -571,6 +589,9 @@ impl Writer {
             listing: BTreeMap::new(),
             detached: BTreeMap::new(),
             reaping: false,
+            expiring_keys: false,
+            keys_expired_at: 0,
+            keys_left: false,
             read_ahead_ops: 0,
             reaped_at: 0,
             chore: None,
@@ -1150,10 +1171,10 @@ impl Writer {
     }
 
     fn answer(&mut self, token: Token, answer: Answer) {
-        if token == INTERNAL {
-            self.reaping = false;
-        } else {
-            self.actions.push(Action::Answer { token, answer });
+        match token {
+            INTERNAL => self.reaping = false,
+            EXPIRY => self.expiring_keys = false,
+            _ => self.actions.push(Action::Answer { token, answer }),
         }
     }
 
@@ -1325,7 +1346,7 @@ impl Writer {
     fn prepare(&mut self, sub: &Submitted) -> Result<(), Vec<Read>> {
         let need = match *sub.work {
             Work::Batch(_) | Work::Ack(_) | Work::Reap(..) => Grant::Write,
-            Work::Key(_) => Grant::Admin,
+            Work::Key(_) | Work::Expire(_) => Grant::Admin,
             Work::Lease(..) => Grant::Read,
         };
         let authorized = {
@@ -1385,6 +1406,23 @@ impl Writer {
                 let mut writes = delta.write_set();
                 writes.log.push((version, log.encode()));
                 self.add(sub, delta, version, Answer::Unavailable, writes, None);
+                Ok(())
+            }
+            Work::Expire(ids) => {
+                let delta = {
+                    let view = Overlaid {
+                        overlay: &self.overlay,
+                        base: &self.cache,
+                    };
+                    exec::execute_expiry(ids, self.now, self.next_version, &view)
+                };
+                if delta.is_empty() {
+                    // A revocation took them first.
+                    let seen = self.seen();
+                    self.hold(seen, sub.clone(), Answer::Unavailable);
+                } else {
+                    self.add_change(sub, delta, Answer::Unavailable);
+                }
                 Ok(())
             }
             Work::Ack(entries) => {
@@ -1631,6 +1669,21 @@ impl Writer {
             self.reaped_at = self.now;
             self.enqueue(INTERNAL, Caller::Trusted(ROOT), Work::Reap(at, top));
             return self.send();
+        }
+        // Delete expired keys once a second, in commits of a bounded
+        // size, and at once while a backlog fills each commit.
+        if !self.expiring_keys
+            && (self.keys_left || self.now >= self.keys_expired_at + EXPIRE_KEYS_EVERY)
+        {
+            let ids = self.cache.keys().expired(self.now, EXPIRE_KEYS_BUDGET);
+            self.keys_left = false;
+            if !ids.is_empty() {
+                self.expiring_keys = true;
+                self.keys_expired_at = self.now;
+                self.keys_left = ids.len() == EXPIRE_KEYS_BUDGET;
+                self.enqueue(EXPIRY, Caller::Trusted(ROOT), Work::Expire(ids));
+                return self.send();
+            }
         }
         if self.in_flight.is_some() {
             return;

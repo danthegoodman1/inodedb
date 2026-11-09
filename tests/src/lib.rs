@@ -37,7 +37,7 @@ macro_rules! api_conformance {
             leases_hold_the_log, caches_hold_a_lease, snapshots_hold_their_version,
             snapshots_hold_what_they_read, caches_start_under_steady_writes,
             claims_read_values_their_file_outlived, listings_hold_the_whole_free_queue,
-            checks_take_a_root_admin_key,
+            checks_take_a_root_admin_key, keys_expire_and_leave_the_store,
             dropping_a_server_closes_its_store, a_stream_ends_when_its_client_leaves,
             clients_reconnect_to_a_restarted_server, a_stream_outlives_its_client_handle,
             lease_streams_send_every_beat);
@@ -1591,6 +1591,65 @@ pub async fn keys_bound_their_reach<B: Backend>(backend: &mut B) {
     db.commit([Op::remove_all("t/a")]).await.expect("commits");
     assert_eq!(code(reader.stat("").await), Code::Unauthenticated);
     assert_eq!(writer.list("").await.expect("lists").entries.len(), 0);
+}
+
+/// A key minted through the server takes the version that minted it as
+/// its id. Once its TTL passes it stops working, and the writer deletes it
+/// with the keys minted from it.
+pub async fn keys_expire_and_leave_the_store<B: Backend>(backend: &mut B) {
+    let Fixture { db, server, .. } = fresh(backend).await;
+    db.commit([Op::mkdir("t")]).await.expect("commits");
+    let before = db.version();
+    let day = std::time::Duration::from_secs(86_400);
+    let id = |key: &str| u64::from_str_radix(&key[..16], 16).expect("a key's id is hex");
+    let connect = |key: String| {
+        let endpoint = server.endpoint();
+        async move { Client::connect(endpoint, &key).await.expect("connects") }
+    };
+    let admin_key = db
+        .mint_key("t", inodedb::Grant::Admin, day)
+        .await
+        .expect("mints");
+    let admin = connect(admin_key.clone()).await;
+    let short_key = admin
+        .mint_key("", inodedb::Grant::Admin, std::time::Duration::from_secs(1))
+        .await
+        .expect("mints");
+    let short = connect(short_key.clone()).await;
+    let minted_key = short
+        .mint_key("", inodedb::Grant::Read, day)
+        .await
+        .expect("mints");
+    let minted = connect(minted_key.clone()).await;
+    assert!(
+        before < id(&admin_key)
+            && id(&admin_key) < id(&short_key)
+            && id(&short_key) < id(&minted_key),
+        "ids {admin_key} {short_key} {minted_key} after version {before}"
+    );
+    minted.stat("").await.expect("stats");
+    // An expired key reads as expired until the writer deletes it, and as
+    // unknown after.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match short.stat("").await {
+            Err(Error::Status(status)) if status.message() == "unknown or revoked key" => break,
+            Err(Error::Status(status)) if status.message() == "the key expired" => {}
+            Ok(_) => {}
+            other => panic!("expected the key to work, expire or go, got {other:?}"),
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the expired key stays"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    match minted.stat("").await {
+        Err(Error::Status(status)) => assert_eq!(status.message(), "unknown or revoked key"),
+        other => panic!("the minted key outlived its minter: {other:?}"),
+    }
+    assert_eq!(code(admin.revoke_key(&short_key).await), Code::NotFound);
+    admin.stat("").await.expect("the admin key stands");
 }
 
 /// A stream ends when its key is revoked.

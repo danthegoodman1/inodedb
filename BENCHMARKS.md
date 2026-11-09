@@ -2,11 +2,12 @@
 
 Measurements that guide InodeDB's design. Each names its command, so it can be run again after a change.
 
-Three machines:
+Four machines:
 
 - **Metal,** for "Devices", "Operations", "Before and after", "Group commit", "Expiring records", "Failover" and "Path resolution": a Latitude.sh `f4.metal.medium` (AMD EPYC 4564P, 16 cores and 32 threads in two L3 groups, one NUMA node, 187 GiB) on Ubuntu 24.04 with Linux 6.8, its CPU governor at `performance`. Every store sits on one Micron NVMe drive (MTFDKCC1T9TGP), which reports no volatile write cache, under XFS. FoundationDB 7.3.79 runs one process per role on the `ssd-2` engine, with single replication and its data on the same drive: coordinator, cluster controller, master, commit proxy, GRV proxy, resolver, log, storage, ratekeeper, data distributor and consistency scan. `scripts/bench/setup` prepares the machine, and `scripts/bench/run` runs the benchmarks, checks that each role holds a process of its own, and records them in `fdb-roles.txt`. Every metal table comes from one sitting of about an hour. Each backend runs in its own process: in one process, whichever backend ran second lost up to 3%. Controls after the sitting stayed within 2% of its start on stats at 64 clients and within 4% on puts.
 - **EC2,** for "Network storage" and "Idle states": an i7ie.6xlarge (Intel Xeon Platinum 8559C, 24 vCPUs, 192 GiB) on Ubuntu 24.04 with Linux 7.0, with a gp3 volume provisioned at gp3's maximum of 80,000 IOPS and 2,000 MiB/s. Those runs predate the lionturtle backend. Its speed varies between sittings: on the same code and kernel, two instances launched later that day ran about 15% slower across the board, and path resolution, which touches neither disk nor network, 34% slower. So compare numbers only within one sitting on one machine.
-- **A Mac** for "Footprint", "Revocation" and "Freeing a subtree", which measure memory and CPU, and beside metal in "Path resolution": an Apple M3 Max (16 cores, 128 GB) on macOS 26.6.
+- **A Mac** for "Footprint" and "Freeing a subtree", which measure memory and CPU, and beside metal in "Path resolution": an Apple M3 Max (16 cores, 128 GB) on macOS 26.6.
+- **A Linux desktop** for "Revocation", which measures CPU, and the key rows of "Footprint": an Intel Core Ultra 9 285 (24 cores, 125 GiB) on Ubuntu 26.04 with Linux 7.0. The Footprint rows it shares with the Mac match byte for byte.
 
 Every run uses a release build.
 
@@ -277,7 +278,7 @@ A writer and a standby share a store. Eight clients that know only the standby's
 cargo run --release -p inodedb-tests --example footprint
 ```
 
-What state costs. Log and storage bytes come from the harness's writer over the memory backend; the tree's directories are three deep, and each batch carries a request id. Memory counts the bytes allocations ask for, for the writer alone, over 200,000 batches each adding one item, against storage that keeps nothing, beside what its cache charges for them. Each cached record is 200,000 of its kind filled into an empty cache. The undo is what a subscriber holding a snapshot open keeps beyond one without, over 10,000 replaced values, beside what the `undo_bytes` budget charges for it.
+What state costs. Log and storage bytes come from the harness's writer over the memory backend; the tree's directories are three deep, and each batch carries a request id. Memory counts the bytes allocations ask for, for the writer alone, over 200,000 batches each adding one item, against storage that keeps nothing, beside what its cache charges for them. Each key is one of 50,000 that an admin key mints, measured while they live and again once they have expired and the writer has deleted them. Each cached record is 200,000 of its kind filled into an empty cache. The undo is what a subscriber holding a snapshot open keeps beyond one without, over 10,000 replaced values, beside what the `undo_bytes` budget charges for it.
 
 | Batch | Log entry bytes | Tree and record bytes |
 | --- | ---: | ---: |
@@ -291,6 +292,8 @@ What state costs. Log and storage bytes come from the harness's writer over the 
 | --- | ---: | ---: |
 | Live request record, in the writer's memory | 98 | none |
 | Cached empty file: inode, entry, back-pointer and value | 910 | 983 |
+| Live key with a TTL, in the writer's memory | 225 | none |
+| Key minted by a key, once expired and deleted | 0 | none |
 | Snapshot undo per replaced value | 162 | 160 |
 
 | Cached record | Held | Charged |
@@ -332,13 +335,15 @@ Resolution walks one map per level, so its cost grows with depth and the logarit
 cargo run --release -p inodedb-tests --example revoke
 ```
 
-Keys minted under one admin key, all revoked in one commit, through the harness's writer over the memory backend: by revoking the admin key, and by removing the directory every key is rooted at.
+Keys minted under one admin key, through the harness's writer over the memory backend, revoked in one commit by revoking the admin key or by removing the directory every key is rooted at. The last column mints them each with the same TTL under an admin key that never expires, and times the writer's deletions once they expire: a thousand keys to a commit, each commit sent as the one before lands. Four runs stayed within 5% of one another; the table is the last.
 
-| Keys | Revoke the minter | Remove their root |
-| ---: | ---: | ---: |
-| 4,000 | 2.9 ms | 3.1 ms |
-| 16,000 | 11.9 ms | 12.8 ms |
-| 64,000 | 52.4 ms | 58.0 ms |
+| Keys | Revoke the minter | Remove their root | Delete them once expired |
+| ---: | ---: | ---: | ---: |
+| 4,000 | 1.9 ms | 1.8 ms | 1.5 ms |
+| 16,000 | 8.6 ms | 8.1 ms | 6.4 ms |
+| 64,000 | 44.8 ms | 49.6 ms | 33.3 ms |
+
+Deleting an expired key costs the writer about half a microsecond. Finding that none is due reads the first entry of an index ordered by expiry.
 
 Revocation follows each key's minted keys through an index, so its cost grows with the keys it revokes. A store holds at most 100,000 keys, so revoking all of them fits one commit.
 

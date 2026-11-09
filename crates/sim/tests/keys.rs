@@ -1,5 +1,5 @@
-//! Scripted scenarios for keys: roots, grants, minting, revocation, and
-//! reads by handle.
+//! Scripted scenarios for keys: roots, grants, minting, revocation,
+//! expiry, and reads by handle.
 
 use inodedb_core::auth::{Caller, Denied, Grant, KeyError, KeyOp};
 use inodedb_core::ops::{CommitResult, Outcome, Skip};
@@ -49,7 +49,7 @@ fn denied(answer: &Answer) -> Option<Denied> {
 fn a_key_resolves_paths_from_its_root() {
     let mut h = Harness::new();
     h.ops([mkdir_p("t/a"), put("t/a/f", "x"), put("g", "y")]);
-    let key = h.mint(ADMIN, 1, "t", Grant::Write, 0);
+    let key = h.mint(ADMIN, "t", Grant::Write, 0);
     assert!(found(&stat_as(&mut h, key, Target::Path(p("a/f")))));
     assert!(!found(&stat_as(&mut h, key, Target::Path(p("g")))));
     let result = committed(h.ops_as(key, [put("a/h", "z"), mkdir("b")]));
@@ -73,13 +73,13 @@ fn a_key_resolves_paths_from_its_root() {
 fn grants_bound_what_a_key_does() {
     let mut h = Harness::new();
     h.ops([mkdir("t")]);
-    let reader = h.mint(ADMIN, 1, "t", Grant::Read, 0);
-    let writer = h.mint(ADMIN, 2, "t", Grant::Write, 0);
+    let reader = h.mint(ADMIN, "t", Grant::Read, 0);
+    let writer = h.mint(ADMIN, "t", Grant::Write, 0);
     assert!(found(&stat_as(&mut h, reader, Target::Path(p("")))));
     assert_eq!(denied(&h.ops_as(reader, [mkdir("a")])), Some(Denied::Grant));
     assert!(matches!(h.ops_as(writer, [mkdir("a")]), Answer::Commit(_)));
     let mint = KeyOp::Mint {
-        id: 3,
+        id: None,
         hash: key_hash(3),
         root: p("a"),
         grant: Grant::Read,
@@ -87,7 +87,7 @@ fn grants_bound_what_a_key_does() {
     };
     assert_eq!(denied(&h.key_op(writer, mint)), Some(Denied::Grant));
     let impostor = Caller::Key {
-        id: 2,
+        id: key_id(writer),
         hash: key_hash(9),
     };
     assert_eq!(
@@ -100,52 +100,59 @@ fn grants_bound_what_a_key_does() {
 fn minted_keys_stay_within_their_minter() {
     let mut h = Harness::new();
     h.ops([mkdir_p("t/a/b"), put("t/f", "x")]);
-    let admin = h.mint(ADMIN, 1, "t", Grant::Admin, 10_000);
-    let mint = |id, root: &str, grant, ttl| KeyOp::Mint {
-        id,
-        hash: key_hash(id),
+    let admin = h.mint(ADMIN, "t", Grant::Admin, 10_000);
+    let mint = |root: &str, grant, ttl| KeyOp::Mint {
+        id: None,
+        hash: key_hash(2),
         root: p(root),
         grant,
         ttl,
     };
     assert_eq!(
-        h.key_op(admin, mint(2, "f", Grant::Read, 0)),
+        h.key_op(admin, mint("f", Grant::Read, 0)),
         Answer::Key(Err(KeyError::Fs(Error::NotDir)))
     );
     assert_eq!(
-        h.key_op(admin, mint(2, "x", Grant::Read, 0)),
+        h.key_op(admin, mint("x", Grant::Read, 0)),
         Answer::Key(Err(KeyError::Fs(Error::NotFound)))
     );
-    assert_eq!(
-        h.key_op(admin, mint(1, "a", Grant::Read, 0)),
-        Answer::Key(Err(KeyError::Exists))
-    );
-    let nested = h.mint(admin, 2, "a", Grant::Admin, 0);
-    let deeper = h.mint(nested, 3, "b", Grant::Read, 50_000);
+    let nested = h.mint(admin, "a", Grant::Admin, 0);
+    let deeper = h.mint(nested, "b", Grant::Read, 50_000);
     assert!(found(&stat_as(&mut h, deeper, Target::Path(p("")))));
     assert_eq!(
-        h.key_op(deeper, mint(4, "", Grant::Read, 0)),
+        h.key_op(deeper, mint("", Grant::Read, 0)),
         Answer::Denied(Denied::Grant)
     );
     // Neither key outlives its minter.
     let keys = h.writer.keys();
-    let expires = |id| keys.get(id).expect("minted").expires;
+    let expires = |caller| keys.get(key_id(caller)).expect("minted").expires;
     assert_eq!(
-        (expires(1), expires(2), expires(3)),
+        (expires(admin), expires(nested), expires(deeper)),
         (11_000, 11_000, 11_000)
     );
-    h.tick(10_000);
+    // An expired key is refused at once, and the writer's next deletion
+    // takes it with the keys it minted.
+    h.tick(9_999);
+    h.now += 1;
+    h.writer.set_now(h.now);
     assert_eq!(
         denied(&stat_as(&mut h, deeper, Target::Path(p("")))),
         Some(Denied::Expired)
     );
+    h.tick(0);
+    assert_eq!(
+        denied(&stat_as(&mut h, deeper, Target::Path(p("")))),
+        Some(Denied::Unknown)
+    );
+    assert!(h.writer.keys().is_empty());
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
 
 #[test]
 fn a_key_follows_its_root_through_renames() {
     let mut h = Harness::new();
     h.ops([mkdir_p("t/a"), put("t/a/f", "x"), mkdir("u")]);
-    let key = h.mint(ADMIN, 1, "t/a", Grant::Write, 0);
+    let key = h.mint(ADMIN, "t/a", Grant::Write, 0);
     h.ops([mv("t/a", "u/b")]);
     assert!(found(&stat_as(&mut h, key, Target::Path(p("f")))));
     committed(h.ops_as(key, [put("g", "y")]));
@@ -157,11 +164,11 @@ fn a_key_follows_its_root_through_renames() {
 fn freeing_or_detaching_a_root_revokes_its_keys() {
     let mut h = Harness::new();
     h.ops([mkdir_p("t/a/b"), mkdir_p("u/c/d")]);
-    let at_a = h.mint(ADMIN, 1, "t/a", Grant::Admin, 0);
-    let minted = h.mint(at_a, 2, "b", Grant::Read, 0);
-    let at_b = h.mint(ADMIN, 3, "t/a/b", Grant::Read, 0);
-    let at_d = h.mint(ADMIN, 4, "u/c/d", Grant::Read, 0);
-    let at_u = h.mint(ADMIN, 5, "u", Grant::Read, 0);
+    let at_a = h.mint(ADMIN, "t/a", Grant::Admin, 0);
+    let minted = h.mint(at_a, "b", Grant::Read, 0);
+    let at_b = h.mint(ADMIN, "t/a/b", Grant::Read, 0);
+    let at_d = h.mint(ADMIN, "u/c/d", Grant::Read, 0);
+    let at_u = h.mint(ADMIN, "u", Grant::Read, 0);
     // Freeing b takes the keys rooted there, whoever minted them.
     h.ops([rmdir("t/a/b")]);
     assert_eq!(
@@ -182,7 +189,7 @@ fn freeing_or_detaching_a_root_revokes_its_keys() {
     assert!(found(&stat_as(&mut h, at_u, Target::Path(p("")))));
     // Renaming onto an empty directory frees it.
     h.ops([mkdir("t/x"), mkdir("t/y")]);
-    let at_y = h.mint(ADMIN, 6, "t/y", Grant::Read, 0);
+    let at_y = h.mint(ADMIN, "t/y", Grant::Read, 0);
     h.ops([mv("t/x", "t/y")]);
     assert_eq!(
         denied(&stat_as(&mut h, at_y, Target::Path(p("")))),
@@ -195,23 +202,21 @@ fn freeing_or_detaching_a_root_revokes_its_keys() {
 fn revoking_a_key_revokes_what_it_minted() {
     let mut h = Harness::new();
     h.ops([mkdir_p("t/a/b")]);
-    let top = h.mint(ADMIN, 1, "t", Grant::Admin, 0);
-    let middle = h.mint(top, 2, "a", Grant::Admin, 0);
-    let bottom = h.mint(middle, 3, "b", Grant::Admin, 0);
-    let sibling = h.mint(top, 4, "a", Grant::Read, 0);
+    let top = h.mint(ADMIN, "t", Grant::Admin, 0);
+    let middle = h.mint(top, "a", Grant::Admin, 0);
+    let bottom = h.mint(middle, "b", Grant::Admin, 0);
+    let sibling = h.mint(top, "a", Grant::Read, 0);
     // A key revokes only itself and what came from it.
+    let revoke = |caller| KeyOp::Revoke { id: key_id(caller) };
     assert_eq!(
-        h.key_op(bottom, KeyOp::Revoke { id: 2 }),
+        h.key_op(bottom, revoke(middle)),
         Answer::Key(Err(KeyError::NotFound))
     );
     assert_eq!(
-        h.key_op(middle, KeyOp::Revoke { id: 4 }),
+        h.key_op(middle, revoke(sibling)),
         Answer::Key(Err(KeyError::NotFound))
     );
-    assert!(matches!(
-        h.key_op(top, KeyOp::Revoke { id: 2 }),
-        Answer::Key(Ok(_))
-    ));
+    assert!(matches!(h.key_op(top, revoke(middle)), Answer::Key(Ok(_))));
     for gone in [middle, bottom] {
         assert_eq!(
             denied(&stat_as(&mut h, gone, Target::Path(p("")))),
@@ -219,10 +224,7 @@ fn revoking_a_key_revokes_what_it_minted() {
         );
     }
     assert!(found(&stat_as(&mut h, sibling, Target::Path(p("")))));
-    assert!(matches!(
-        h.key_op(top, KeyOp::Revoke { id: 1 }),
-        Answer::Key(Ok(_))
-    ));
+    assert!(matches!(h.key_op(top, revoke(top)), Answer::Key(Ok(_))));
     assert!(h.writer.keys().is_empty());
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
@@ -231,10 +233,11 @@ fn revoking_a_key_revokes_what_it_minted() {
 fn a_batch_queued_behind_a_revocation_is_refused() {
     let mut h = Harness::new();
     h.ops([mkdir("t")]);
-    let key = h.mint(ADMIN, 1, "t", Grant::Write, 0);
+    let key = h.mint(ADMIN, "t", Grant::Write, 0);
     // Both arrive before either commits; the batch runs after the revoke.
     let (revoke, batch) = (h.token(), h.token());
-    h.writer.submit_key(revoke, ADMIN, KeyOp::Revoke { id: 1 });
+    h.writer
+        .submit_key(revoke, ADMIN, KeyOp::Revoke { id: key_id(key) });
     h.writer.submit(
         batch,
         key,
@@ -262,7 +265,7 @@ fn a_read_by_handle_stays_within_the_key() {
         put("u/g", "y"),
     ]);
     h.ops([link("u/g", "t/a/g")]);
-    let key = h.mint(ADMIN, 1, "t", Grant::Read, 0);
+    let key = h.mint(ADMIN, "t", Grant::Read, 0);
     let (dir_in, file_in, dir_out, file_out) = (
         ino(&mut h, "t/a"),
         ino(&mut h, "t/a/f"),
@@ -311,7 +314,7 @@ fn a_read_by_handle_stays_within_the_key() {
 fn keys_survive_a_restart() {
     let mut h = Harness::new();
     h.ops([mkdir("t")]);
-    let key = h.mint(ADMIN, 1, "t", Grant::Write, 0);
+    let key = h.mint(ADMIN, "t", Grant::Write, 0);
     let secret = h.writer.handle_secret();
     let mut restarted = Harness::with(h.storage.clone(), Default::default());
     assert!(matches!(
@@ -326,9 +329,9 @@ fn keys_survive_a_restart() {
 fn a_freed_file_stays_within_the_keys_that_held_it() {
     let mut h = Harness::new();
     h.ops([mkdir_p("t/a"), mkdir("u"), put("t/a/x", "gone soon")]);
-    let at_t = h.mint(ADMIN, 1, "t", Grant::Read, 0);
-    let at_a = h.mint(ADMIN, 2, "t/a", Grant::Read, 0);
-    let at_u = h.mint(ADMIN, 3, "u", Grant::Read, 0);
+    let at_t = h.mint(ADMIN, "t", Grant::Read, 0);
+    let at_a = h.mint(ADMIN, "t/a", Grant::Read, 0);
+    let at_u = h.mint(ADMIN, "u", Grant::Read, 0);
     let x = ino(&mut h, "t/a/x");
     h.ops([unlink("t/a/x")]);
     for key in [at_t, at_a] {
@@ -364,13 +367,13 @@ fn a_freed_file_stays_within_the_keys_that_held_it() {
 fn a_revoked_id_never_mints_again() {
     let mut h = Harness::new();
     h.ops([mkdir("t")]);
-    h.mint(ADMIN, 1, "t", Grant::Read, 0);
+    h.mint_named(1, "t", Grant::Read, 0);
     assert!(matches!(
         h.key_op(ADMIN, KeyOp::Revoke { id: 1 }),
         Answer::Key(Ok(_))
     ));
     let again = KeyOp::Mint {
-        id: 1,
+        id: Some(1),
         hash: key_hash(1),
         root: p("t"),
         grant: Grant::Admin,
@@ -392,8 +395,8 @@ fn a_revoked_id_never_mints_again() {
 fn a_request_id_answers_only_its_own_key() {
     let mut h = Harness::new();
     h.ops([mkdir("a"), mkdir("b")]);
-    let at_a = h.mint(ADMIN, 1, "a", Grant::Write, 0);
-    let at_b = h.mint(ADMIN, 2, "b", Grant::Write, 0);
+    let at_a = h.mint(ADMIN, "a", Grant::Write, 0);
+    let at_b = h.mint(ADMIN, "b", Grant::Write, 0);
     let batch = |path: &str| inodedb_core::ops::Batch {
         ops: vec![put(path, "x")],
         request_id: 77,
@@ -413,16 +416,152 @@ fn a_request_id_answers_only_its_own_key() {
 fn revoking_a_key_revokes_thousands_minted_from_it() {
     let mut h = Harness::new();
     h.ops([mkdir("t")]);
-    let top = h.mint(ADMIN, 1, "t", Grant::Admin, 0);
-    let middle = h.mint(top, 2, "", Grant::Admin, 0);
-    for id in 3..2_003 {
-        let minter = if id % 2 == 0 { top } else { middle };
-        h.mint(minter, id, "", Grant::Read, 0);
+    let top = h.mint(ADMIN, "t", Grant::Admin, 0);
+    let middle = h.mint(top, "", Grant::Admin, 0);
+    for n in 0..2_000 {
+        let minter = if n % 2 == 0 { top } else { middle };
+        h.mint(minter, "", Grant::Read, 0);
     }
     assert!(matches!(
-        h.key_op(ADMIN, KeyOp::Revoke { id: 1 }),
+        h.key_op(ADMIN, KeyOp::Revoke { id: key_id(top) }),
         Answer::Key(Ok(_))
     ));
     assert!(h.writer.keys().is_empty());
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn a_key_minted_by_a_key_takes_its_version_as_its_id() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t")]);
+    let operator = h.mint_named(0x5eed, "t", Grant::Admin, 0);
+    assert_eq!(key_id(operator), 0x5eed);
+    let mint = |id| KeyOp::Mint {
+        id,
+        hash: key_hash(1),
+        root: p(""),
+        grant: Grant::Read,
+        ttl: 0,
+    };
+    // A key's mint takes its version, whatever id it names.
+    for named in [None, Some(0x5eed)] {
+        let Answer::Key(Ok(version)) = h.key_op(operator, mint(named)) else {
+            panic!("mints");
+        };
+        let minted = Caller::Key {
+            id: version,
+            hash: key_hash(1),
+        };
+        assert!(found(&stat_as(&mut h, minted, Target::Path(p("")))));
+        assert_eq!(
+            h.writer.keys().get(version).map(|record| record.minted_by),
+            Some(Some(0x5eed))
+        );
+    }
+    assert_eq!(h.writer.keys().len(), 3);
+}
+
+#[test]
+fn an_expired_key_leaves_nothing_behind() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t")]);
+    let operator = h.mint(ADMIN, "t", Grant::Admin, 0);
+    let (records, tombstones) = h.stored_keys();
+    let short: Vec<Caller> = (0..10)
+        .map(|n| h.mint(operator, "", Grant::Read, 1_000 + n))
+        .collect();
+    let revoked = h.mint(operator, "", Grant::Read, 0);
+    assert!(matches!(
+        h.key_op(
+            operator,
+            KeyOp::Revoke {
+                id: key_id(revoked)
+            }
+        ),
+        Answer::Key(Ok(_))
+    ));
+    assert_eq!(h.stored_keys(), (records + short.len(), tombstones));
+    // Expired keys go once the writer's next deletion runs, a second at
+    // most after they expire, and keys minted by keys leave no tombstones.
+    h.tick(2_000);
+    for key in &short {
+        assert_eq!(
+            denied(&stat_as(&mut h, *key, Target::Path(p("")))),
+            Some(Denied::Unknown)
+        );
+    }
+    assert_eq!(h.stored_keys(), (records, tombstones));
+    assert_eq!(h.writer.keys().len(), 1);
+    assert_eq!(h.writer.keys().tombstones(), 0);
+    // The operator's own keys leave tombstones.
+    let named = h.mint_named(0x5eed, "t", Grant::Read, 500);
+    h.tick(1_000);
+    assert_eq!(
+        denied(&stat_as(&mut h, named, Target::Path(p("")))),
+        Some(Denied::Unknown)
+    );
+    assert_eq!(h.stored_keys(), (records, tombstones + 1));
+    let again = KeyOp::Mint {
+        id: Some(0x5eed),
+        hash: key_hash(1),
+        root: p("t"),
+        grant: Grant::Read,
+        ttl: 0,
+    };
+    assert_eq!(h.key_op(ADMIN, again), Answer::Key(Err(KeyError::Exists)));
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn an_expired_key_takes_what_it_minted_in_one_commit() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t")]);
+    let top = h.mint(ADMIN, "t", Grant::Admin, 1_000);
+    // More than a deletion's budget, all expiring with the key that
+    // minted them.
+    for _ in 0..inodedb_core::writer::EXPIRE_KEYS_BUDGET + 500 {
+        h.mint(top, "", Grant::Read, 0);
+    }
+    h.tick(1_000);
+    assert_eq!(h.key_deletions().len(), 1);
+    assert!(h.writer.keys().is_empty());
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn expired_keys_go_in_bounded_commits_one_after_another() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t")]);
+    let budget = inodedb_core::writer::EXPIRE_KEYS_BUDGET;
+    for _ in 0..2 * budget + 500 {
+        h.mint(ADMIN, "t", Grant::Read, 1_000);
+    }
+    // A backlog's commits follow one another without waiting.
+    h.tick(1_000);
+    let deleted: Vec<usize> = h.key_deletions().iter().map(|(_, count)| *count).collect();
+    assert_eq!(deleted, vec![budget, budget, 500]);
+    assert!(h.writer.keys().is_empty());
+}
+
+#[test]
+fn a_writer_deletes_keys_that_expired_while_none_ran() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t")]);
+    let operator = h.mint(ADMIN, "t", Grant::Admin, 0);
+    let short = h.mint(operator, "", Grant::Read, 5_000);
+    let writer = inodedb_core::writer::Writer::new(
+        Default::default(),
+        Harness::writer_id(),
+        h.now + 60_000,
+        [7; 32],
+    );
+    let mut h = Harness::with_writer(h.storage.clone(), writer);
+    h.now += 60_000;
+    h.tick(0);
+    assert_eq!(
+        denied(&stat_as(&mut h, short, Target::Path(p("")))),
+        Some(Denied::Unknown)
+    );
+    assert!(found(&stat_as(&mut h, operator, Target::Path(p("")))));
+    assert_eq!(h.stored_keys().0, 1);
 }

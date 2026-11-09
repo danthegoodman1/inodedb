@@ -22,7 +22,7 @@ fn store() -> Store {
     let mut h = Harness::new();
     h.ops([mkdir_p("a/b"), put("a/f", "value")]);
     h.ops([link("a/f", "a/b/g")]);
-    h.mint(Caller::Trusted(ROOT), 7, "a", Grant::Write, u64::MAX);
+    h.mint(Caller::Trusted(ROOT), "a", Grant::Write, u64::MAX);
     h.commit(inodedb_core::ops::Batch {
         ops: vec![set_mtime("a", 5)],
         request_id: 1 << 64 | 1,

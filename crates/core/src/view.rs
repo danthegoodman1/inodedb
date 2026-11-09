@@ -167,7 +167,9 @@ pub trait View {
     fn detach_entry(&self, version: Version, ino: Ino) -> Lookup<Option<Vec<Ino>>>;
     /// A key's record. The writer's views hold every key.
     fn key(&self, id: KeyId) -> Option<KeyRecord>;
-    /// Whether a key with this id was revoked.
+    /// Whether a tombstone keeps this id from minting again: a deleted
+    /// operator key held it. A layer of changes counts every key it
+    /// deletes.
     fn key_retired(&self, id: KeyId) -> bool;
     fn keys_rooted_at(&self, dir: Ino) -> Vec<KeyId>;
     fn keys_minted_by(&self, id: KeyId) -> Vec<KeyId>;

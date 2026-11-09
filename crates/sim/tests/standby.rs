@@ -83,7 +83,7 @@ fn a_standby_answers_reads_at_a_version_and_sends_the_rest_on() {
         )]
     );
     // A read past the follower waits for the log.
-    let key = h.mint(trusted, 9, "a", Grant::Read, 0);
+    let key = h.mint(trusted, "a", Grant::Read, 0);
     // A key newer than the log the follower has read is the writer's to
     // judge.
     follower.query(2, key, read("f"), follower.version());
@@ -366,8 +366,8 @@ fn a_standby_follows_links_through_renames() {
     let mut h = Harness::with(inodedb_storage::Memory::new(), config());
     h.ops([mkdir("a"), mkdir("b"), mkdir("c"), put("a/x", "1")]);
     let trusted = Caller::Trusted(inodedb_core::types::ROOT);
-    let in_a = h.mint(trusted, 1, "a", Grant::Read, 0);
-    let in_b = h.mint(trusted, 2, "b", Grant::Read, 0);
+    let in_a = h.mint(trusted, "a", Grant::Read, 0);
+    let in_b = h.mint(trusted, "b", Grant::Read, 0);
     let file = ino(&mut h, "a/x");
     let mut follower = Follower::new(config(), h.now);
     run(&h, &mut follower);

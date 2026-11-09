@@ -1,9 +1,15 @@
 //! Keys: which subtree a request reaches and what it may do there.
 //!
 //! A key's record holds a hash of its secret, the directory it is rooted
-//! at, its grant, when it expires, and the key that minted it. Keys are
-//! few, so the writer holds every record from startup on, and a commit
-//! that frees or detaches a key's root revokes the key in the same commit.
+//! at, its grant, when it expires, and the key that minted it. The writer
+//! holds every record from startup on, up to `MAX_KEYS`, indexed by when
+//! each expires, and deletes keys once they expire. A commit that frees or
+//! detaches a key's root revokes the key in the same commit.
+//!
+//! A key minted by a key takes the version that minted it as its id, so no
+//! two keys ever share an id and deleting one leaves nothing behind. The
+//! operator's keys may name their ids, as `--init-key` does, so deleting
+//! one leaves a tombstone that keeps its id from minting again.
 
 use crate::codec::{Dec, DecodeError, Enc};
 use crate::types::{Error, Ino, Millis, Path};
@@ -89,6 +95,14 @@ impl KeyRecord {
     pub fn live(&self, now: Millis) -> bool {
         self.expires == 0 || now < self.expires
     }
+
+    /// Whether deleting the key leaves a tombstone: the operator's keys
+    /// may name their ids, and a tombstone keeps such an id from minting
+    /// again. A key minted by a key took its minting version as its id,
+    /// which no later key takes.
+    pub fn leaves_tombstone(&self) -> bool {
+        self.minted_by.is_none()
+    }
 }
 
 /// Who sends a request.
@@ -169,9 +183,12 @@ pub enum KeyOp {
     /// A key rooted at a directory under the caller's root. Minting needs
     /// `Admin`, so any grant is within the caller's. It expires `ttl` after
     /// it is minted, or with the caller's key if that comes first; a zero
-    /// `ttl` expires with the caller's key.
+    /// `ttl` expires with the caller's key. Its id is the version that
+    /// mints it.
     Mint {
-        id: KeyId,
+        /// The id a trusted caller names for the key, as `--init-key` does.
+        /// A key's mints take their version as their id.
+        id: Option<KeyId>,
         hash: [u8; 32],
         root: Path,
         grant: Grant,
@@ -195,13 +212,15 @@ pub enum KeyError {
     NotFound,
 }
 
-/// Every key record, indexed by root and by minter, and the ids of keys
-/// revoked, which never mint again.
+/// Every key record, indexed by root, by minter and by when it expires,
+/// and the ids of the operator's keys deleted, which never mint again.
 #[derive(Clone, Debug, Default)]
 pub struct Keys {
     records: BTreeMap<KeyId, KeyRecord>,
     by_root: BTreeMap<Ino, BTreeSet<KeyId>>,
     by_minter: BTreeMap<KeyId, BTreeSet<KeyId>>,
+    /// Keys that expire, by when.
+    by_expiry: BTreeSet<(Millis, KeyId)>,
     retired: BTreeSet<KeyId>,
 }
 
@@ -216,7 +235,8 @@ impl Keys {
             if let Some(minter) = old.minted_by {
                 unindex(&mut self.by_minter, minter, id);
             }
-            if record.is_none() {
+            self.by_expiry.remove(&(old.expires, id));
+            if record.is_none() && old.leaves_tombstone() {
                 self.retired.insert(id);
             }
         }
@@ -225,8 +245,26 @@ impl Keys {
             if let Some(minter) = record.minted_by {
                 self.by_minter.entry(minter).or_default().insert(id);
             }
+            if record.expires != 0 {
+                self.by_expiry.insert((record.expires, id));
+            }
             self.records.insert(id, record);
         }
+    }
+
+    /// Up to `limit` keys expired by `now`, the earliest first.
+    pub fn expired(&self, now: Millis, limit: usize) -> Vec<KeyId> {
+        self.by_expiry
+            .iter()
+            .take_while(|(expires, _)| *expires <= now)
+            .take(limit)
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
+    /// How many ids tombstones keep from minting again.
+    pub fn tombstones(&self) -> usize {
+        self.retired.len()
     }
 
     /// Marks an id revoked, as its tombstone says.
@@ -327,11 +365,27 @@ mod tests {
         keys.put(1, Some(record(5, None)));
         keys.put(2, Some(record(5, Some(1))));
         keys.put(3, Some(record(6, Some(1))));
+        keys.put(
+            4,
+            Some(KeyRecord {
+                expires: 0,
+                ..record(6, None)
+            }),
+        );
         assert_eq!(keys.rooted_at(5), vec![1, 2]);
         assert_eq!(keys.minted_by(1), vec![2, 3]);
+        assert_eq!(keys.expired(98, 10), Vec::<KeyId>::new());
+        assert_eq!(keys.expired(99, 10), vec![1, 2, 3]);
+        assert_eq!(keys.expired(u64::MAX, 2), vec![1, 2]);
         keys.put(2, None);
         assert_eq!(keys.rooted_at(5), vec![1]);
         assert_eq!(keys.minted_by(1), vec![3]);
+        assert_eq!(keys.expired(99, 10), vec![1, 3]);
+        // Only the operator's keys leave tombstones.
+        assert!(!keys.retired(2));
+        keys.put(1, None);
+        assert!(keys.retired(1));
+        assert_eq!(keys.tombstones(), 1);
     }
 
     #[test]

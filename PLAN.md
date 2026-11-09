@@ -279,6 +279,7 @@ Scope:
 - 5C Roots follow renames; a commit that frees a key's root, or detaches a directory at or above it, revokes the key and those minted from it.
 - 5D Handles: a MAC over key and inode under a secret in storage; reads by handle checked against the key's root through back-pointers and parent ids.
 - 5E `Watch` shows only the subscriber's tree, with handles for its key.
+- 5F Key expiry: the writer indexes keys by expiry and deletes expired ones, with the keys they minted, in commits of at most 1,000 once a second and back to back through a backlog. A key minted by a key takes its minting version as its id, so deletion leaves no tombstone; only the operator's keys keep tombstones.
 
 Out of scope:
 - Scope checks on freed inodes (Phase 6); until then a file with no links is readable by handle only under keys rooted at the tree's root.
@@ -289,7 +290,8 @@ All scope items have tests; a 10,000-seed sweep passes; `scripts/mutants` catche
 Testing plan:
 - Simulator: keys with nested and disjoint roots, and renames moving directories across them; property 8.
 - Measurement: the scope check on a read by handle, recorded in `BENCHMARKS.md`, against the design's estimate of about a microsecond.
-- Planted bugs: a read by handle that skips the scope check; a wrong secret, an expired key, or a key revoked ahead of a batch accepted; a handle's MAC unchecked; a minted key outliving its minter; a key revoking keys it never minted; revocation leaving minted keys; a freed or detached root leaving its key; a stream outliving its key; `Link` resolving `to` from the tree's root.
+- Planted bugs: a read by handle that skips the scope check; a wrong secret, an expired key, or a key revoked ahead of a batch accepted; a handle's MAC unchecked; a minted key outliving its minter; a key revoking keys it never minted; revocation leaving minted keys; a freed or detached root leaving its key; a stream outliving its key; `Link` resolving `to` from the tree's root; expired keys left in the store, deleted early, deleted all in one commit, or held back a second per commit through a backlog; an expired key's deletion leaving the keys it minted; a tombstone for a key minted by a key, or none for the operator's; a mint taking the id it names; the server handing out an id the writer didn't mint.
+- 5F: the swarm draws a TTL for the keys clients mint in half its seeds and checks property 8's expiry clauses; scripted scenarios check deletion within a second, cascades, commit bounds, restarts and tombstones; the API suite checks expiry and deletion on every backend.
 
 Status ledger:
 
@@ -304,6 +306,11 @@ Status ledger:
 | Complete | Test | Planted bugs for Phase 5 | The testing plan's bugs and the review's, in `scripts/mutants`, all caught in the run through Phase 5. |
 | Complete | Gate | 10,000-seed sweep | `inodedb-sim 0 --seeds 10000` with keyed clients: 0 failures. |
 | Complete | Gate | Code review | Six findings, all fixed: a `Watch` from past the version its key was checked at kept streaming after revocation, so `Watch` refuses such a `from`; a `Watch` followed its directory out of its key's tree and replayed what happened before it entered, so `route` filters by the key's root and the stream ends (`watch_stays_in_its_keys_tree`); `--init-key` re-minted a revoked bootstrap key, so revoked ids keep tombstones (`a_revoked_id_never_mints_again`); revocation cost grew with the square of the keys, so key indexes make it linear, 64,000 keys in 52 ms (`BENCHMARKS.md`, "Revocation"; `revoking_a_key_revokes_thousands_minted_from_it`), with `MAX_KEYS` and a size check on key groups; a request id answered any key that sent it, so ids are scoped to keys (`a_request_id_answers_only_its_own_key`); the cached client kept answering after its key was refused, so it stops (`caches_stop_with_their_key`). |
+| Complete | Work | 5F: Key expiry and version ids | The expiry index and `Keys::expired` in `crates/core/src/auth.rs`; `exec::{execute_expiry, minted_id}`; `Work::Expire` in `writer.rs`, once a second and back to back through a backlog, up to `EXPIRE_KEYS_BUDGET` keys a commit; `MintKey` names each key by its minting version (`service.rs::mint_key`); tombstones for the operator's keys alone (`KeyRecord::leaves_tombstone`). `keys.rs::{a_key_minted_by_a_key_takes_its_version_as_its_id, an_expired_key_leaves_nothing_behind, an_expired_key_takes_what_it_minted_in_one_commit, expired_keys_go_in_bounded_commits_one_after_another, a_writer_deletes_keys_that_expired_while_none_ran}`; API check `keys_expire_and_leave_the_store` on every backend, FoundationDB through `scripts/fdb`; the swarm's keys take TTLs in half its seeds, and property 8 checks their ids, refusals and the writer's deletions. |
+| Complete | Test | 5F measurement | `BENCHMARKS.md`: in "Footprint", a live key with a TTL holds 225 bytes of the writer's memory and a deleted one none; in "Revocation", the writer deletes 64,000 expired keys in 64 commits and 33 ms. |
+| Complete | Test | Planted bugs for 5F | Ten in `scripts/mutants`, from "expired keys stay in the store" to "the server hands out an id the writer didn't mint", all caught in one run with "a revoked key's id mints again", "an expired key still works" and "a minted key outlives its minter", after an unmutated baseline passed every layer. |
+| Complete | Gate | 5F sweep | `inodedb-sim 0 --seeds 10000` passes. |
+| Incomplete | Gate | 5F code review | Missing: `/code-review high` on the 5F change. |
 
 ## Phase 6: Leases, Freeing and Snapshots
 

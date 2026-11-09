@@ -123,6 +123,8 @@ pub struct Options {
     /// The most each process's clock runs fast or slow, in parts per
     /// million.
     pub drift_ppm: u64,
+    /// How long the keys clients mint last; zero never expires.
+    pub key_ttl: Millis,
     /// Clients that only read, and so keep reading through a writer's
     /// stall.
     pub reader_percent: u64,
@@ -215,6 +217,14 @@ impl Options {
             // lease, over a lease.
             drift_ppm: *prng.pick(&[0, 10_000, 90_000, 90_000]),
             reader_percent: *prng.pick(&[0, 30, 60, 60]),
+            key_ttl: {
+                let prng = &mut Prng::stream(seed, "key ttl options");
+                if prng.percent(50) {
+                    prng.range(20..=3_000)
+                } else {
+                    0
+                }
+            },
             ..options
         }
     }
@@ -263,6 +273,7 @@ impl Options {
             stall_every: 1_000,
             drift_ppm: 0,
             reader_percent: 0,
+            key_ttl: 0,
         }
     }
 }
@@ -320,11 +331,12 @@ enum Kindof {
     Key(KeyOp),
 }
 
-/// The key a client works under, once the writer has minted it.
+/// The key a client works under: its secret, and its id once the writer
+/// has minted it.
 #[derive(Clone, Debug)]
 struct ClientKey {
-    id: KeyId,
-    minted: bool,
+    secret: u64,
+    id: Option<KeyId>,
 }
 
 /// The key a caller works under; None for a trusted one.
@@ -341,33 +353,41 @@ fn recorded(batch: &Batch, caller: Caller) -> u128 {
 }
 
 /// The hash the simulator gives a key's secret.
-fn key_hash(id: KeyId) -> [u8; 32] {
+fn key_hash(secret: u64) -> [u8; 32] {
     let mut hash = [0; 32];
     for chunk in hash.chunks_mut(8) {
-        chunk.copy_from_slice(&id.to_be_bytes());
+        chunk.copy_from_slice(&secret.to_be_bytes());
     }
     hash
 }
 
-/// Each minting of a key: the version that minted it and its root node.
-/// A late copy of a mint may mint an id again once revocation has freed
-/// it.
-type Incarnations = Vec<(Version, NodeId)>;
+/// The secret a key's hash was made from.
+fn secret_of(hash: &[u8; 32]) -> u64 {
+    u64::from_be_bytes(hash[..8].try_into().expect("eight bytes"))
+}
 
-/// A key's root node as of `version`.
-fn key_node(incarnations: &Incarnations, version: Version) -> Option<NodeId> {
-    incarnations
-        .iter()
-        .rev()
-        .find(|(minted, _)| *minted <= version)
-        .map(|(_, node)| *node)
+/// A key the log minted.
+#[derive(Clone, Debug)]
+struct Minted {
+    /// The version that minted it, which is also its id.
+    version: Version,
+    root: NodeId,
+    /// When it expires, by the minting writer's clock; zero never.
+    expires: Millis,
+    /// The version that deleted it once it expired.
+    expired: Option<Version>,
+}
+
+/// A key's root node as of `version`, while the key stands.
+fn key_node(key: &Minted, version: Version) -> Option<NodeId> {
+    (key.version <= version && key.expired.is_none_or(|at| at > version)).then_some(key.root)
 }
 
 /// The keys whose roots the model's tree holds at its version.
-fn live_keys(keys: &BTreeMap<KeyId, Incarnations>, model: &Model) -> BTreeSet<KeyId> {
+fn live_keys(keys: &BTreeMap<KeyId, Minted>, model: &Model) -> BTreeSet<KeyId> {
     keys.iter()
-        .filter(|(_, incarnations)| {
-            key_node(incarnations, model.version).is_some_and(|node| model.path_of(node).is_some())
+        .filter(|(_, key)| {
+            key_node(key, model.version).is_some_and(|node| model.path_of(node).is_some())
         })
         .map(|(id, _)| *id)
         .collect()
@@ -714,11 +734,11 @@ pub struct Simulator {
     batches: BTreeMap<u128, Batch>,
     /// The key each keyed batch was sent under, by request id.
     callers: BTreeMap<u128, KeyId>,
-    /// The root path each mint asked for, by key id.
-    mints: BTreeMap<KeyId, Vec<inodedb_core::types::Name>>,
-    /// Every minting of each key.
-    keys: BTreeMap<KeyId, Incarnations>,
-    /// Keys some commit revoked.
+    /// The root path each mint asked for, by its key's secret.
+    mints: BTreeMap<u64, Vec<inodedb_core::types::Name>>,
+    /// Every key the log minted, by id.
+    keys: BTreeMap<KeyId, Minted>,
+    /// Keys some commit revoked or deleted on expiry.
     revoked: BTreeSet<KeyId>,
     keys_prng: Prng,
     model: Option<Model>,
@@ -779,6 +799,7 @@ pub struct Summary {
     /// Listings of the free queue checked whole.
     pub listings: u64,
     pub keys: u64,
+    pub keys_expired: u64,
     pub denied: u64,
     pub takeovers: u64,
     pub stalls: u64,
@@ -791,7 +812,7 @@ impl fmt::Display for Summary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} commits in {} transactions, {} batches ({} changed nothing, {} rejected), {} queries ({} from standbys), {} storage reads ({} from before a later writer's commit), {} retries ({} given up), {} storage faults, {} crashes, {} releases, {} cache checks, {} snapshot checks ({} too old), {} leases expired, {} records acknowledged, {} listings, {} keys ({} requests denied), {} takeovers, {} stalls, {} ticks",
+            "{} commits in {} transactions, {} batches ({} changed nothing, {} rejected), {} queries ({} from standbys), {} storage reads ({} from before a later writer's commit), {} retries ({} given up), {} storage faults, {} crashes, {} releases, {} cache checks, {} snapshot checks ({} too old), {} leases expired, {} records acknowledged, {} listings, {} keys ({} expired, {} requests denied), {} takeovers, {} stalls, {} ticks",
             self.commits,
             self.transactions,
             self.batches,
@@ -813,6 +834,7 @@ impl fmt::Display for Summary {
             self.acked,
             self.listings,
             self.keys,
+            self.keys_expired,
             self.denied,
             self.takeovers,
             self.stalls,
@@ -881,8 +903,8 @@ impl Simulator {
                 submit_scheduled: false,
                 cut_until: 0,
                 key: keys_prng.percent(options.keyed_percent).then(|| ClientKey {
-                    id: keys_prng.next_u64(),
-                    minted: false,
+                    secret: keys_prng.next_u64(),
+                    id: None,
                 }),
                 writer: None,
             })
@@ -1604,6 +1626,11 @@ impl Simulator {
 
     /// How long a writer's `span` surely lasts on the simulator's clock,
     /// whatever the writer's clock rate.
+    /// The latest any server's clock reads now.
+    fn fastest_clock(&self) -> Millis {
+        self.now + self.now * self.options.drift_ppm / 1_000_000
+    }
+
     fn drifted(&self, span: Millis) -> Millis {
         span - span * self.options.drift_ppm / 1_000_000 - 1
     }
@@ -2090,27 +2117,33 @@ impl Simulator {
         self.next_request += 1;
         let key = self.clients[client].key.clone();
         let (caller, what) = match key {
-            Some(key) if !key.minted => {
-                // Each mint takes a new id, so a late copy of an earlier
-                // one mints a key of its own.
-                let id = self.keys_prng.next_u64();
+            Some(ClientKey { id: None, .. }) => {
+                // Each mint takes its version as its key's id, so a late
+                // copy of an earlier one mints a key of its own.
+                let secret = self.keys_prng.next_u64();
                 let root = generate::path(&mut self.keys_prng, &shape);
-                self.mints.insert(id, root.names.clone());
-                self.clients[client].key = Some(ClientKey { id, minted: false });
+                self.mints.insert(secret, root.names.clone());
+                self.clients[client].key = Some(ClientKey { secret, id: None });
                 let op = KeyOp::Mint {
-                    id,
-                    hash: key_hash(id),
+                    id: None,
+                    hash: key_hash(secret),
                     root,
                     grant: Grant::Write,
-                    ttl: 0,
+                    ttl: self.options.key_ttl,
                 };
                 (Caller::Trusted(ROOT), Kindof::Key(op))
             }
             key => {
-                let caller = key.map_or(Caller::Trusted(ROOT), |key| Caller::Key {
-                    id: key.id,
-                    hash: key_hash(key.id),
-                });
+                let caller = match key {
+                    Some(ClientKey {
+                        secret,
+                        id: Some(id),
+                    }) => Caller::Key {
+                        id,
+                        hash: key_hash(secret),
+                    },
+                    _ => Caller::Trusted(ROOT),
+                };
                 let reads = self.clients[client].reads;
                 let what = if self.requests_prng.percent(self.options.query_percent) || reads {
                     Kindof::Query(generate::query(&mut self.requests_prng, &shape))
@@ -2695,7 +2728,7 @@ impl Simulator {
                 Some(key) => match self
                     .keys
                     .get(key)
-                    .and_then(|incarnations| key_node(incarnations, model.version))
+                    .and_then(|key| key_node(key, model.version))
                     .and_then(|node| model.path_of(node))
                 {
                     Some(root) => root,
@@ -2712,9 +2745,8 @@ impl Simulator {
             let live_after: BTreeSet<KeyId> = self
                 .keys
                 .iter()
-                .filter(|(_, incarnations)| {
-                    key_node(incarnations, *version - 1)
-                        .is_some_and(|node| model.path_of(node).is_some())
+                .filter(|(_, key)| {
+                    key_node(key, *version - 1).is_some_and(|node| model.path_of(node).is_some())
                 })
                 .map(|(id, _)| *id)
                 .collect();
@@ -2819,14 +2851,37 @@ impl Simulator {
                 )));
             }
         }
-        if entry.keys.iter().any(|(_, record)| record.is_none()) {
-            return Err(self.fail(format!("version {version} revoked a key by hand")));
-        }
         for (id, record) in &entry.keys {
             let Some(record) = record else {
-                unreachable!("checked above");
+                // The writer deletes a key on its own once it expires.
+                let expired = match self.keys.get_mut(id) {
+                    Some(key)
+                        if key.expired.is_none()
+                            && key.expires != 0
+                            && key.expires <= entry.time =>
+                    {
+                        key.expired = Some(version);
+                        true
+                    }
+                    _ => false,
+                };
+                if !expired {
+                    let expires = self.keys.get(id).map(|key| key.expires);
+                    return Err(self.fail(format!(
+                        "version {version}, at {}, deleted key {id:x}, which expires at {expires:?}",
+                        entry.time
+                    )));
+                }
+                self.revoked.insert(*id);
+                self.summary.keys_expired += 1;
+                continue;
             };
-            let Some(path) = self.mints.get(id) else {
+            if *id != version {
+                return Err(self.fail(format!(
+                    "version {version} minted key {id:x}, whose id isn't its version"
+                )));
+            }
+            let Some(path) = self.mints.get(&secret_of(&record.hash)) else {
                 return Err(self.fail(format!("version {version} minted unknown key {id:x}")));
             };
             let Some(node) = model.node_at(path).filter(|node| model.is_dir(*node)) else {
@@ -2834,14 +2889,18 @@ impl Simulator {
                     "version {version} minted key {id:x} at {path:?}, which names no directory"
                 )));
             };
-            let incarnations = self.keys.entry(*id).or_default();
-            if key_node(incarnations, version).is_some_and(|node| model.path_of(node).is_some()) {
-                return Err(self.fail(format!("version {version} minted live key {id:x} again")));
-            }
-            incarnations.push((version, node));
             if let Err(why) = self.mapping.bind(record.root, node) {
                 return Err(self.fail(format!("key {id:x}'s root: {why}")));
             }
+            self.keys.insert(
+                *id,
+                Minted {
+                    version,
+                    root: node,
+                    expires: record.expires,
+                    expired: None,
+                },
+            );
             self.summary.keys += 1;
         }
         model.advance(version);
@@ -2862,7 +2921,7 @@ impl Simulator {
             Some(key) => self
                 .keys
                 .get(&key)
-                .and_then(|incarnations| key_node(incarnations, model.version))
+                .and_then(|key| key_node(key, model.version))
                 .and_then(|node| model.path_of(node)),
         }
     }
@@ -2981,25 +3040,30 @@ impl Simulator {
                 self.check_query(&attempt, query, version, result)?;
                 None
             }
-            (Kindof::Key(KeyOp::Mint { id, .. }), Answer::Key(result)) => {
+            (Kindof::Key(KeyOp::Mint { hash, .. }), Answer::Key(result)) => {
+                let secret = secret_of(hash);
                 match result {
-                    Ok(_) | Err(KeyError::Exists) => {
-                        if !self.keys.contains_key(id) {
+                    Ok(id) => {
+                        // The key takes the version that minted it as its id.
+                        if !self.keys.contains_key(&id) {
                             return Err(self.fail(format!(
                                 "key {id:x} answered as minted, which storage never made durable"
                             )));
                         }
                         for client in &mut self.clients {
                             if let Some(key) = &mut client.key
-                                && key.id == *id
+                                && key.secret == secret
+                                && key.id.is_none()
                             {
-                                key.minted = true;
+                                key.id = Some(id);
                             }
                         }
                     }
                     Err(KeyError::Fs(_)) => {}
                     Err(other) => {
-                        return Err(self.fail(format!("minting key {id:x} failed: {other:?}")));
+                        return Err(self.fail(format!(
+                            "minting the key of secret {secret:x} failed: {other:?}"
+                        )));
                     }
                 }
                 None
@@ -3008,17 +3072,27 @@ impl Simulator {
                 let Caller::Key { id, .. } = attempt.caller else {
                     return Err(self.fail(format!("a trusted caller was denied: {denied:?}")));
                 };
-                if denied != Denied::Unknown || !self.revoked.contains(&id) {
+                // A key goes when its root does or once it expires, by
+                // the clock of whichever server checked it.
+                let fair = match denied {
+                    Denied::Unknown => self.revoked.contains(&id),
+                    Denied::Expired => self
+                        .keys
+                        .get(&id)
+                        .is_some_and(|key| key.expires != 0 && key.expires <= self.fastest_clock()),
+                    Denied::Grant => false,
+                };
+                if !fair {
                     return Err(self.fail(format!(
-                        "key {id:x} was denied ({denied:?}) while its root stands"
+                        "key {id:x} was denied ({denied:?}) while it stands"
                     )));
                 }
                 self.summary.denied += 1;
                 for client in &mut self.clients {
                     if let Some(key) = &mut client.key
-                        && key.id == id
+                        && key.id == Some(id)
                     {
-                        key.minted = false;
+                        key.id = None;
                     }
                 }
                 None

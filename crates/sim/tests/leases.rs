@@ -106,8 +106,8 @@ fn claims_stay_under_the_consumers_root() {
     let mut h = Harness::new();
     h.ops([mkdir("t"), mkdir("u"), put("t/a", "1"), put("u/b", "2")]);
     h.ops([unlink("t/a"), unlink("u/b")]);
-    let at_t = h.mint(ADMIN, 1, "t", Grant::Write, 0);
-    let reader = h.mint(ADMIN, 2, "t", Grant::Read, 0);
+    let at_t = h.mint(ADMIN, "t", Grant::Write, 0);
+    let reader = h.mint(ADMIN, "t", Grant::Read, 0);
     let (_, mine) = h.claim(at_t, 10);
     assert_eq!(mine.len(), 1, "{mine:?}");
     assert_eq!(mine[0].freed, Freed::Inode(ino_of_freed(&mine[0])));
@@ -130,8 +130,8 @@ fn a_subtrees_frees_go_to_consumers_above_it_as_it_detached() {
     let mut h = Harness::new();
     h.ops([mkdir_p("a/p/t/q"), put("a/p/t/q/f", "v"), mkdir("b")]);
     h.ops([remove_all("a/p/t"), mv("a/p", "b/p")]);
-    let at_a = h.mint(ADMIN, 1, "a", Grant::Write, 0);
-    let at_b = h.mint(ADMIN, 2, "b", Grant::Write, 0);
+    let at_a = h.mint(ADMIN, "a", Grant::Write, 0);
+    let at_b = h.mint(ADMIN, "b", Grant::Write, 0);
     assert_eq!(h.claim(at_b, 10).1, []);
     let (_, mine) = h.claim(at_a, 10);
     assert_eq!(
@@ -367,8 +367,8 @@ fn listings_stay_under_their_root_and_page_through_the_queue() {
     ]);
     let (a, c) = (ino(&mut h, "t/a"), ino(&mut h, "t/c"));
     h.ops([unlink("t/a"), unlink("u/b"), unlink("t/c")]);
-    let at_t = h.mint(ADMIN, 1, "t", Grant::Write, 0);
-    let reader = h.mint(ADMIN, 2, "t", Grant::Read, 0);
+    let at_t = h.mint(ADMIN, "t", Grant::Write, 0);
+    let reader = h.mint(ADMIN, "t", Grant::Read, 0);
     let token = h.token();
     h.writer.list_freed(token, reader, None, 10);
     h.run();
@@ -398,7 +398,7 @@ fn listings_stay_under_their_root_and_page_through_the_queue() {
 fn a_listing_reports_freeing_done_only_past_every_detached_subtree() {
     let mut h = Harness::new();
     h.ops([mkdir_p("t/d"), put("t/d/f", "v"), mkdir("u")]);
-    let at_u = h.mint(ADMIN, 1, "u", Grant::Write, 0);
+    let at_u = h.mint(ADMIN, "u", Grant::Write, 0);
     let token = h.token();
     h.writer.submit(
         token,
