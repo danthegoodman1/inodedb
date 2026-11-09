@@ -108,7 +108,8 @@ impl Config {
     }
 }
 
-/// Free-queue entries one claim scan reads.
+/// Free-queue entries one read of a claim's scan, or of a listing's page,
+/// covers.
 const CLAIM_PAGE: usize = 1024;
 
 /// The head record, which is also the writer record: the last committed
@@ -218,6 +219,17 @@ pub enum Answer {
     },
     /// Acknowledged entries are gone as of a version.
     Acked(Result<Version, ClaimError>),
+    /// A page of the free queue under the caller's root, read at `version`
+    /// or later. `next` is the last entry the page covers, None once it
+    /// reached the queue's end. Every subtree under the root detached at or
+    /// before `freed_through` has all its contents in the queue as of the
+    /// page.
+    FreeQueue {
+        version: Version,
+        entries: Vec<FreeEntry>,
+        next: Option<(Version, Freed)>,
+        freed_through: Version,
+    },
 }
 
 /// How a commit ended.
@@ -349,6 +361,8 @@ enum Purpose {
     Batch,
     Query(u64),
     Claim(u64),
+    /// A page of the free queue for a listing.
+    List(u64),
     /// A page of the tree read into the cache.
     Preload(Cursor),
 }
@@ -368,6 +382,17 @@ struct WaitingClaim {
     /// Whether the scan has gone back to the queue's start, for entries
     /// behind where it began.
     wrapped: bool,
+}
+
+/// A listing of the free queue awaiting its page.
+#[derive(Debug)]
+struct WaitingList {
+    token: Token,
+    root: Ino,
+    limit: usize,
+    /// The committed version when the page's read went out.
+    version: Version,
+    freed_through: Version,
 }
 
 #[derive(Debug)]
@@ -467,6 +492,7 @@ pub struct Writer {
     secret_stored: bool,
     leases: Leases,
     claiming: BTreeMap<u64, WaitingClaim>,
+    listing: BTreeMap<u64, WaitingList>,
     /// Detached subtrees still to free, by the version that detached each
     /// and its top, with the directories above the top as it detached.
     detached: BTreeMap<(Version, Ino), Vec<Ino>>,
@@ -542,6 +568,7 @@ impl Writer {
             secret_stored: false,
             leases,
             claiming: BTreeMap::new(),
+            listing: BTreeMap::new(),
             detached: BTreeMap::new(),
             reaping: false,
             read_ahead_ops: 0,
@@ -627,6 +654,11 @@ impl Writer {
             std::mem::take(&mut self.claiming)
                 .values()
                 .map(|claim| claim.token),
+        );
+        tokens.extend(
+            std::mem::take(&mut self.listing)
+                .values()
+                .map(|list| list.token),
         );
         for token in tokens {
             self.answer(token, Answer::Unavailable);
@@ -809,18 +841,7 @@ impl Writer {
         };
         let full = pairs.len() == CLAIM_PAGE;
         for (key, value) in pairs {
-            let (version, freed) = match keys::parse(&key) {
-                Some(Parsed::Free(version, ino, None)) => (version, Freed::Inode(ino)),
-                Some(Parsed::Free(version, ino, Some(value))) => {
-                    (version, Freed::Value(ino, value))
-                }
-                _ => return Err(DecodeError),
-            };
-            let entry = FreeEntry {
-                version,
-                freed,
-                ancestors: crate::delta::decode_ancestors(&value)?,
-            };
+            let entry = free_entry(&key, &value)?;
             waiting.after = Some(key);
             if waiting.found.len() < waiting.limit
                 && self.leases.claimable(waiting.root, &entry)
@@ -870,6 +891,103 @@ impl Writer {
                 claim,
                 entries: waiting.found,
             }
+        };
+        self.answer(waiting.token, answer);
+        Ok(())
+    }
+
+    /// Lists up to `limit` free-queue entries under the caller's root after
+    /// `after`, whatever the horizon and whether claimed, and claims none.
+    /// A listing reads one page of the queue, so it may hold fewer entries
+    /// than `limit`, or none, and still go on.
+    pub fn list_freed(
+        &mut self,
+        token: Token,
+        caller: Caller,
+        after: Option<(Version, Freed)>,
+        limit: usize,
+    ) {
+        if self.phase != Phase::Ready || !self.is_fresh() {
+            return self.answer(token, Answer::Unavailable);
+        }
+        let scope = match self.authorize(&caller, Grant::Write) {
+            Ok(scope) => scope,
+            Err(denied) => return self.answer(token, Answer::Denied(denied)),
+        };
+        // From the committed state, which the page's read sees at least: a
+        // subtree the writer no longer holds detached has committed every
+        // entry its freeing wrote.
+        let root = scope.root;
+        let freed_through = self
+            .detached
+            .iter()
+            .find(|(_, above)| root == ROOT || above.contains(&root))
+            .map_or(self.version, |(&(at, _), _)| at - 1);
+        let id = self.id();
+        self.listing.insert(
+            id,
+            WaitingList {
+                token,
+                root,
+                limit: limit.max(1),
+                version: self.version,
+                freed_through,
+            },
+        );
+        self.reads.insert(
+            id,
+            Outstanding {
+                issued_at: self.version,
+                reads: Vec::new(),
+                purpose: Purpose::List(id),
+            },
+        );
+        let after = after.map(|(version, freed)| freed.key(version));
+        self.actions.push(Action::Read {
+            id,
+            reads: vec![
+                KvRead::Get(keys::head()),
+                KvRead::Scan {
+                    range: keys::free_after(after.as_deref()),
+                    limit: CLAIM_PAGE,
+                },
+            ],
+        });
+    }
+
+    fn list_read(&mut self, id: u64, results: Vec<KvResult>) -> Result<(), DecodeError> {
+        let Some(KvResult::Scan(pairs)) = results.into_iter().nth(1) else {
+            return Err(DecodeError);
+        };
+        let Some(waiting) = self.listing.remove(&id) else {
+            return Ok(());
+        };
+        let full = pairs.len() == CLAIM_PAGE;
+        let mut entries = Vec::new();
+        let mut next = None;
+        for (key, value) in pairs {
+            let entry = free_entry(&key, &value)?;
+            next = Some(entry.key());
+            if entry.within(waiting.root) {
+                entries.push(entry);
+                if entries.len() == waiting.limit {
+                    break;
+                }
+            }
+        }
+        if entries.len() < waiting.limit && !full {
+            next = None;
+        }
+        // A writer whose lease lapsed during the read may have a successor.
+        let answer = if self.phase == Phase::Ready && self.is_fresh() {
+            Answer::FreeQueue {
+                version: waiting.version,
+                entries,
+                next,
+                freed_through: waiting.freed_through,
+            }
+        } else {
+            Answer::Unavailable
         };
         self.answer(waiting.token, answer);
         Ok(())
@@ -1875,6 +1993,11 @@ impl Writer {
                 .values()
                 .map(|claim| claim.token),
         );
+        tokens.extend(
+            std::mem::take(&mut self.listing)
+                .values()
+                .map(|list| list.token),
+        );
         for token in tokens {
             self.answer(token, Answer::Unavailable);
         }
@@ -1921,6 +2044,12 @@ impl Writer {
             }
             return;
         }
+        if let Purpose::List(list) = outstanding.purpose {
+            if self.list_read(list, results).is_err() {
+                self.stop();
+            }
+            return;
+        }
         if let Err(error) = self.absorb(&outstanding, results) {
             let _ = error;
             self.stop();
@@ -1936,7 +2065,7 @@ impl Writer {
                 self.pump();
             }
             Purpose::Query(query) => self.run_query(query),
-            Purpose::Claim(_) => {}
+            Purpose::Claim(_) | Purpose::List(_) => {}
             Purpose::Preload(_) => match self.preload.take() {
                 Some(cursor) => self.preload_page(cursor),
                 None => self.preload_dirs.clear(),
@@ -2306,6 +2435,20 @@ pub fn scoped_request(id: u128, key: Option<KeyId>) -> u128 {
         }
         _ => id,
     }
+}
+
+/// A free-queue entry from its key and the ancestors it stores.
+fn free_entry(key: &[u8], value: &[u8]) -> Result<FreeEntry, DecodeError> {
+    let (version, freed) = match keys::parse(key) {
+        Some(Parsed::Free(version, ino, None)) => (version, Freed::Inode(ino)),
+        Some(Parsed::Free(version, ino, Some(value))) => (version, Freed::Value(ino, value)),
+        _ => return Err(DecodeError),
+    };
+    Ok(FreeEntry {
+        version,
+        freed,
+        ancestors: crate::delta::decode_ancestors(value)?,
+    })
 }
 
 /// What a starting writer reads: the head, the request records' expiries,

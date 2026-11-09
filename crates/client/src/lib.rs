@@ -23,7 +23,7 @@ pub use bytes::Bytes;
 pub use cache::{Cached, Snapshot};
 pub use inodedb_core::auth::Grant;
 pub use inodedb_core::cache::Budget;
-pub use lease::{Claim, Freed, Lease};
+pub use lease::{Claim, Freed, FreedPage, Lease};
 pub use ops::{Cond, Op, OpRef};
 pub use types::*;
 

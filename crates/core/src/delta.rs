@@ -24,6 +24,16 @@ pub enum Freed {
     Value(Ino, Version),
 }
 
+impl Freed {
+    /// Its free-queue key under the version that freed it.
+    pub fn key(self, version: Version) -> Vec<u8> {
+        match self {
+            Freed::Inode(ino) => keys::free(version, ino, None),
+            Freed::Value(ino, value) => keys::free(version, ino, Some(value)),
+        }
+    }
+}
+
 pub type Links = BTreeSet<(Ino, Name)>;
 
 /// A free-queue entry a consumer acknowledged: it goes, with the records it
@@ -341,10 +351,7 @@ impl Delta {
             writes.set(keys::value(*ino, *version), value.to_vec());
         }
         for freed in &self.freed {
-            let key = match *freed {
-                Freed::Inode(ino) => keys::free(self.version, ino, None),
-                Freed::Value(ino, value) => keys::free(self.version, ino, Some(value)),
-            };
+            let key = freed.key(self.version);
             let above = self.ancestors.get(freed).map_or(&[][..], Vec::as_slice);
             writes.set(key, encode_ancestors(above));
         }
@@ -365,11 +372,7 @@ impl Delta {
             }
         }
         for acked in &self.acked {
-            let key = match acked.freed {
-                Freed::Inode(ino) => keys::free(acked.version, ino, None),
-                Freed::Value(ino, value) => keys::free(acked.version, ino, Some(value)),
-            };
-            writes.clear(key);
+            writes.clear(acked.freed.key(acked.version));
         }
         for (ino, version) in &self.dropped {
             writes.clear(keys::value(*ino, *version));

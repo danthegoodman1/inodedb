@@ -307,17 +307,31 @@ pub fn leases() -> KeyRange {
 
 /// The free-queue entries freed at or before `version`, from `after` on.
 pub fn released(after: Option<&[u8]>, version: Version) -> KeyRange {
-    let start = match after {
+    let mut end = key(FREE, 8);
+    end.extend_from_slice(&(version + 1).to_be_bytes());
+    KeyRange {
+        start: free_start(after),
+        end,
+    }
+}
+
+/// The whole free queue past `after`.
+pub fn free_after(after: Option<&[u8]>) -> KeyRange {
+    KeyRange {
+        start: free_start(after),
+        end: free_range().end,
+    }
+}
+
+fn free_start(after: Option<&[u8]>) -> Vec<u8> {
+    match after {
         Some(key) => {
             let mut next = key.to_vec();
             next.push(0);
             next
         }
         None => key(FREE, 0),
-    };
-    let mut end = key(FREE, 8);
-    end.extend_from_slice(&(version + 1).to_be_bytes());
-    KeyRange { start, end }
+    }
 }
 
 /// The secret that handles' MACs are made under.

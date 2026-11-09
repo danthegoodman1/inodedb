@@ -23,6 +23,7 @@ pub mod prng;
 use generate::Shape;
 use inodedb_core::auth::{Caller, Denied, Grant, KeyError, KeyId, KeyOp};
 use inodedb_core::cache::{Budget, Cache, DIR_BYTES, INODE_BYTES};
+use inodedb_core::delta::Freed;
 use inodedb_core::feed::{Change, Subscriber, route};
 use inodedb_core::fsck;
 use inodedb_core::keys::{self, KvRead, KvResult, Parsed, WriteSet};
@@ -624,6 +625,15 @@ enum LeaseCall {
     Ack {
         entries: Vec<FreeEntry>,
     },
+    List,
+}
+
+/// A listing of the free queue that goes on page by page until a page
+/// reaches the queue's end.
+#[derive(Debug, Default)]
+struct Listing {
+    next: Option<(Version, Freed)>,
+    seen: BTreeSet<(Version, Freed)>,
 }
 
 struct Client {
@@ -732,6 +742,15 @@ pub struct Simulator {
     claim: Option<(ClaimId, Vec<FreeEntry>)>,
     consuming: bool,
     lease_prng: Prng,
+    /// The consumer's listing in progress, each page asked for as the one
+    /// before it answers.
+    listing: Option<Listing>,
+    list_prng: Prng,
+    /// Freed inodes whose entries an acknowledgement went out for, whether
+    /// or not it committed.
+    maybe_acked: BTreeSet<Ino>,
+    /// Entries an acknowledgement removed, by the version it reported.
+    acked_at: BTreeMap<(Version, Freed), Version>,
     summary: Summary,
 }
 
@@ -757,6 +776,8 @@ pub struct Summary {
     pub snapshots_too_old: u64,
     pub leases_expired: u64,
     pub acked: u64,
+    /// Listings of the free queue checked whole.
+    pub listings: u64,
     pub keys: u64,
     pub denied: u64,
     pub takeovers: u64,
@@ -770,7 +791,7 @@ impl fmt::Display for Summary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} commits in {} transactions, {} batches ({} changed nothing, {} rejected), {} queries ({} from standbys), {} storage reads ({} from before a later writer's commit), {} retries ({} given up), {} storage faults, {} crashes, {} releases, {} cache checks, {} snapshot checks ({} too old), {} leases expired, {} records acknowledged, {} keys ({} requests denied), {} takeovers, {} stalls, {} ticks",
+            "{} commits in {} transactions, {} batches ({} changed nothing, {} rejected), {} queries ({} from standbys), {} storage reads ({} from before a later writer's commit), {} retries ({} given up), {} storage faults, {} crashes, {} releases, {} cache checks, {} snapshot checks ({} too old), {} leases expired, {} records acknowledged, {} listings, {} keys ({} requests denied), {} takeovers, {} stalls, {} ticks",
             self.commits,
             self.transactions,
             self.batches,
@@ -790,6 +811,7 @@ impl fmt::Display for Summary {
             self.snapshots_too_old,
             self.leases_expired,
             self.acked,
+            self.listings,
             self.keys,
             self.denied,
             self.takeovers,
@@ -936,6 +958,10 @@ impl Simulator {
             claim: None,
             consuming: false,
             lease_prng: Prng::stream(seed, "leases"),
+            listing: None,
+            list_prng: Prng::stream(seed, "listings"),
+            maybe_acked: BTreeSet::new(),
+            acked_at: BTreeMap::new(),
             summary: Summary::default(),
             options,
         }
@@ -1725,18 +1751,27 @@ impl Simulator {
         if self.unfinished() {
             self.schedule(self.options.consume_every, Event::Consume);
         }
-        if self.consuming || !self.writer().is_ready() {
+        if !self.writer().is_ready() {
             return Ok(());
+        }
+        let listed = self.list_page();
+        if self.consuming {
+            return if listed { self.actions() } else { Ok(()) };
         }
         let token = self.next_token;
         self.next_token += 1;
         self.consuming = true;
         match self.claim.take() {
             Some((claim, entries)) if !self.lease_prng.percent(10) => {
-                let acked: Vec<(Version, inodedb_core::delta::Freed)> = entries
+                let acked: Vec<(Version, Freed)> = entries
                     .iter()
                     .map(|entry| (entry.version, entry.freed))
                     .collect();
+                for (_, freed) in &acked {
+                    if let Freed::Inode(ino) = freed {
+                        self.maybe_acked.insert(*ino);
+                    }
+                }
                 self.lease_calls
                     .insert(token, (self.current, LeaseCall::Ack { entries }));
                 self.writer_mut()
@@ -1750,6 +1785,112 @@ impl Simulator {
             }
         }
         self.actions()
+    }
+
+    /// Now and then starts a listing of the free queue, unless one is in
+    /// progress. Returns whether it asked.
+    fn list_page(&mut self) -> bool {
+        if self.listing.is_some() || !self.list_prng.percent(30) {
+            return false;
+        }
+        self.listing = Some(Listing::default());
+        self.next_page();
+        true
+    }
+
+    /// Asks for the listing's next page.
+    fn next_page(&mut self) {
+        let limit = self.list_prng.range(1..=20) as usize;
+        let after = self.listing.as_ref().and_then(|listing| listing.next);
+        let token = self.next_token;
+        self.next_token += 1;
+        self.lease_calls
+            .insert(token, (self.current, LeaseCall::List));
+        self.writer_mut()
+            .list_freed(token, Caller::Trusted(ROOT), after, limit);
+    }
+
+    /// Property 10: a page of the free queue lists nothing a name holds or
+    /// an acknowledgement removed by its version, and a listing that
+    /// reaches the queue's end holds every file the model at that page's
+    /// version says was freed, unless an acknowledgement went out for it.
+    /// No subtree detached at or before the page's `freed_through` still
+    /// links a file.
+    fn check_listing(
+        &mut self,
+        version: Version,
+        entries: Vec<FreeEntry>,
+        next: Option<(Version, Freed)>,
+        freed_through: Version,
+    ) -> Result<(), Failure> {
+        let mut listing = self.listing.take().unwrap_or_default();
+        let model = self.snapshot(version)?;
+        let named = model.named_nodes();
+        if freed_through > version {
+            return Err(self.fail(format!(
+                "a listing at {version} reports freeing done through {freed_through}"
+            )));
+        }
+        for entry in &entries {
+            if let Some(&at) = self.acked_at.get(&entry.key())
+                && at <= version
+            {
+                return Err(self.fail(format!(
+                    "a listing at {version} holds {entry:?}, acknowledged at {at}"
+                )));
+            }
+            if entry.version <= version
+                && let Freed::Inode(ino) = entry.freed
+                && let Some(node) = self.mapping.node(ino)
+                && named.contains(&node)
+            {
+                return Err(self.fail(format!(
+                    "a listing at {version} holds {entry:?}, which a name holds"
+                )));
+            }
+        }
+        listing.seen.extend(entries.iter().map(FreeEntry::key));
+        if next.is_some() {
+            listing.next = next;
+            self.listing = Some(listing);
+            self.next_page();
+            return Ok(());
+        }
+        let listed: BTreeSet<Ino> = listing
+            .seen
+            .iter()
+            .filter_map(|(_, freed)| match freed {
+                Freed::Inode(ino) => Some(*ino),
+                Freed::Value(..) => None,
+            })
+            .collect();
+        for (&id, node) in &model.nodes {
+            if node.kind != Kind::File || named.contains(&id) {
+                continue;
+            }
+            // The model counts down a file's detached links as freeing
+            // removes them, by its inode; a file created inside a subtree
+            // its own batch detached never had its inode seen.
+            let Some(ino) = self.mapping.ino(id) else {
+                continue;
+            };
+            if node.detached_links > 0 {
+                if node.detached_at <= freed_through {
+                    return Err(self.fail(format!(
+                        "a listing at {version} reports freeing done through {freed_through}, but the subtree detached at {} still links node {id}",
+                        node.detached_at
+                    )));
+                }
+                continue;
+            }
+            if !listed.contains(&ino) && !self.maybe_acked.contains(&ino) {
+                return Err(self.fail(format!(
+                    "a listing that reached the queue's end at {version} left out freed inode {ino}"
+                )));
+            }
+        }
+        self.summary.listings += 1;
+        Ok(())
     }
 
     fn lease_answer(&mut self, call: LeaseCall, answer: Answer) -> Result<(), Failure> {
@@ -1821,14 +1962,27 @@ impl Simulator {
             }
             (LeaseCall::Ack { entries }, Answer::Acked(result)) => {
                 self.consuming = false;
-                if result.is_ok() {
+                if let Ok(at) = result {
                     self.summary.acked += entries.len() as u64;
+                    for entry in &entries {
+                        self.acked_at.entry(entry.key()).or_insert(at);
+                    }
                 }
             }
+            (
+                LeaseCall::List,
+                Answer::FreeQueue {
+                    version,
+                    entries,
+                    next,
+                    freed_through,
+                },
+            ) => self.check_listing(version, entries, next, freed_through)?,
             // A writer that stopped answers nothing more.
             (LeaseCall::Claim | LeaseCall::Ack { .. }, Answer::Unavailable) => {
                 self.consuming = false;
             }
+            (LeaseCall::List, Answer::Unavailable) => self.listing = None,
             (call, answer) => {
                 return Err(self.fail(format!("{call:?} answered {answer:?}")));
             }
@@ -2324,6 +2478,7 @@ impl Simulator {
                 }
                 LeaseCall::Beat { .. } => {}
                 LeaseCall::Claim | LeaseCall::Ack { .. } => self.consuming = false,
+                LeaseCall::List => self.listing = None,
             }
         }
         if !reached {
@@ -2754,7 +2909,8 @@ impl Simulator {
             Answer::Query { .. }
             | Answer::NotYet { .. }
             | Answer::Denied(_)
-            | Answer::Claimed { .. } => true,
+            | Answer::Claimed { .. }
+            | Answer::FreeQueue { .. } => true,
             Answer::Rejected(_) | Answer::Unavailable | Answer::NotWriter { .. } => false,
         };
         if read

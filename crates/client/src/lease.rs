@@ -3,7 +3,8 @@
 //! A lease keeps the inodes and values freed after its oldest version
 //! readable by handle until it moves on or runs out. A consumer claims
 //! released entries under its root, deletes what they reference, and
-//! acknowledges them.
+//! acknowledges them. A listing reads every entry still in the queue,
+//! released or not, and claims none.
 
 use crate::{Client, Error, Handle, Inode, Version};
 use bytes::Bytes;
@@ -186,8 +187,7 @@ impl Drop for Lease {
     }
 }
 
-/// A free-queue entry a consumer claimed: what was freed, at which
-/// version, and what it kept.
+/// A free-queue entry: what was freed, at which version, and what it kept.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Freed {
     pub version: Version,
@@ -225,6 +225,22 @@ impl Freed {
 pub struct Claim {
     pub id: u64,
     pub entries: Vec<Freed>,
+}
+
+/// A page of the free queue under the key's root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreedPage {
+    /// The page's entries in the order freed; possibly none while `next`
+    /// is set.
+    pub entries: Vec<Freed>,
+    /// Where the next page starts, None once this page reached the queue's
+    /// end.
+    pub next: Option<Bytes>,
+    /// Every subtree under the root detached at or before this version has
+    /// all its contents in the queue as of this page.
+    pub freed_through: Version,
+    /// The page reflects this version or a later one.
+    pub version: Version,
 }
 
 impl Client {
@@ -274,6 +290,32 @@ impl Client {
         Ok(Claim {
             id: response.claim,
             entries: response.freed.into_iter().map(Freed::from_pb).collect(),
+        })
+    }
+
+    /// Lists up to `limit` free-queue entries under this key's root, from
+    /// the queue's start or after a page's `next`. It lists entries a lease
+    /// holds and entries a consumer has claimed, and claims none. An entry
+    /// freed after a page went out lands past that page's `next`, so pages
+    /// read to the end see every entry freed while they ran, unless it was
+    /// acknowledged first.
+    pub async fn list_freed(&self, after: Option<&[u8]>, limit: u32) -> Result<FreedPage, Error> {
+        let after = Bytes::copy_from_slice(after.unwrap_or_default());
+        let response = self
+            .retry(|mut rpc| {
+                let request = self.request(pb::ListFreedRequest {
+                    after: after.clone(),
+                    limit,
+                });
+                async move { rpc.list_freed(request).await }
+            })
+            .await?
+            .into_inner();
+        Ok(FreedPage {
+            entries: response.freed.into_iter().map(Freed::from_pb).collect(),
+            next: (!response.next.is_empty()).then_some(response.next),
+            freed_through: response.freed_through,
+            version: response.version,
         })
     }
 

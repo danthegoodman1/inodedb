@@ -710,6 +710,39 @@ MUTANTS = [
         "a writer whose lease lapsed answers the claim it scanned",
         [(WRITER, "if !self.is_fresh() {\n            self.answer(waiting.token, Answer::Unavailable);\n            return Ok(());\n        }", "")]),
     (
+        "a listing of the free queue stops at the release horizon",
+        [(WRITER, "range: keys::free_after(after.as_deref()),", "range: keys::released(after.as_deref(), self.leases.claim_horizon()),")],
+    ),
+    (
+        "a listing of the free queue skips claimed entries",
+        [(WRITER, "if entry.within(waiting.root) {\n                entries.push(entry);", "if entry.within(waiting.root) && (entry.version > self.leases.claim_horizon() || self.leases.claimable(waiting.root, &entry)) {\n                entries.push(entry);")],
+    ),
+    (
+        "a listing of the free queue reaches outside its key's root",
+        [(WRITER, "if entry.within(waiting.root) {\n                entries.push(entry);", "if true {\n                entries.push(entry);")],
+    ),
+    (
+        "a listing of the free queue claims what it lists",
+        [(WRITER, "let answer = if self.phase == Phase::Ready && self.is_fresh() {", "self.leases.claim(waiting.root, entries.clone(), self.now);\n        let answer = if self.phase == Phase::Ready && self.is_fresh() {")],
+    ),
+    (
+        "a full page of the free queue goes on past what it left out",
+        [(WRITER, "if entries.len() == waiting.limit {\n                    break;\n                }", ""),
+         (WRITER, "if entry.within(waiting.root) {\n                entries.push(entry);", "if entry.within(waiting.root) && entries.len() < waiting.limit {\n                entries.push(entry);")],
+    ),
+    (
+        "a listing reports freeing done past a detached subtree",
+        [(WRITER, ".map_or(self.version, |(&(at, _), _)| at - 1);", ".map_or(self.version, |_| self.version);")],
+    ),
+    (
+        "a writer whose lease lapsed answers the listing it read",
+        [(WRITER, "let answer = if self.phase == Phase::Ready && self.is_fresh() {", "let answer = if self.phase == Phase::Ready {")],
+    ),
+    (
+        "a listing leaves out what its entries kept",
+        [(SERVICE, "let freed = kept(&self.engine, caller, &scope, &entries).await?;\n        Ok(Response::new(pb::ListFreedResponse {", "let freed = entries.iter().map(|entry| convert::freed(entry, &QueryResult::Failed(Error::NotFound), &scope)).collect();\n        Ok(Response::new(pb::ListFreedResponse {")],
+    ),
+    (
         "a standby refuses a key newer than the log it has read",
         [(STANDBY, "Err(Denied::Unknown) => Answer::NotWriter {\n                address: self.address(),\n            },", "")],
     ),
