@@ -36,7 +36,8 @@ macro_rules! api_conformance {
             watch_stays_in_its_keys_tree, caches_stop_with_their_key, leases_hold_freed_records,
             leases_hold_the_log, caches_hold_a_lease, snapshots_hold_their_version,
             snapshots_hold_what_they_read, caches_start_under_steady_writes,
-            claims_read_values_their_file_outlived, checks_take_a_root_admin_key,
+            claims_read_values_their_file_outlived, listings_hold_the_whole_free_queue,
+            checks_take_a_root_admin_key,
             dropping_a_server_closes_its_store, a_stream_ends_when_its_client_leaves,
             clients_reconnect_to_a_restarted_server, a_stream_outlives_its_client_handle,
             lease_streams_send_every_beat);
@@ -2230,6 +2231,121 @@ pub async fn leases_hold_freed_records<B: Backend>(backend: &mut B) {
         lease.beat(db.version(), db.version()).await,
         Err(Error::LeaseExpired)
     ));
+}
+
+/// A listing of the free queue holds entries a lease holds and entries a
+/// consumer claimed, each with what it kept, under the key's root, and
+/// claims none. Pages go on from their cursor, and `freed_through` passes
+/// a detached subtree once its contents are in the queue.
+pub async fn listings_hold_the_whole_free_queue<B: Backend>(backend: &mut B) {
+    let Fixture { db, server, .. } = fresh(backend).await;
+    db.commit([
+        Op::mkdir("t"),
+        Op::mkdir("u"),
+        Op::put("t/a", "1"),
+        Op::put("t/b", "2"),
+        Op::put("u/c", "3"),
+    ])
+    .await
+    .expect("commits");
+    let mut inos = Vec::new();
+    for path in ["t/a", "t/b", "u/c"] {
+        inos.push(db.stat(path).await.expect("stats").handle.ino);
+    }
+    db.commit([Op::unlink("t/a")]).await.expect("commits");
+    let at = db.version();
+    let lease = db.lease(at, at).await.expect("opens");
+    db.commit([Op::unlink("t/b"), Op::unlink("u/c")])
+        .await
+        .expect("commits");
+    let of = |entries: &[inodedb::Freed]| -> Vec<u64> {
+        entries.iter().map(|entry| entry.handle.ino).collect()
+    };
+    // Pages of one entry go through the queue in the order freed.
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let page = db.list_freed(after.as_deref(), 1).await.expect("lists");
+        assert!(page.entries.len() <= 1, "{page:?}");
+        seen.extend(page.entries);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(of(&seen), inos);
+    assert_eq!(
+        seen[0].value.as_deref(),
+        Some(&b"1"[..]),
+        "an entry carries what it kept"
+    );
+    // The listing claimed nothing; the lease holds what came after it.
+    let claim = db.claim_freed(10).await.expect("claims");
+    assert_eq!(of(&claim.entries), inos[..1]);
+    let page = db.list_freed(None, 10).await.expect("lists");
+    assert_eq!(of(&page.entries), inos, "claimed and held entries stay");
+    assert_eq!(page.next, None);
+    let day = std::time::Duration::from_secs(86_400);
+    let under_u = Client::connect(
+        server.endpoint(),
+        db.mint_key("u", inodedb::Grant::Write, day)
+            .await
+            .expect("mints"),
+    )
+    .await
+    .expect("connects");
+    let page = under_u.list_freed(None, 10).await.expect("lists");
+    assert_eq!(of(&page.entries), inos[2..], "a key lists under its root");
+    let reader = Client::connect(
+        server.endpoint(),
+        db.mint_key("t", inodedb::Grant::Read, day)
+            .await
+            .expect("mints"),
+    )
+    .await
+    .expect("connects");
+    assert!(matches!(
+        reader.list_freed(None, 10).await,
+        Err(Error::Status(status)) if status.code() == Code::PermissionDenied
+    ));
+    assert!(matches!(
+        db.list_freed(Some(b"not a cursor"), 10).await,
+        Err(Error::Status(status)) if status.code() == Code::InvalidArgument
+    ));
+    db.ack_freed(claim.id, &claim.entries)
+        .await
+        .expect("acknowledges");
+    let page = db.list_freed(None, 10).await.expect("lists");
+    assert_eq!(of(&page.entries), inos[1..]);
+    // A detached subtree's contents enter the queue as the writer frees it.
+    db.commit([Op::mkdir("t/d"), Op::put("t/d/f", "4")])
+        .await
+        .expect("commits");
+    let file = db.stat("t/d/f").await.expect("stats").handle.ino;
+    let detached = db
+        .commit([Op::remove_all("t/d")])
+        .await
+        .expect("commits")
+        .version;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let page = loop {
+        let page = db.list_freed(None, 60).await.expect("lists");
+        if page.freed_through >= detached {
+            break page;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "freeing reaches the subtree"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(page.version >= page.freed_through);
+    assert!(
+        of(&page.entries).contains(&file),
+        "freed through {}, past the detach at {detached}: {page:?}",
+        page.freed_through
+    );
+    drop(lease);
 }
 
 /// Servers that share a store, with a short writer lease so takeovers come

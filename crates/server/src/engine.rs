@@ -67,6 +67,12 @@ enum Command {
         entries: Vec<(Version, Freed)>,
         reply: oneshot::Sender<Answer>,
     },
+    ListFreed {
+        caller: Caller,
+        after: Option<(Version, Freed)>,
+        limit: usize,
+        reply: oneshot::Sender<Answer>,
+    },
     Ready {
         reply: oneshot::Sender<Ready>,
     },
@@ -377,6 +383,21 @@ impl Engine {
         .await
     }
 
+    pub async fn list_freed(
+        &self,
+        caller: Caller,
+        after: Option<(Version, Freed)>,
+        limit: usize,
+    ) -> Result<Answer, Status> {
+        self.answer(|reply| Command::ListFreed {
+            caller,
+            after,
+            limit,
+            reply,
+        })
+        .await
+    }
+
     /// Waits for the writer to start.
     pub async fn ready(&self) -> Result<Ready, Status> {
         self.ask(|reply| Command::Ready { reply }).await
@@ -575,12 +596,24 @@ impl<S: Storage + Clone> Node<S> {
                 writer.acknowledge(token(waiting, next, reply), caller, claim, &entries);
             }
             (
+                Role::Write(writer),
+                Command::ListFreed {
+                    caller,
+                    after,
+                    limit,
+                    reply,
+                },
+            ) => {
+                writer.list_freed(token(waiting, next, reply), caller, after, limit);
+            }
+            (
                 Role::Follow(follower),
                 Command::Submit { reply, .. }
                 | Command::Key { reply, .. }
                 | Command::Lease { reply, .. }
                 | Command::Claim { reply, .. }
-                | Command::Ack { reply, .. },
+                | Command::Ack { reply, .. }
+                | Command::ListFreed { reply, .. },
             ) => Node::<S>::not_writer(follower, reply),
             (
                 current,

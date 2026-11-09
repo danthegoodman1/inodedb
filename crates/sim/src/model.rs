@@ -6,7 +6,7 @@ use inodedb_core::Bytes;
 use inodedb_core::ops::{Batch, Op, Outcome, Pred, PredSource, PutMode, RenameFlag, Skip};
 use inodedb_core::query::{ENTRY_COST, Query, Target};
 use inodedb_core::types::{Error, Kind, MAX_VALUE, Millis, Name, Version};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type NodeId = u64;
 pub const MODEL_ROOT: NodeId = 1;
@@ -24,6 +24,8 @@ pub struct Node {
     /// hold it, or once freeing the last of them freed it, they bound who
     /// reaches it by inode.
     pub detached_under: Vec<NodeId>,
+    /// The latest version that detached a subtree linking it.
+    pub detached_at: Version,
     /// The directories above the names it lost at `lost_at`, the version
     /// it last lost one: once it has no name, they bound who reaches it by
     /// inode.
@@ -75,6 +77,7 @@ impl Model {
                     value: Bytes::new(),
                     detached_links: 0,
                     detached_under: Vec::new(),
+                    detached_at: 0,
                     lost_under: Vec::new(),
                     lost_at: 0,
                     removed: false,
@@ -175,6 +178,11 @@ impl Model {
             .collect()
     }
 
+    /// Every node a path names.
+    pub fn named_nodes(&self) -> BTreeSet<NodeId> {
+        self.paths.values().map(|named| named.node).collect()
+    }
+
     pub fn nlink(&self, node: NodeId) -> u32 {
         let named = self
             .paths
@@ -204,6 +212,7 @@ impl Model {
                 value,
                 detached_links: 0,
                 detached_under: Vec::new(),
+                detached_at: 0,
                 lost_under: Vec::new(),
                 lost_at: 0,
                 removed: false,
@@ -563,6 +572,7 @@ impl Model {
                         let node = self.nodes.get_mut(&doomed_named.node).expect("node exists");
                         node.detached_links += 1;
                         node.detached_under.extend(above);
+                        node.detached_at = version;
                     }
                 }
                 let node = self.nodes.get_mut(&named.node).expect("node exists");

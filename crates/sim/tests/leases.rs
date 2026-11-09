@@ -306,3 +306,126 @@ fn a_restarted_writer_releases_no_less_than_it_claimed() {
         Err(LeaseError::TooOld { .. })
     ));
 }
+
+fn listed(page: &FreePage) -> Vec<Freed> {
+    page.entries.iter().map(|entry| entry.freed).collect()
+}
+
+/// A listing holds entries a lease holds and entries a consumer claimed,
+/// and claims none itself.
+#[test]
+fn a_listing_holds_every_entry_and_claims_none() {
+    let mut h = Harness::new();
+    h.ops([put("a", "1"), put("b", "2")]);
+    let (a, b) = (ino(&mut h, "a"), ino(&mut h, "b"));
+    h.ops([unlink("a")]);
+    let at = h.writer.version();
+    h.open_lease(ADMIN, at).expect("opens");
+    h.ops([unlink("b")]);
+    let page = h.list_freed(ADMIN, None, 10);
+    assert_eq!(listed(&page), [Freed::Inode(a), Freed::Inode(b)]);
+    assert_eq!(page.next, None, "one page holds the queue");
+    let (claim, claimed) = h.claim(ADMIN, 10);
+    assert_eq!(
+        claimed.iter().map(|entry| entry.freed).collect::<Vec<_>>(),
+        [Freed::Inode(a)],
+        "the listing claimed nothing, and the lease holds b"
+    );
+    assert_eq!(
+        listed(&h.list_freed(ADMIN, None, 10)),
+        [Freed::Inode(a), Freed::Inode(b)],
+        "a claimed entry stays listed"
+    );
+    h.ack(ADMIN, claim, &claimed).expect("acknowledges");
+    assert_eq!(listed(&h.list_freed(ADMIN, None, 10)), [Freed::Inode(b)]);
+}
+
+#[test]
+fn a_listing_holds_a_replaced_value() {
+    let mut h = Harness::new();
+    h.ops([put("f", "old")]);
+    let f = ino(&mut h, "f");
+    let QueryResult::Stat { inode, .. } = h.stat("f") else {
+        panic!()
+    };
+    h.ops([put("f", "new")]);
+    assert_eq!(
+        listed(&h.list_freed(ADMIN, None, 10)),
+        [Freed::Value(f, inode.value)]
+    );
+}
+
+#[test]
+fn listings_stay_under_their_root_and_page_through_the_queue() {
+    let mut h = Harness::new();
+    h.ops([
+        mkdir("t"),
+        mkdir("u"),
+        put("t/a", "1"),
+        put("u/b", "2"),
+        put("t/c", "3"),
+    ]);
+    let (a, c) = (ino(&mut h, "t/a"), ino(&mut h, "t/c"));
+    h.ops([unlink("t/a"), unlink("u/b"), unlink("t/c")]);
+    let at_t = h.mint(ADMIN, 1, "t", Grant::Write, 0);
+    let reader = h.mint(ADMIN, 2, "t", Grant::Read, 0);
+    let token = h.token();
+    h.writer.list_freed(token, reader, None, 10);
+    h.run();
+    assert!(matches!(
+        h.answer(token),
+        inodedb_core::writer::Answer::Denied(_)
+    ));
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let page = h.list_freed(at_t, after, 1);
+        assert!(page.entries.len() <= 1, "{page:?}");
+        seen.extend(listed(&page));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, [Freed::Inode(a), Freed::Inode(c)]);
+    assert_eq!(h.list_freed(ADMIN, None, 10).entries.len(), 3);
+}
+
+/// A subtree's contents reach the queue as the writer frees it, after the
+/// detach commits; until then a listing's `freed_through` stays below the
+/// detach, for keys above the subtree.
+#[test]
+fn a_listing_reports_freeing_done_only_past_every_detached_subtree() {
+    let mut h = Harness::new();
+    h.ops([mkdir_p("t/d"), put("t/d/f", "v"), mkdir("u")]);
+    let at_u = h.mint(ADMIN, 1, "u", Grant::Write, 0);
+    let token = h.token();
+    h.writer.submit(
+        token,
+        ADMIN,
+        inodedb_core::ops::Batch {
+            ops: vec![remove_all("t/d")],
+            ..Default::default()
+        },
+    );
+    let held = h.run_until(token);
+    let inodedb_core::writer::Answer::Commit(detach) = h.answer(token) else {
+        panic!("the detach commits")
+    };
+    assert!(!held.is_empty(), "the freeing waits to commit");
+    assert_eq!(h.writer.detached(), 1);
+    let page = h.list_freed(ADMIN, None, 10);
+    assert_eq!(page.freed_through, detach.version - 1);
+    assert_eq!(page.entries, [], "nothing is freed yet");
+    let page = h.list_freed(at_u, None, 10);
+    assert_eq!(
+        page.freed_through, page.version,
+        "the subtree lies outside u"
+    );
+    h.resume(held);
+    assert_eq!(h.writer.detached(), 0);
+    let page = h.list_freed(ADMIN, None, 10);
+    assert_eq!(page.freed_through, page.version);
+    assert!(page.freed_through > detach.version);
+    assert_eq!(page.entries.len(), 2, "the subtree's top and its file");
+}

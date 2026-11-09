@@ -212,6 +212,12 @@ Freeing waits for readers. A reader such as a ClickHouse replica holds file hand
 - A claim lasts its time once every entry is acknowledged, so a retried acknowledgement succeeds. Each writer draws claim ids from its own id, so an acknowledgement meant for an earlier writer's claim finds nothing.
 - A consumer's next claim scans on from where its root's last one stopped, and back from the queue's start once it reaches the horizon, so entries other roots leave in the queue cost one pass rather than one per claim.
 
+**Listing.** A consumer with `write` can also list the queue under its root, in the order freed: every entry, whether a lease holds it or a consumer has claimed it, each with what it kept, as a claim reads it. A listing claims nothing.
+
+- Each page reads at most 1,024 entries of the queue, so a page may list none and still name where the next starts. An entry freed after a page lands past where that page ended, so pages read to the queue's end list every entry freed while they ran, unless it was acknowledged first.
+- A page reports `freed_through`: every subtree under the root detached at or before it has all its contents in the queue ([Removing subtrees](#removing-subtrees)). The writer takes it from its committed state before the page's read goes out.
+- A snapshot at version V reaches every file live at V. A listing that reaches the queue's end with `freed_through` at or past V holds every entry not yet acknowledged, the contents of subtrees detached by V among them. Together they name every value written by V that storage still holds, so a sweep of a blob store can delete the blobs neither names ([ClickHouse integration](#clickhouse-integration)).
+
 **Where leases live.** The writer keeps leases in memory, runs release, and writes each heartbeat to storage with its next commit, so a new writer finds them; when no batch is coming, a commit of heartbeats alone goes out at most once a second. A new writer gives every stored lease a fresh TTL before it releases anything, so no lease deadline is ever compared with another server's clock, and answers lease calls only once it has loaded them. A writer that starts over after a failed first commit loads them again, and what storage holds replaces all it held and queued before.
 
 - **The release record** holds the horizon claims may use and the next lease id. A lease's opening commits the record past its id, and a claim releases nothing above the horizon the record holds, committing a newer one first. A starting writer begins from the record, so it never hands an id out again, and never releases less than an earlier writer let a consumer claim.
@@ -346,7 +352,7 @@ On SQLite, RocksDB and lionturtle, the database's lock admits one process, and a
 
 ### Standbys
 
-A standby follows the log into a cache of the whole tree, and serves `AtLeast(v)` reads, waiting for its cache to reach `v`, and `Watch`. It answers writes, `Latest` reads, leases and claims with `NotWriter` and the address the head record names. It takes over with its cache, so failover costs the lease and margin plus a read of the store and the epoch commit.
+A standby follows the log into a cache of the whole tree, and serves `AtLeast(v)` reads, waiting for its cache to reach `v`, and `Watch`. It answers writes, `Latest` reads, leases, claims and listings of the free queue with `NotWriter` and the address the head record names. It takes over with its cache, so failover costs the lease and margin plus a read of the store and the epoch commit.
 
 ## API
 
@@ -360,6 +366,7 @@ service InodeDB {
   rpc Lease(stream LeaseBeat)     returns (stream LeaseState);
   rpc ClaimFreed(ClaimRequest)    returns (ClaimResponse);
   rpc AckFreed(AckRequest)        returns (AckResponse);
+  rpc ListFreed(ListFreedRequest) returns (ListFreedResponse);
   rpc MintKey(MintKeyRequest)     returns (MintKeyResponse);
   rpc RevokeKey(RevokeKeyRequest) returns (RevokeKeyResponse);
   rpc Check(CheckRequest)         returns (CheckResponse);    // fsck, root admin keys only
@@ -370,7 +377,7 @@ service InodeDB {
 - Every op in a `CommitRequest` addresses a path. Reads address a path or a handle, and a read by handle can name a value's version, for snapshots.
 - `List` takes a name to start after and a name prefix. It can return each entry's attributes and value, so a client loads a directory of small files in one call. Each page holds at most 1,024 entries and about 3 MiB, counting each entry's name, its value when asked for, and 128 bytes for the rest; a page holds one entry whatever its size. Pages after the first are at least as new as the one before, so a listing reflects at least its first page's version, as `readdir` does. Every page names the directory it lists, and pages after the first list that directory wherever renames take it, as `readdir` follows an open directory; a listing resumed by that handle does the same.
 - A `CommitResponse` carries each op's outcome. Errors that reject a whole request are gRPC status codes carrying an InodeDB error code, and `NotWriter` carries the writer's address. A batch holding an op or predicate the server can't read is malformed. A missing, unknown, revoked or expired key gets `Unauthenticated`; a key without the grant, `PermissionDenied`; a handle issued to another key, `InvalidArgument`.
-- Responses stay under gRPC's default 4 MiB message limit: listings page, a `Read` names at most 60 targets and a `Stat` at most 1,000, and the client splits larger requests and sends the parts at once.
+- Responses stay under gRPC's default 4 MiB message limit: listings page, a `Read` names at most 60 targets and a `Stat` at most 1,000, a claim or a page of the free queue holds at most 60 entries, and the client splits larger requests and sends the parts at once.
 
 ## Client library
 
@@ -464,13 +471,14 @@ One thread runs clients with caches and snapshots, a writer, standbys that follo
 7. No queue entry is claimed while a live lease's oldest version is below its free version, and every handle a live lease could hold still reads.
 8. No key reads or writes outside its root, by path or by handle, and a revoked key does nothing.
 9. The position the writer gives log truncation is at most every live lease's position, as the simulator's own record of the leases has it.
+10. A page of the free queue lists nothing a name holds or an acknowledgement removed by its version. A listing that reaches the queue's end holds every file the model at its last page's version says was freed, unless an acknowledgement went out for it, and no subtree detached at or before that page's `freed_through` still links a file.
 
 ### Seeds, regressions and mutants
 
 - A seed replays its run exactly. The simulator's PRNG is its own module, `sim/src/prng.rs`, and each source of randomness draws from its own stream, so a new source leaves existing draws unchanged.
 - `--seeds N` sweeps N seeds on every core.
 - A bug the simulator finds becomes a regression test in `sim/tests` that runs its seed. The commit message records the seed and the commit that failed.
-- `scripts/mutants` plants known bugs one at a time and requires some layer to catch each: skipping the cycle check or its reverse for `Exchange`, keeping a file's link count on unlink, releasing below a lease, dropping the request-id lookup, skipping the epoch check, skipping the scope check on reads by handle, an op that applies although an op it names in `Applied` was skipped, a batch answered before the groups it was evaluated against commit, a cache that keeps a name a commit removed, a feed that leaves cached links as they were, a snapshot that ignores its undo records, a writer that answers after its lease, a read from the cache past the lease or outside its key's root, a standby that waits out a released head. `scripts/mutants --rocksdb` and `--lionturtle` plant bugs in those backends, and `scripts/fdb python3 scripts/mutants --fdb` in the FoundationDB backend, against a cluster. `EVIDENCE.md` maps every behavior here to the tests, properties and planted bugs that check it.
+- `scripts/mutants` plants known bugs one at a time and requires some layer to catch each: skipping the cycle check or its reverse for `Exchange`, keeping a file's link count on unlink, releasing below a lease, dropping the request-id lookup, skipping the epoch check, skipping the scope check on reads by handle, an op that applies although an op it names in `Applied` was skipped, a batch answered before the groups it was evaluated against commit, a cache that keeps a name a commit removed, a feed that leaves cached links as they were, a snapshot that ignores its undo records, a writer that answers after its lease, a read from the cache past the lease or outside its key's root, a standby that waits out a released head, a listing of the free queue that stops at the horizon or skips claimed entries, a listing that reports freeing done past a detached subtree. `scripts/mutants --rocksdb` and `--lionturtle` plant bugs in those backends, and `scripts/fdb python3 scripts/mutants --fdb` in the FoundationDB backend, against a cluster. `EVIDENCE.md` maps every behavior here to the tests, properties and planted bugs that check it.
 
 ### Conformance and differential suites
 
@@ -504,6 +512,7 @@ The ClickHouse side is a new `metadata_type` for object-storage disks: an `IMeta
 - `tmp_*` directories stage locally and reach InodeDB as one batch at their rename.
 - The ClickHouse writer fences itself with a `when` on an owner file's version, and sends each transaction as an `all_or_nothing` batch.
 - Replicas read through snapshots. `refresh` waits for the latest version, and the changefeed reports removed parts as well as new ones.
+- A writer that dies after uploading a part's blobs and before committing its records leaves blobs no record names. The writer that takes over can sweep them once it has bumped the owner fence, since no older writer can then commit: it lists the tree through a snapshot at version V, lists the free queue until `freed_through` reaches V, and deletes the blobs uploaded before the bump that neither names ([Listing](#leases-and-freeing)). The sweep must cover only blobs the fenced writer could have uploaded.
 
 | ClickHouse | InodeDB |
 |---|---|

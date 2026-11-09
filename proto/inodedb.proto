@@ -16,6 +16,10 @@ service InodeDB {
   rpc Lease(stream LeaseBeat) returns (stream LeaseState);
   rpc ClaimFreed(ClaimRequest) returns (ClaimResponse);
   rpc AckFreed(AckRequest) returns (AckResponse);
+  // The free queue's entries under the key's root in the order freed,
+  // whether a lease holds them or a consumer has claimed them. It claims
+  // nothing.
+  rpc ListFreed(ListFreedRequest) returns (ListFreedResponse);
   rpc MintKey(MintKeyRequest) returns (MintKeyResponse);
   rpc RevokeKey(RevokeKeyRequest) returns (RevokeKeyResponse);
   // Checks the store's invariants over one snapshot, as `fsck`. It reads
@@ -368,6 +372,26 @@ message AckRequest {
 }
 
 message AckResponse {}
+
+message ListFreedRequest {
+  // The previous page's `next`; empty starts at the queue's start.
+  bytes after = 1;
+  uint32 limit = 2;
+}
+
+message ListFreedResponse {
+  // At most the request's limit, and possibly none while `next` is set:
+  // each page reads a bounded stretch of the queue.
+  repeated Freed freed = 1;
+  // Where the next page starts; empty once this page reached the queue's
+  // end.
+  bytes next = 2;
+  // Every subtree under the root detached at or before this version has
+  // all its contents in the queue as of this page.
+  uint64 freed_through = 3;
+  // The page reflects this version or a later one.
+  uint64 version = 4;
+}
 
 enum Grant {
   READ = 0;

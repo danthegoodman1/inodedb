@@ -1,12 +1,13 @@
 //! The gRPC service: checks keys, converts messages and asks the engine.
 
-use crate::auth::{self, Auth, Grant};
+use crate::auth::{self, Auth, Grant, Scope};
 use crate::convert;
 use crate::engine::Engine;
 use crate::feed::{self, Log};
 use inodedb_core::auth::{Caller, KeyError, KeyOp};
 use inodedb_core::delta::Freed;
-use inodedb_core::lease::{ClaimError, LeaseError, LeaseRecord};
+use inodedb_core::keys::{self, Parsed};
+use inodedb_core::lease::{ClaimError, FreeEntry, LeaseError, LeaseRecord};
 use inodedb_core::ops::BatchError;
 use inodedb_core::query::{Query, QueryResult, Target};
 use inodedb_core::types::{Error, Kind, Version};
@@ -25,8 +26,8 @@ use tonic::{Request, Response, Status, Streaming};
 pub const MAX_READ_TARGETS: usize = 60;
 /// The most targets one `Stat` names; each answer is about 100 bytes.
 pub const MAX_STAT_TARGETS: usize = 1_000;
-/// The most entries one claim returns, each with its value, within gRPC's
-/// default 4 MiB message.
+/// The most entries one claim or listing of the free queue returns, each
+/// with its value, within gRPC's default 4 MiB message.
 pub const MAX_CLAIM: usize = 60;
 /// Entries per `List` page.
 pub const PAGE_ENTRIES: usize = 1024;
@@ -181,6 +182,30 @@ async fn ask(
         Answer::Unavailable => Err(Status::unavailable("the writer has stopped")),
         other => Err(Status::internal(format!("unexpected answer {other:?}"))),
     }
+}
+
+/// Free-queue entries as the API sends them, each with what it kept: the
+/// inode while its record stands, and the value it frees, within the root
+/// the entry recorded.
+async fn kept(
+    engine: &Engine,
+    caller: Caller,
+    scope: &Scope,
+    entries: &[FreeEntry],
+) -> Result<Vec<pb::Freed>, Status> {
+    let reads = entries.iter().map(|entry| Query::Kept {
+        freed: entry.freed,
+        above: entry.ancestors.clone(),
+    });
+    let (_, kept) = ask(engine, caller, Query::Many(reads.collect()), None).await?;
+    let QueryResult::Many(kept) = kept else {
+        return Err(Status::internal("many queries answered one"));
+    };
+    Ok(entries
+        .iter()
+        .zip(&kept)
+        .map(|(entry, kept)| convert::freed(entry, kept, scope))
+        .collect())
 }
 
 /// A key op's answer.
@@ -571,22 +596,54 @@ impl InodeDb for Service {
             Answer::Unavailable => return Err(Status::unavailable("the writer has stopped")),
             other => return Err(Status::internal(format!("unexpected answer {other:?}"))),
         };
-        // What each entry kept: the inode while its record stands, and the
-        // value it frees, within the root the entry recorded.
-        let reads = entries.iter().map(|entry| Query::Kept {
-            freed: entry.freed,
-            above: entry.ancestors.clone(),
-        });
-        let (_, kept) = ask(&self.engine, caller, Query::Many(reads.collect()), None).await?;
-        let QueryResult::Many(kept) = kept else {
-            return Err(Status::internal("many queries answered one"));
-        };
-        let freed = entries
-            .iter()
-            .zip(&kept)
-            .map(|(entry, kept)| convert::freed(entry, kept, &scope))
-            .collect();
+        let freed = kept(&self.engine, caller, &scope, &entries).await?;
         Ok(Response::new(pb::ClaimResponse { claim, freed }))
+    }
+
+    async fn list_freed(
+        &self,
+        request: Request<pb::ListFreedRequest>,
+    ) -> Result<Response<pb::ListFreedResponse>, Status> {
+        let (caller, scope) = self.auth.caller(&request)?;
+        let request = request.into_inner();
+        let limit = (request.limit as usize).clamp(1, MAX_CLAIM);
+        let after = match &request.after[..] {
+            [] => None,
+            after => match keys::parse(after) {
+                Some(Parsed::Free(version, ino, value)) => Some((
+                    version,
+                    match value {
+                        Some(value) => Freed::Value(ino, value),
+                        None => Freed::Inode(ino),
+                    },
+                )),
+                _ => return Err(Status::invalid_argument("not a cursor ListFreed gave")),
+            },
+        };
+        let (version, entries, next, freed_through) =
+            match self.engine.list_freed(caller, after, limit).await? {
+                Answer::FreeQueue {
+                    version,
+                    entries,
+                    next,
+                    freed_through,
+                } => (version, entries, next, freed_through),
+                Answer::Denied(denied) => return Err(auth::denied(denied)),
+                Answer::Unavailable => {
+                    return Err(Status::unavailable("the writer has stopped"));
+                }
+                other => return Err(Status::internal(format!("unexpected answer {other:?}"))),
+            };
+        let freed = kept(&self.engine, caller, &scope, &entries).await?;
+        Ok(Response::new(pb::ListFreedResponse {
+            freed,
+            next: next
+                .map(|(version, freed)| freed.key(version))
+                .unwrap_or_default()
+                .into(),
+            freed_through,
+            version,
+        }))
     }
 
     async fn ack_freed(

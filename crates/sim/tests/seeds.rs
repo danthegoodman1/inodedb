@@ -23,6 +23,14 @@ fn seed_403() {
     passes(403);
 }
 
+/// A file created inside a subtree its own batch detached never had its
+/// inode seen, so the model kept counting the link freeing removed, and
+/// a listing's `freed_through` past the detach looked too high.
+#[test]
+fn seed_2051() {
+    passes(2051);
+}
+
 /// A failed group's run again reopened leases that had run out meanwhile,
 /// and their pending deletions, written after the openings, removed them
 /// from storage; a restarted writer lost them.

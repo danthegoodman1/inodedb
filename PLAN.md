@@ -318,6 +318,7 @@ Scope:
 - 6E `RemoveAll`: the detach commit, revocation of keys rooted inside, background freeing in transactions of at most 1,000 inodes, links outside the subtree kept.
 - 6F Truncation by live leases' positions.
 - 6G Snapshots in the client: undo records, the read rule, misses waiting for the feed, old values by handle and version, `undo_bytes` and `SnapshotTooOld`.
+- 6H `ListFreed`: every free-queue entry under the caller's root, whether a lease holds it or a consumer claimed it, with what it kept, in pages, with `freed_through` for detached subtrees; it claims nothing.
 
 Out of scope:
 - Per-tenant release horizons (open question).
@@ -326,8 +327,8 @@ Completion gate:
 All scope items have tests; a 10,000-seed sweep passes; `scripts/mutants` catches every Phase 6 planted bug; `/code-review` findings are resolved.
 
 Testing plan:
-- Simulator: replicas with long snapshots, consumers that claim entries and delete from a model of an external store, partitions that expire leases; properties 6 (snapshots), 7 and 9.
-- Planted bugs: releasing below a lease; claiming outside the consumer's root; a snapshot that ignores its undo records; deleting a record before its entry is acknowledged; accepting a heartbeat that lowers the oldest version; a detach that leaves keys rooted inside it working.
+- Simulator: replicas with long snapshots, consumers that claim entries, list the queue and delete from a model of an external store, partitions that expire leases; properties 6 (snapshots), 7, 9 and 10.
+- Planted bugs: releasing below a lease; claiming outside the consumer's root; a snapshot that ignores its undo records; deleting a record before its entry is acknowledged; accepting a heartbeat that lowers the oldest version; a detach that leaves keys rooted inside it working; a listing that stops at the horizon, skips claimed entries, or reports freeing done past a detached subtree.
 
 Status ledger:
 
@@ -343,6 +344,10 @@ Status ledger:
 | Complete | Test | Planted bugs for Phase 6 | Twenty-eight in `scripts/mutants`, from "the horizon passes a live lease" to "a lease opens at the version the cache read", all caught: the sixteen added or changed for the review in one run, its two misses after `ops.rs::a_wide_directory_frees_over_several_commits` and the `slow_lease_opens` fault in `caches_start_under_steady_writes`. |
 | Complete | Gate | 10,000-seed sweep | `inodedb-sim 0 --seeds 10000` and 10,000 seeds from a random start pass on the reviewed code. |
 | Complete | Gate | Code review | Twelve findings, each fixed: (1) lease ids reused after a restart: the release record `s z` stores the next id; (2) a new writer's horizon fell back to stale lease records: the release record stores the horizon, and claims use only the stored one; (3) a snapshot past `undo_bytes` stopped pinning its lease: an ended snapshot pins until dropped; (4) a claim lost a replaced value once its file's record went: `Query::Kept` reads the kept value directly (`claims_read_values_their_file_outlived`); (5) each reap step listed a whole directory: listings stop at the step's remaining budget; (6) every request scanned every lease: `Leases` indexes oldest versions, positions and expiries; (7) every claim scanned the free queue from its start: claims resume from a cursor per root; (8) MAC pruning stopped while a snapshot was open: it keeps what the cache holds or an undo record names; (9) retried acknowledgements failed, and claim ids repeated across writers: acknowledged claims linger until they expire, and ids start from the writer's id; (10) reaping starved under steady load: it runs every 100 ms regardless; (11) reaps routed through the detached top's stale parent: detach records hold the ancestors at detach time; (12) heartbeats stopped while the Watch reconnected: a heartbeat task runs apart from the stream. |
+| Complete | Work | 6H: Listing the free queue | `Writer::list_freed` in `crates/core/src/writer.rs`, `ListFreed` in `service.rs`, `Client::list_freed`; `leases.rs::{a_listing_holds_every_entry_and_claims_none, a_listing_holds_a_replaced_value, listings_stay_under_their_root_and_page_through_the_queue, a_listing_reports_freeing_done_only_past_every_detached_subtree}`; API check `listings_hold_the_whole_free_queue` on every backend, FoundationDB through `scripts/fdb`; the simulated consumer lists the queue page by page and checks property 10. |
+| Complete | Test | Planted bugs for 6H | Eight in `scripts/mutants`, from "a listing of the free queue stops at the release horizon" to "a listing leaves out what its entries kept", all caught in one run: six by the API suite, two by the simulator's tests. Before that run, 500-seed sweeps caught the horizon, claimed-entry, cursor and `freed_through` bugs in 251, 123, 231 and 77 seeds, and 2,000 seeds caught the lapsed-lease one in 104. |
+| Complete | Gate | 6H sweep | `inodedb-sim 0 --seeds 10000` passes. A first sweep failed seed 2051 on a gap in the simulator's model, not the core: a file created inside a subtree its own batch detached never had its inode seen, so the model kept counting the link freeing removed. Property 10 now skips such files, and `seeds.rs::seed_2051` runs it. |
+| Incomplete | Gate | 6H code review | Missing: `/code-review high` on the 6H change. |
 
 ## Phase S2: FoundationDB and Takeover
 
@@ -524,6 +529,7 @@ Scope:
 - 8E Replicas: snapshots, `refresh` through `wait_for`, removed parts reported by the changefeed.
 - 8F Blob removal through `ClaimFreed` and `AckFreed`.
 - 8G Small files stored inline, which needs a change to the disk's write path.
+- 8H An orphan sweep when a writer starts: once it has bumped the owner fence, it deletes the blobs uploaded before the bump that neither a snapshot of the tree nor a `ListFreed` listing names, under a prefix only the fenced writer uploads to.
 
 Out of scope:
 - Changes to MergeTree's refresh beyond what 8E needs.
@@ -545,4 +551,5 @@ Status ledger:
 | Incomplete | Work | 8E: Replicas | Missing: a replica test with dropped parts. |
 | Incomplete | Work | 8F: Blob removal | Missing: a test that blobs go only after acknowledgment. |
 | Incomplete | Work | 8G: Inline small files | Missing: write-path change and a cold-load test. |
+| Incomplete | Work | 8H: Orphan sweep | InodeDB side complete (6H). Missing: the sweep in the disk, and a crash test whose leftover objects equal the set the metadata names. |
 | Incomplete | Gate | Stateless tests and kill tests | Missing: test run results. |

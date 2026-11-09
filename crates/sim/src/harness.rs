@@ -3,6 +3,7 @@
 
 use inodedb_core::Bytes;
 use inodedb_core::auth::{Caller, Grant, KeyId, KeyOp};
+use inodedb_core::delta::Freed;
 use inodedb_core::fsck;
 use inodedb_core::lease::{
     ClaimError, ClaimId, FreeEntry, Granted, LeaseError, LeaseId, LeaseRecord,
@@ -20,6 +21,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 /// Writer ids unique across every harness in the process.
 static NEXT_WRITER: AtomicU64 = AtomicU64::new(1);
+
+/// A page of the free queue, as `Answer::FreeQueue` holds it.
+#[derive(Debug)]
+pub struct FreePage {
+    pub version: Version,
+    pub entries: Vec<FreeEntry>,
+    pub next: Option<(Version, Freed)>,
+    pub freed_through: Version,
+}
 
 pub struct Harness {
     pub writer: Writer,
@@ -77,24 +87,58 @@ impl Harness {
                 return;
             }
             for action in actions {
+                self.carry_out(action);
+            }
+        }
+    }
+
+    /// Runs the writer as `run` does until `token` has its answer, then
+    /// holds back the commits it asks for, and returns them.
+    pub fn run_until(&mut self, token: u64) -> Vec<Action> {
+        let mut held = Vec::new();
+        loop {
+            let actions = self.writer.drain();
+            if actions.is_empty() {
+                return held;
+            }
+            for action in actions {
                 match action {
-                    Action::Read { id, reads } => {
-                        self.reads += 1;
-                        let results = self.storage.read_now(&reads);
-                        self.writer.read_done(id, results);
+                    Action::Commit { .. } | Action::Resolve { .. }
+                        if self.answers.contains_key(&token) =>
+                    {
+                        held.push(action);
                     }
-                    Action::Commit { id, expect, writes } => {
-                        let outcome = self.storage.commit_now(expect.as_deref(), &writes);
-                        self.writer.commit_done(id, outcome);
-                    }
-                    Action::Resolve { id } => {
-                        let head = self.storage.head_now();
-                        self.writer.resolve_done(id, head);
-                    }
-                    Action::Answer { token, answer } => {
-                        self.answers.insert(token, answer);
-                    }
+                    action => self.carry_out(action),
                 }
+            }
+        }
+    }
+
+    /// Carries out the actions `run_until` held back, then runs on.
+    pub fn resume(&mut self, held: Vec<Action>) {
+        for action in held {
+            self.carry_out(action);
+        }
+        self.run();
+    }
+
+    fn carry_out(&mut self, action: Action) {
+        match action {
+            Action::Read { id, reads } => {
+                self.reads += 1;
+                let results = self.storage.read_now(&reads);
+                self.writer.read_done(id, results);
+            }
+            Action::Commit { id, expect, writes } => {
+                let outcome = self.storage.commit_now(expect.as_deref(), &writes);
+                self.writer.commit_done(id, outcome);
+            }
+            Action::Resolve { id } => {
+                let head = self.storage.head_now();
+                self.writer.resolve_done(id, head);
+            }
+            Action::Answer { token, answer } => {
+                self.answers.insert(token, answer);
             }
         }
     }
@@ -229,6 +273,32 @@ impl Harness {
         match self.answer(token) {
             Answer::Acked(result) => result,
             other => panic!("expected an acknowledgement, got {other:?}"),
+        }
+    }
+
+    /// Lists a page of the free queue.
+    pub fn list_freed(
+        &mut self,
+        caller: Caller,
+        after: Option<(Version, Freed)>,
+        limit: usize,
+    ) -> FreePage {
+        let token = self.token();
+        self.writer.list_freed(token, caller, after, limit);
+        self.run();
+        match self.answer(token) {
+            Answer::FreeQueue {
+                version,
+                entries,
+                next,
+                freed_through,
+            } => FreePage {
+                version,
+                entries,
+                next,
+                freed_through,
+            },
+            other => panic!("expected a page of the free queue, got {other:?}"),
         }
     }
 

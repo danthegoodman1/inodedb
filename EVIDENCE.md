@@ -24,6 +24,7 @@ Notation:
 | P7 Release horizon | `lease_answer` | Consumer under the tree's root |
 | P8 Key scope | `check_query`, `durable` (a commit revokes exactly the keys whose roots it removed), `answer` | Write keys minted by the root; stats by inode outside a key's root |
 | P9 Truncation positions | `check_positions` against the simulator's record of live leases | The simulator truncates no log |
+| P10 Listings of the free queue | `check_listing` | The consumer, under the tree's root, starts a listing on 30% of its turns and asks for each page as the one before answers, from 1 to 20 entries a page; files whose inode the simulator has seen |
 
 Faults the simulator injects: clean shutdowns that release the store, unknown outcomes, storage latency and stalls, an old writer's reads from before its successor's commits, writer crashes mid-group, network delay, loss, duplication and reordering of client requests, client cut-offs, cut watch streams, and clock drift of up to 9% against a margin of 20% of the lease.
 
@@ -71,6 +72,7 @@ Faults the simulator injects: clean shutdowns that release the store, unknown ou
 | Leases: horizon, heartbeats, expiry, release record | `leases::*`, `core/lease::*`, `groups::a_lease_reopened_after_it_ran_out_stays_stored`, `api::leases_hold_freed_records`, P7; M"the horizon passes a live lease", M"a heartbeat lowers the oldest version", M"a reopened lease keeps the deletion of its earlier run", M"a writer that starts over keeps the lease deletions it queued", M"a writer that starts over keeps leases gone from storage" |
 | Heartbeats reach storage within each commit's budget | `core/lease::heartbeats_reach_storage_a_budget_at_a_time`; M"a commit carries every pending heartbeat" |
 | Claims: scope, expiry, reads through entries, fencing | `leases::{claims_stay_under_the_consumers_root, a_claim_that_runs_out_returns_its_entries}`, `api::claims_read_values_their_file_outlived`, P4; M"a writer whose lease lapsed answers the claim it scanned" |
+| Listings of the free queue: held and claimed entries, what each kept, scope, pages, claiming none, `freed_through`, fencing | `leases::{a_listing_holds_every_entry_and_claims_none, a_listing_holds_a_replaced_value, listings_stay_under_their_root_and_page_through_the_queue, a_listing_reports_freeing_done_only_past_every_detached_subtree}`, `api::listings_hold_the_whole_free_queue`, `seeds::seed_2051`, P4, P10; M"a listing of the free queue stops at the release horizon", M"a listing of the free queue skips claimed entries", M"a listing of the free queue reaches outside its key's root", M"a listing of the free queue claims what it lists", M"a full page of the free queue goes on past what it left out", M"a listing reports freeing done past a detached subtree", M"a writer whose lease lapsed answers the listing it read", M"a listing leaves out what its entries kept" |
 | `RemoveAll`: detach, bounded frees, links outside | `ops::{remove_all_detaches_a_subtree_then_frees_it, a_large_subtree_frees_in_bounded_commits, a_wide_directory_frees_over_several_commits}`, `feed::freeing_a_subtree_reaches_those_that_saw_it`, `leases::a_subtrees_frees_go_to_consumers_above_it_as_it_detached`, `seeds::seed_403`; M"the reaper frees a file linked outside its subtree", M"a reap routes to no one who saw its subtree", M"a reaped record names what lies above its top now" |
 
 ## Storage and the writer
@@ -109,7 +111,8 @@ Faults the simulator injects: clean shutdowns that release the store, unknown ou
 
 ## Gaps
 
-- The simulator never truncates the log, and lease and claim calls bypass its network.
+- The simulator never truncates the log, and lease, claim and listing calls bypass its network.
+- The swarm lists the free queue under the tree's root alone, and P10 checks freed files alone, since the model keeps no replaced values; listings under narrower keys have scripted and API tests only, and listings of replaced values a scripted test only.
 - The swarm's keys are write keys minted by the root with no expiry; read and admin grants, expiry and explicit revocation have scripted tests only.
 - A fenced or releasing writer's cached reads have scripted tests only: the swarm drops a stopped writer at once, and rarely reads during a release's commit.
 - Changefeed progress changes and the "only committed versions" rule of `Watch` have no test.
