@@ -39,6 +39,8 @@ pub struct Harness {
     /// Storage reads the writer asked for.
     pub reads: usize,
     next_token: u64,
+    /// The secret the next key minted gets.
+    next_secret: u64,
     answers: BTreeMap<u64, Answer>,
 }
 
@@ -73,6 +75,7 @@ impl Harness {
             root: ROOT,
             reads: 0,
             next_token: 1,
+            next_secret: 1 << 32,
             answers: BTreeMap::new(),
         };
         harness.run();
@@ -198,10 +201,28 @@ impl Harness {
         self.answers.remove(&token).expect("the writer answered")
     }
 
-    /// Mints a key rooted at `root` and returns it as a caller. Its hash
-    /// is its id's bytes, repeated.
-    pub fn mint(&mut self, by: Caller, id: KeyId, root: &str, grant: Grant, ttl: Millis) -> Caller {
-        let hash = key_hash(id);
+    /// Mints a key rooted at `root` and returns it as a caller. Its id is
+    /// the version that minted it, and its hash a secret's bytes, repeated,
+    /// each key's secret its own.
+    pub fn mint(&mut self, by: Caller, root: &str, grant: Grant, ttl: Millis) -> Caller {
+        self.mint_as(by, None, root, grant, ttl)
+    }
+
+    /// Mints a key under an id the operator names, as `--init-key` does.
+    pub fn mint_named(&mut self, id: KeyId, root: &str, grant: Grant, ttl: Millis) -> Caller {
+        self.mint_as(Caller::Trusted(ROOT), Some(id), root, grant, ttl)
+    }
+
+    fn mint_as(
+        &mut self,
+        by: Caller,
+        id: Option<KeyId>,
+        root: &str,
+        grant: Grant,
+        ttl: Millis,
+    ) -> Caller {
+        let hash = key_hash(self.next_secret);
+        self.next_secret += 1;
         match self.key_op(
             by,
             KeyOp::Mint {
@@ -212,7 +233,10 @@ impl Harness {
                 ttl,
             },
         ) {
-            Answer::Key(Ok(_)) => Caller::Key { id, hash },
+            Answer::Key(Ok(version)) => Caller::Key {
+                id: id.unwrap_or(version),
+                hash,
+            },
             other => panic!("expected a minted key, got {other:?}"),
         }
     }
@@ -336,6 +360,36 @@ impl Harness {
         self.query(Query::Stat(Target::Path(p(path)))).1
     }
 
+    /// How many key records and tombstones storage holds.
+    pub fn stored_keys(&self) -> (usize, usize) {
+        let dump = self.storage.dump();
+        let count = |range: inodedb_core::keys::KeyRange| {
+            dump.iter().filter(|(key, _)| range.contains(key)).count()
+        };
+        (
+            count(inodedb_core::keys::key_records()),
+            count(inodedb_core::keys::retired_keys()),
+        )
+    }
+
+    /// The versions of the log's entries that delete keys, with how many
+    /// each deletes.
+    pub fn key_deletions(&self) -> Vec<(Version, usize)> {
+        self.storage
+            .log_now(0, usize::MAX)
+            .iter()
+            .filter_map(|(version, bytes)| {
+                let entry = inodedb_core::log::LogEntry::decode(bytes).expect("a log entry");
+                let deleted = entry
+                    .keys
+                    .iter()
+                    .filter(|(_, record)| record.is_none())
+                    .count();
+                (deleted > 0).then_some((*version, deleted))
+            })
+            .collect()
+    }
+
     pub fn fsck(&self) -> Vec<String> {
         let dump = self.storage.dump();
         let log = self.storage.log_now(0, usize::MAX);
@@ -348,13 +402,21 @@ impl Harness {
     }
 }
 
-/// The hash the harness gives a key.
-pub fn key_hash(id: KeyId) -> [u8; 32] {
+/// The hash of a key whose secret is `secret`.
+pub fn key_hash(secret: u64) -> [u8; 32] {
     let mut hash = [0; 32];
     for chunk in hash.chunks_mut(8) {
-        chunk.copy_from_slice(&id.to_be_bytes());
+        chunk.copy_from_slice(&secret.to_be_bytes());
     }
     hash
+}
+
+/// The id of a key a caller holds.
+pub fn key_id(caller: Caller) -> KeyId {
+    match caller {
+        Caller::Key { id, .. } => id,
+        Caller::Trusted(_) => panic!("a trusted caller holds no key"),
+    }
 }
 
 pub fn p(text: &str) -> Path {

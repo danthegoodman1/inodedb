@@ -197,31 +197,34 @@ pub fn execute_key(
             root,
             grant,
             ttl,
-        } => match exec.resolve(root) {
-            Err(Halt::Need(read)) => return Err(vec![read]),
-            Err(Halt::Fail(error)) => Some(KeyError::Fs(error)),
-            Ok((_, inode)) if inode.kind != Kind::Dir => Some(KeyError::Fs(Error::NotDir)),
-            Ok(_) if base.key(*id).is_some() || base.key_retired(*id) => Some(KeyError::Exists),
-            Ok((ino, _)) => {
-                let mut expires = if *ttl == 0 {
-                    scope.expires
-                } else {
-                    now.saturating_add(*ttl)
-                };
-                if scope.expires != 0 {
-                    expires = expires.min(scope.expires);
+        } => {
+            let id = minted_id(*id, scope, version);
+            match exec.resolve(root) {
+                Err(Halt::Need(read)) => return Err(vec![read]),
+                Err(Halt::Fail(error)) => Some(KeyError::Fs(error)),
+                Ok((_, inode)) if inode.kind != Kind::Dir => Some(KeyError::Fs(Error::NotDir)),
+                Ok(_) if base.key(id).is_some() || base.key_retired(id) => Some(KeyError::Exists),
+                Ok((ino, _)) => {
+                    let mut expires = if *ttl == 0 {
+                        scope.expires
+                    } else {
+                        now.saturating_add(*ttl)
+                    };
+                    if scope.expires != 0 {
+                        expires = expires.min(scope.expires);
+                    }
+                    let record = KeyRecord {
+                        hash: *hash,
+                        root: ino,
+                        grant: *grant,
+                        expires,
+                        minted_by: scope.key,
+                    };
+                    exec.delta.set_key(id, None, Some(record));
+                    None
                 }
-                let record = KeyRecord {
-                    hash: *hash,
-                    root: ino,
-                    grant: *grant,
-                    expires,
-                    minted_by: scope.key,
-                };
-                exec.delta.set_key(*id, None, Some(record));
-                None
             }
-        },
+        }
         KeyOp::Revoke { id } => {
             if exec.may_revoke(scope, *id) {
                 exec.revoke(*id);
@@ -235,6 +238,35 @@ pub fn execute_key(
         Some(error) => Err(error),
         None => Ok(exec.delta),
     })
+}
+
+/// The id a mint gives its key: the one a trusted caller names, or else
+/// the version that mints it.
+pub fn minted_id(named: Option<KeyId>, scope: &Scope, version: Version) -> KeyId {
+    match (named, scope.key) {
+        (Some(id), None) => id,
+        _ => version,
+    }
+}
+
+/// Deletes the keys among `ids` that have expired by `now`, with the keys
+/// minted from them, which expire no later.
+pub fn execute_expiry(ids: &[KeyId], now: Millis, version: Version, base: &dyn View) -> Delta {
+    let mut exec = Exec {
+        base,
+        delta: Delta::new(version),
+        root: ROOT,
+        now,
+        version,
+        next_ino: 0,
+        reaping: None,
+    };
+    for id in ids {
+        if exec.key(*id).is_some_and(|record| !record.live(now)) {
+            exec.revoke(*id);
+        }
+    }
+    exec.delta
 }
 
 /// The most inodes one commit of a detached subtree's freeing frees.

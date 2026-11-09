@@ -1,10 +1,13 @@
-//! Revoking a key with many keys minted from it, and removing their root.
+//! Revoking a key with many keys minted from it, removing their root, and
+//! deleting them once they expire.
 //!
 //!     cargo run --release -p inodedb-tests --example revoke
 //!
 //! Each run mints keys under one admin key, then revokes it, which revokes
 //! them all in one commit; then mints them again and removes the directory
-//! they are rooted at, which revokes them too.
+//! they are rooted at, which revokes them too; then mints them again, each
+//! with the same TTL under an admin key that never expires, and lets them
+//! expire, which deletes them a thousand to a commit.
 
 use inodedb_core::auth::{Caller, Grant, KeyOp};
 use inodedb_core::types::ROOT;
@@ -12,38 +15,46 @@ use inodedb_core::writer::Answer;
 use inodedb_sim::harness::*;
 use std::time::Instant;
 
-fn mint_under(h: &mut Harness, count: u64) -> Caller {
-    let top = h.mint(Caller::Trusted(ROOT), 1, "t", Grant::Admin, 0);
-    for id in 0..count {
-        h.mint(top, 1_000_000 + id, "", Grant::Read, 0);
+fn mint_under(h: &mut Harness, count: u64, ttl: u64) -> Caller {
+    let top = h.mint(Caller::Trusted(ROOT), "t", Grant::Admin, 0);
+    for _ in 0..count {
+        h.mint(top, "", Grant::Read, ttl);
     }
     top
 }
 
 fn main() {
-    println!("| Keys | Revoke the minter | Remove their root |");
-    println!("| ---: | ---: | ---: |");
+    println!("| Keys | Revoke the minter | Remove their root | Delete them once expired |");
+    println!("| ---: | ---: | ---: | ---: |");
     for count in [4_000, 16_000, 64_000] {
         let mut h = Harness::new();
         h.ops([mkdir("t")]);
-        mint_under(&mut h, count);
+        let top = mint_under(&mut h, count, 0);
         let started = Instant::now();
         assert!(matches!(
-            h.key_op(Caller::Trusted(ROOT), KeyOp::Revoke { id: 1 }),
+            h.key_op(Caller::Trusted(ROOT), KeyOp::Revoke { id: key_id(top) }),
             Answer::Key(Ok(_))
         ));
         let revoked = started.elapsed();
         let mut h = Harness::new();
         h.ops([mkdir("t")]);
-        mint_under(&mut h, count);
+        mint_under(&mut h, count, 0);
         let started = Instant::now();
         h.ops([remove_all("t")]);
         let removed = started.elapsed();
         assert!(h.writer.keys().is_empty());
+        let mut h = Harness::new();
+        h.ops([mkdir("t")]);
+        mint_under(&mut h, count, 60_000);
+        let started = Instant::now();
+        h.tick(60_000);
+        let expired = started.elapsed();
+        assert_eq!(h.writer.keys().len(), 1);
         println!(
-            "| {count} | {:.1} ms | {:.1} ms |",
+            "| {count} | {:.1} ms | {:.1} ms | {:.1} ms |",
             revoked.as_secs_f64() * 1000.0,
-            removed.as_secs_f64() * 1000.0
+            removed.as_secs_f64() * 1000.0,
+            expired.as_secs_f64() * 1000.0
         );
     }
 }

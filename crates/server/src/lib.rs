@@ -58,7 +58,7 @@ pub struct Settings {
 async fn init_key(engine: &Engine, key: &str) -> Result<(), String> {
     let (id, secret) = auth::parse(key).ok_or("the initial key is malformed")?;
     let op = KeyOp::Mint {
-        id,
+        id: Some(id),
         hash: auth::hash(secret),
         root: Path::root(),
         grant: Grant::Admin,

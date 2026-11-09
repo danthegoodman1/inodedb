@@ -22,7 +22,7 @@ Notation:
 | P5 `fsck` | `check_storage` after every commit; `fsck::check_with_log` at each run's end | Every seed |
 | P6 Caches and snapshots | `probe`, `probe_snapshot` | Path reads; snapshots probed once caught up |
 | P7 Release horizon | `lease_answer` | Consumer under the tree's root |
-| P8 Key scope | `check_query`, `durable` (a commit revokes exactly the keys whose roots it removed), `answer` | Write keys minted by the root; stats by inode outside a key's root |
+| P8 Key scope | `check_query`; `durable` (a commit revokes exactly the keys whose roots it removed); `unrecorded` (each key's id is its minting version, and the writer's own commits delete only keys expired by their time); `answer` (refusals only for keys revoked, deleted, or expired on the fastest clock) | Write keys minted by the root, which half the seeds give TTLs of 20 ms to 3 s; stats by inode outside a key's root |
 | P9 Truncation positions | `check_positions` against the simulator's record of live leases | The simulator truncates no log |
 | P10 Listings of the free queue | `check_listing` | The consumer, under the tree's root, starts a listing on 30% of its turns and asks for each page as the one before answers, from 1 to 20 entries a page; files whose inode the simulator has seen |
 
@@ -68,7 +68,9 @@ Faults the simulator injects: clean shutdowns that release the store, unknown ou
 
 | Behavior | Evidence |
 | --- | --- |
-| Keys: root follows renames, grants, minting, revocation, expiry | `keys::*`, `api::keys_bound_their_reach`, `init_key::the_first_key_comes_from_the_key_file`, P8; M"freeing a key's root leaves the key", M"a minted key outlives its minter" |
+| Keys: root follows renames, grants, minting, revocation, expiry | `keys::*`, `api::keys_bound_their_reach`, `init_key::the_first_key_comes_from_the_key_file`, P8; M"freeing a key's root leaves the key", M"a minted key outlives its minter", M"an expired key still works" |
+| Expired keys deleted: in commits of at most 1,000 once a second, through a backlog without waiting, with the keys each minted, and after a restart | `keys::{minted_keys_stay_within_their_minter, an_expired_key_leaves_nothing_behind, an_expired_key_takes_what_it_minted_in_one_commit, expired_keys_go_in_bounded_commits_one_after_another, a_writer_deletes_keys_that_expired_while_none_ran}`, `core/auth::indexes_follow_puts`, `api::keys_expire_and_leave_the_store`, P8; M"expired keys stay in the store", M"the writer deletes keys before they expire", M"an expired key's deletion leaves the keys it minted", M"the writer deletes every expired key in one commit", M"a backlog of expired keys waits a second per commit" |
+| Key ids: a key's mints take their version; tombstones for the operator's keys alone | `keys::{a_key_minted_by_a_key_takes_its_version_as_its_id, an_expired_key_leaves_nothing_behind, a_revoked_id_never_mints_again}`, `api::keys_expire_and_leave_the_store`, P8; M"a key's mint takes the id it names", M"deleting a key minted by a key leaves a tombstone", M"deleting an operator's key leaves no tombstone", M"a revoked key's id mints again", M"the server hands out an id the writer didn't mint" |
 | Leases: horizon, heartbeats, expiry, release record | `leases::*`, `core/lease::*`, `groups::a_lease_reopened_after_it_ran_out_stays_stored`, `api::leases_hold_freed_records`, P7; M"the horizon passes a live lease", M"a heartbeat lowers the oldest version", M"a reopened lease keeps the deletion of its earlier run", M"a writer that starts over keeps the lease deletions it queued", M"a writer that starts over keeps leases gone from storage" |
 | Heartbeats reach storage within each commit's budget | `core/lease::heartbeats_reach_storage_a_budget_at_a_time`; M"a commit carries every pending heartbeat" |
 | Claims: scope, expiry, reads through entries, fencing | `leases::{claims_stay_under_the_consumers_root, a_claim_that_runs_out_returns_its_entries}`, `api::claims_read_values_their_file_outlived`, P4; M"a writer whose lease lapsed answers the claim it scanned" |
@@ -113,7 +115,7 @@ Faults the simulator injects: clean shutdowns that release the store, unknown ou
 
 - The simulator never truncates the log, and lease, claim and listing calls bypass its network.
 - The swarm lists the free queue under the tree's root alone, and P10 checks freed files alone, since the model keeps no replaced values; listings under narrower keys have scripted and API tests only, and listings of replaced values a scripted test only.
-- The swarm's keys are write keys minted by the root with no expiry; read and admin grants, expiry and explicit revocation have scripted tests only.
+- The swarm's keys are write keys minted by the root, so read and admin grants, keys minted by keys, explicit revocation, and expiry's cascades and commit bounds have scripted tests only. The swarm checks that the writer deletes only expired keys, and a scripted test that it deletes them within a second; faults and takeovers would stretch any bound the swarm could check.
 - A fenced or releasing writer's cached reads have scripted tests only: the swarm drops a stopped writer at once, and rarely reads during a release's commit.
 - Changefeed progress changes and the "only committed versions" rule of `Watch` have no test.
 - The client library has no unit tests; its cache restart after `Compacted`, heartbeat pacing and listing checks are covered only through `api::`.

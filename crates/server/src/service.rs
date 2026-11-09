@@ -208,10 +208,10 @@ async fn kept(
         .collect())
 }
 
-/// A key op's answer.
-async fn key_op(engine: &Engine, caller: Caller, op: KeyOp) -> Result<(), Status> {
+/// The version a key op committed at, which a mint's key takes as its id.
+async fn key_op(engine: &Engine, caller: Caller, op: KeyOp) -> Result<Version, Status> {
     match engine.key(caller, op).await? {
-        Answer::Key(Ok(_)) => Ok(()),
+        Answer::Key(Ok(version)) => Ok(version),
         Answer::Key(Err(KeyError::Fs(Error::NotFound))) => {
             Err(Status::not_found("the root doesn't exist"))
         }
@@ -692,15 +692,15 @@ impl InodeDb for Service {
             Ok(pb::Grant::Admin) => Grant::Admin,
             Err(_) => return Err(Status::invalid_argument("unknown grant")),
         };
-        let (id, secret) = auth::generate();
+        let secret = auth::secret();
         let op = KeyOp::Mint {
-            id,
+            id: None,
             hash: auth::hash(&secret),
             root: convert::path(&request.root)?,
             grant,
             ttl: request.ttl_ms,
         };
-        key_op(&self.engine, caller, op).await?;
+        let id = key_op(&self.engine, caller, op).await?;
         Ok(Response::new(pb::MintKeyResponse {
             key: auth::format(id, &secret),
         }))

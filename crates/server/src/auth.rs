@@ -41,13 +41,19 @@ pub fn format(id: KeyId, secret: &str) -> String {
     format!("{id:016x}.{secret}")
 }
 
-/// A random key: an id and a 128-bit secret.
-pub fn generate() -> (KeyId, String) {
-    let id = getrandom::u64().expect("the system's random source");
+/// A random 128-bit secret, in hex.
+pub fn secret() -> String {
     let mut secret = [0u8; 16];
     getrandom::fill(&mut secret).expect("the system's random source");
-    let secret = secret.iter().map(|byte| format!("{byte:02x}")).collect();
-    (id, secret)
+    secret.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A random key for the operator to name at bootstrap: an id and a
+/// 128-bit secret. Keys minted through the server take their minting
+/// version as their id.
+pub fn generate() -> (KeyId, String) {
+    let id = getrandom::u64().expect("the system's random source");
+    (id, secret())
 }
 
 pub fn denied(denied: Denied) -> Status {

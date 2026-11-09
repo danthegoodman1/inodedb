@@ -283,7 +283,7 @@ pub fn key_records() -> KeyRange {
     KeyRange::prefix(system(b'k', 0))
 }
 
-/// A revoked key's tombstone, so its id never mints again.
+/// A deleted operator key's tombstone, so its id never mints again.
 pub fn key_retired(id: u64) -> Vec<u8> {
     let mut key = system(b'R', 8);
     key.extend_from_slice(&id.to_be_bytes());

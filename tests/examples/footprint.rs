@@ -113,6 +113,44 @@ fn per_item(count: u64, make: impl Fn(u64) -> Batch) -> (f64, f64) {
     )
 }
 
+/// The writer's bytes per key, over `count` keys an admin key mints with
+/// one TTL: while they live, and once they have expired and gone.
+fn per_key(count: u64) -> (f64, f64) {
+    use inodedb_core::auth::{Caller, Grant, KeyOp};
+    let mut writer = Writer::new(Config::default(), 1, 1_000, [7; 32]);
+    drive(&mut writer);
+    let admin = Caller::Key {
+        id: 1 << 40,
+        hash: [1; 32],
+    };
+    let mint = |id, hash, grant, ttl| KeyOp::Mint {
+        id,
+        hash,
+        root: inodedb_core::types::Path::root(),
+        grant,
+        ttl,
+    };
+    writer.submit_key(
+        0,
+        Caller::Trusted(ROOT),
+        mint(Some(1 << 40), [1; 32], Grant::Admin, 0),
+    );
+    drive(&mut writer);
+    let before = live();
+    for index in 0..count {
+        writer.submit_key(index + 1, admin, mint(None, [2; 32], Grant::Read, 60_000));
+        drive(&mut writer);
+    }
+    assert_eq!(writer.keys().len() as u64, count + 1);
+    let held = live() - before;
+    writer.set_now(62_000);
+    writer.tick();
+    drive(&mut writer);
+    assert_eq!(writer.keys().len(), 1);
+    let left = live() - before;
+    (held as f64 / count as f64, left as f64 / count as f64)
+}
+
 /// The bytes of the log entry and request record each batch adds.
 fn stored(h: &mut Harness, ops: Vec<OpSpec>) -> (usize, usize) {
     let before: usize = h
@@ -159,6 +197,7 @@ fn main() {
     let (file, file_charged) = per_item(count, |index| {
         batch(vec![put(&format!("d/f{index}"), "")], 0)
     });
+    let (key, gone) = per_key(50_000);
     println!();
     println!("| Writer state | Held | Charged |");
     println!("| --- | ---: | ---: |");
@@ -166,6 +205,8 @@ fn main() {
     println!(
         "| Cached empty file (inode, entry, back-pointer, value) | {file:.0} | {file_charged:.0} |"
     );
+    println!("| Live key with a TTL | {key:.0} | none |");
+    println!("| Key minted by a key, once expired and deleted | {gone:.0} | none |");
     println!();
     println!("| Cached record | Held | Charged |");
     println!("| --- | ---: | ---: |");

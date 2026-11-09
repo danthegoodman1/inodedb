@@ -528,7 +528,49 @@ MUTANTS = [
     ),
     (
         "a revoked key's id mints again",
-        [(EXEC, "base.key(*id).is_some() || base.key_retired(*id)", "base.key(*id).is_some()")],
+        [(EXEC, "base.key(id).is_some() || base.key_retired(id)", "base.key(id).is_some()")],
+    ),
+    (
+        "expired keys stay in the store",
+        [(WRITER, "let ids = self.cache.keys().expired(self.now, EXPIRE_KEYS_BUDGET);",
+          "let ids: Vec<KeyId> = Vec::new();")],
+    ),
+    (
+        "the writer deletes keys before they expire",
+        [(CORE_AUTH, ".take_while(|(expires, _)| *expires <= now)", ".take_while(|(expires, _)| *expires <= now + 500)"),
+         (EXEC, "if exec.key(*id).is_some_and(|record| !record.live(now)) {", "if exec.key(*id).is_some() {")],
+    ),
+    (
+        "deleting a key minted by a key leaves a tombstone",
+        [(DELTA, "if change.before.is_some_and(|before| before.leaves_tombstone()) {", "if change.before.is_some() {"),
+         (CORE_AUTH, "if record.is_none() && old.leaves_tombstone() {", "if record.is_none() {")],
+    ),
+    (
+        "deleting an operator's key leaves no tombstone",
+        [(DELTA, "if change.before.is_some_and(|before| before.leaves_tombstone()) {", "if false {")],
+    ),
+    (
+        "a key's mint takes the id it names",
+        [(EXEC, "(Some(id), None) => id,", "(Some(id), _) => id,")],
+    ),
+    (
+        "an expired key's deletion leaves the keys it minted",
+        [(EXEC, "if exec.key(*id).is_some_and(|record| !record.live(now)) {\n            exec.revoke(*id);",
+          "if let Some(record) = exec.key(*id).filter(|record| !record.live(now)) {\n            exec.delta.set_key(*id, Some(record), None);")],
+    ),
+    (
+        "the writer deletes every expired key in one commit",
+        [(WRITER, "let ids = self.cache.keys().expired(self.now, EXPIRE_KEYS_BUDGET);",
+          "let ids = self.cache.keys().expired(self.now, usize::MAX);")],
+    ),
+    (
+        "a backlog of expired keys waits a second per commit",
+        [(WRITER, "self.keys_left = ids.len() == EXPIRE_KEYS_BUDGET;", "self.keys_left = false;")],
+    ),
+    (
+        "the server hands out an id the writer didn't mint",
+        [(SERVICE, "let id = key_op(&self.engine, caller, op).await?;",
+          "key_op(&self.engine, caller, op).await?;\n        let id = auth::generate().0;")],
     ),
     (
         "a request id answers any key that sends it",

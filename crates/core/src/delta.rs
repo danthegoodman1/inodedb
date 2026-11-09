@@ -367,7 +367,12 @@ impl Delta {
                 Some(record) => writes.set(keys::key_record(*id), record.encode()),
                 None => {
                     writes.clear(keys::key_record(*id));
-                    writes.set(keys::key_retired(*id), Vec::new());
+                    if change
+                        .before
+                        .is_some_and(|before| before.leaves_tombstone())
+                    {
+                        writes.set(keys::key_retired(*id), Vec::new());
+                    }
                 }
             }
         }
