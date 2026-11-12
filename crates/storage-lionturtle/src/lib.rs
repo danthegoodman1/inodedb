@@ -6,13 +6,13 @@
 //!
 //! A sync that must also grow a file commits the file system's journal, which
 //! costs up to four times the write itself on local NVMe (`BENCHMARKS.md`,
-//! "Devices"). So the store zero-fills each log segment ahead of its writes,
-//! and commits overwrite written blocks.
+//! "Devices"). So lionturtle writes each log segment whole before the segment
+//! takes writes, the first as the store opens and the next ones behind it, and
+//! commits overwrite written blocks.
 //!
 //! lionturtle's file storage takes no lock, so the backend holds one beside the
 //! store's own directory, which lionturtle takes to hold only its files.
 
-use bytes::Bytes;
 use inodedb_core::keys::{self, KeyRange, KvRead, KvResult, KvWrite, Pairs, WriteSet};
 use inodedb_core::types::Version;
 use inodedb_core::writer::CommitOutcome;
@@ -425,42 +425,76 @@ fn commit_group(shared: &Shared, expect: Option<&[u8]>, writes: &WriteSet) -> Co
     }
 }
 
-/// What a batch does, in the order its writes give. The caller holds the commit
-/// lock, so what a range clears stays as it reads here.
-fn batch(
+/// What a batch does, in the order its writes give: where each op's key lies
+/// in `keys`, and the value it sets, or none for a delete. The keys share one
+/// buffer and the values stay where the group holds them, so a batch costs a
+/// few allocations however many ops it has; lionturtle copies what it keeps.
+#[derive(Default)]
+struct Batch<'a> {
+    keys: Vec<u8>,
+    ops: Vec<(std::ops::Range<usize>, Option<&'a [u8]>)>,
+}
+
+impl<'a> Batch<'a> {
+    fn push(&mut self, space: u8, key: &[u8], value: Option<&'a [u8]>) {
+        let start = self.keys.len();
+        self.keys.push(space);
+        self.keys.extend_from_slice(key);
+        self.ops.push((start..self.keys.len(), value));
+    }
+
+    /// The ops as lionturtle takes them.
+    fn ops(&self) -> Vec<(&[u8], Option<&[u8]>)> {
+        self.ops
+            .iter()
+            .map(|(key, value)| (&self.keys[key.clone()], *value))
+            .collect()
+    }
+}
+
+/// Lays out a batch. The caller holds the commit lock, so what a range clears
+/// stays as it reads here.
+fn batch<'a>(
     db: &Db,
-    writes: &[KvWrite],
-    log: &[(Version, Vec<u8>)],
-) -> Result<Vec<WriteOp>, StorageError> {
-    let mut ops = Vec::with_capacity(writes.len() + log.len());
+    writes: &'a [KvWrite],
+    log: &'a [(Version, Vec<u8>)],
+) -> Result<Batch<'a>, StorageError> {
+    let mut batch = Batch::default();
+    batch.ops.reserve(writes.len() + log.len());
+    let keys: usize = writes
+        .iter()
+        .map(|write| match write {
+            KvWrite::Set(key, _) | KvWrite::Clear(key) => 1 + key.len(),
+            KvWrite::ClearRange(_) => 0,
+        })
+        .sum();
+    batch.keys.reserve(keys + log.len() * 9);
     // Groups put their range clears first, so most clear nothing of their own.
     let mut any_set = false;
     for write in writes {
         match write {
             KvWrite::Set(key, value) => {
                 any_set = true;
-                ops.push(WriteOp::put(tree_key(key), Bytes::copy_from_slice(value)));
+                batch.push(TREE, key, Some(value));
             }
-            KvWrite::Clear(key) => ops.push(WriteOp::delete(tree_key(key))),
+            KvWrite::Clear(key) => batch.push(TREE, key, None),
             KvWrite::ClearRange(range) => {
                 if any_set {
-                    ops.retain(|op| !range.contains(&op.key[1..]));
+                    let Batch { keys, ops } = &mut batch;
+                    ops.retain(|(key, _)| !range.contains(&keys[key.start + 1..key.end]));
                 }
                 let (start, end) = (tree_key(&range.start), tree_key(&range.end));
                 let mut stored = db.iter(&start, Some(&end));
                 while let Some((key, _)) = stored.next().map_err(failed)? {
-                    ops.push(WriteOp::delete(key));
+                    batch.push(TREE, &key[1..], None);
                 }
             }
         }
     }
     for (version, entry) in log {
-        ops.push(WriteOp::put(
-            Bytes::copy_from_slice(&log_key(*version)),
-            Bytes::copy_from_slice(entry),
-        ));
+        batch.push(LOG, &version.to_be_bytes(), Some(entry));
     }
-    Ok(ops)
+    Ok(batch)
 }
 
 /// Applies writes in one durable write. The caller holds the commit lock.
@@ -470,9 +504,9 @@ fn write(
     log: &[(Version, Vec<u8>)],
 ) -> Result<(), CommitError> {
     let db = &shared.db;
-    let ops = running(db, batch(db, writes, log))
+    let batch = running(db, batch(db, writes, log))
         .map_err(|error| CommitError::Unavailable(error.to_string()))?;
-    let committed = db.write(&ops, true);
+    let committed = db.write(&batch.ops(), true);
     // A write that fails may still have reached the log. Later transactions
     // treat its writes as made, so they conflict with it.
     shared

@@ -278,7 +278,9 @@ impl Client {
     }
 
     /// Claims up to `limit` released entries under this key's root; no
-    /// entries when none are released.
+    /// entries when none are released. The server returns 60 at most, each
+    /// with the value its file held, so a consumer with more to take claims
+    /// again until a claim returns fewer than it asked for.
     pub async fn claim_freed(&self, limit: u32) -> Result<Claim, Error> {
         let response = self
             .retry(|mut rpc| {

@@ -1395,7 +1395,7 @@ LIONTURTLE_MUTANTS = [
     ),
     (
         "a commit on lionturtle answers before it is durable",
-        [(LIONTURTLE, "let committed = db.write(&ops, true);", "let committed = db.write(&ops, false);")],
+        [(LIONTURTLE, "let committed = db.write(&batch.ops(), true);", "let committed = db.write(&batch.ops(), false);")],
     ),
     (
         "a stopped lionturtle store answers reads",
@@ -1414,13 +1414,14 @@ LIONTURTLE_MUTANTS = [
     (
         "a range on lionturtle keeps what the group set before it",
         [(LIONTURTLE, """if any_set {
-                    ops.retain(|op| !range.contains(&op.key[1..]));
+                    let Batch { keys, ops } = &mut batch;
+                    ops.retain(|(key, _)| !range.contains(&keys[key.start + 1..key.end]));
                 }""", "let _ = any_set;")],
     ),
     (
         "a range on lionturtle keeps what the store holds",
         [(LIONTURTLE, """while let Some((key, _)) = stored.next().map_err(failed)? {
-                    ops.push(WriteOp::delete(key));
+                    batch.push(TREE, &key[1..], None);
                 }""", "let _ = &mut stored;")],
     ),
     (
