@@ -1332,6 +1332,14 @@ MUTANTS = [
         [(SERVER, "file.write_all(&1i32.to_ne_bytes())?;", "file.write_all(&[])?;")],
     ),
     (
+        "a cached value holds its request's buffer",
+        [(CONVERT, "value: p.value.to_vec().into(),", "value: p.value,")],
+    ),
+    (
+        "the server returns freed memory to the kernel",
+        [(SERVER, "libmimalloc_sys::mi_option_set(PURGE_DELAY, -1)", "libmimalloc_sys::mi_option_set(PURGE_DELAY, 1000)")],
+    ),
+    (
         "an attempt ignores its timeout",
         [(TRANSPORT, """let text = headers.get("grpc-timeout")?.to_str().ok()?;""", """let text = headers.get("no-such-header")?.to_str().ok()?;""")],
     ),

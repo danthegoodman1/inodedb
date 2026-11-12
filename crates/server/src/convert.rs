@@ -50,7 +50,10 @@ fn op(op: pb::Op) -> Result<OpSpec, Status> {
         },
         K::Put(p) => Op::Put {
             path: path(&p.path)?,
-            value: p.value,
+            // The decoded value is a slice of its request's buffer, 8 KiB or
+            // more, and the cache keeps the value: a copy lets the buffer go
+            // with the request, where a slice would hold all of it.
+            value: p.value.to_vec().into(),
             mode: match pb::PutMode::try_from(p.mode)
                 .map_err(|_| Status::invalid_argument("put mode"))?
             {
@@ -331,5 +334,36 @@ pub fn freed(
         value_version,
         inode: found.map(|found| inode(ino, &found, scope)),
         value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inodedb_core::Bytes;
+
+    /// A put's value leaves its request's buffer, which the cache would
+    /// otherwise hold for as long as it holds the value.
+    #[test]
+    fn a_puts_value_leaves_its_requests_buffer() {
+        let buffer = Bytes::from(vec![7u8; 8192]);
+        let put = pb::Op {
+            cond: Vec::new(),
+            kind: Some(pb::op::Kind::Put(pb::Put {
+                path: Bytes::from_static(b"f"),
+                value: buffer.slice(..100),
+                mode: pb::PutMode::Upsert as i32,
+                mtime: None,
+            })),
+        };
+        let Op::Put { value, .. } = op(put).expect("converts").op else {
+            panic!("a put converts to a put");
+        };
+        assert_eq!(value, buffer.slice(..100));
+        let held = buffer.as_ptr() as usize..buffer.as_ptr() as usize + buffer.len();
+        assert!(
+            !held.contains(&(value.as_ptr() as usize)),
+            "the value points into its request's buffer"
+        );
     }
 }

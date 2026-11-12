@@ -50,8 +50,7 @@ async fn signal() {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (path, key_file) = match args.as_slice() {
         [flag, path] if flag == "--config" => (path, None),
@@ -75,6 +74,18 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Before the runtime starts its threads, which read the setting.
+    if config.keep_memory {
+        inodedb_server::keep_freed_memory();
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("starts a runtime")
+        .block_on(serve(config, init_key))
+}
+
+async fn serve(config: Config, init_key: Option<String>) -> ExitCode {
     // Held until the process exits.
     let _shallow = config.shallow_idle.then(|| {
         match inodedb_server::hold_shallow_idle(std::path::Path::new(

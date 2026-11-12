@@ -189,6 +189,24 @@ pub fn hold_shallow_idle(path: &std::path::Path) -> std::io::Result<std::fs::Fil
     Ok(file)
 }
 
+/// mimalloc's option for how long freed memory waits, in milliseconds, before
+/// the allocator returns it to the kernel. The crate names only some of
+/// mimalloc's options, so this one goes by its place among them.
+const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+/// Has the allocator keep freed memory for its next allocations, for as long
+/// as the process runs. Returning memory to the kernel falls to whichever
+/// thread allocates next. lionturtle frees a memtable's millions of
+/// allocations at each checkpoint; commits after one then stalled 4 to 40 ms
+/// unmapping them, and later commits took page faults mapping them again
+/// (`BENCHMARKS.md`, "Sustained puts"). The process holds the most memory it
+/// has used. Call it before the process starts its threads: mimalloc stores
+/// the option without synchronization.
+pub fn keep_freed_memory() {
+    // SAFETY: the option takes any delay, and a negative one ends purging.
+    unsafe { libmimalloc_sys::mi_option_set(PURGE_DELAY, -1) };
+}
+
 /// How long ending a runtime waits for its blocking calls.
 const END_RUNTIME: Duration = Duration::from_secs(10);
 
@@ -305,5 +323,18 @@ mod tests {
         );
         drop(held);
         assert!(hold_shallow_idle(&dir.path().join("missing")).is_err());
+    }
+
+    /// The option the server sets is mimalloc's purge delay: it starts at
+    /// mimalloc's second, and the server's setting ends purging.
+    #[test]
+    fn the_server_keeps_freed_memory() {
+        // SAFETY: reading an option changes nothing.
+        let delay = || unsafe { libmimalloc_sys::mi_option_get(PURGE_DELAY) };
+        if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+            assert_eq!(delay(), 1000, "option {PURGE_DELAY} is the purge delay");
+        }
+        keep_freed_memory();
+        assert_eq!(delay(), -1);
     }
 }

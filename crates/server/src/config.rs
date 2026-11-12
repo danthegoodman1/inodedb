@@ -23,9 +23,17 @@ pub struct Config {
     /// than a microsecond to leave, while it runs, if it may.
     #[serde(default = "shallow_idle")]
     pub shallow_idle: bool,
+    /// Whether the server keeps the memory it frees for its next
+    /// allocations, where the allocator would return it to the kernel.
+    #[serde(default = "keep_memory")]
+    pub keep_memory: bool,
 }
 
 fn shallow_idle() -> bool {
+    true
+}
+
+fn keep_memory() -> bool {
     true
 }
 
@@ -267,6 +275,7 @@ mod tests {
         );
         assert!(core.preload);
         assert!(config.shallow_idle);
+        assert!(config.keep_memory);
     }
 
     #[test]
