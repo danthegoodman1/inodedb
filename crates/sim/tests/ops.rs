@@ -450,6 +450,42 @@ fn a_large_subtree_frees_in_bounded_commits() {
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
 
+/// A batch may write little and still be too large: each file it frees
+/// deep in the tree writes a queue key under every directory above it,
+/// and a transaction is charged several times a small key's bytes.
+#[test]
+fn a_batch_is_too_large_by_what_its_small_keys_are_charged() {
+    const FILES: usize = 6_000;
+    let mut h = Harness::new();
+    let deep = "a/b/c/d/e/f";
+    h.ops([mkdir_p(deep), mkdir("top")]);
+    for chunk in (0..FILES).collect::<Vec<_>>().chunks(2_000) {
+        h.ops(chunk.iter().map(|n| put(&format!("{deep}/f{n}"), "v")));
+        h.ops(chunk.iter().map(|n| put(&format!("top/f{n}"), "v")));
+    }
+    let unlinks = |dir: &str, files: std::ops::Range<usize>| Batch {
+        ops: files.map(|n| unlink(&format!("{dir}/f{n}"))).collect(),
+        ..Batch::default()
+    };
+    // As many small files as a batch holds ops fit.
+    h.ops([mkdir("wide")]);
+    let wide = h.ops((0..10_000).map(|n| put(&format!("wide/f{n}"), "a small value")));
+    assert!(wide.outcomes.iter().all(Outcome::applied));
+    // One directory down, the batch commits.
+    let before = h.writer.version();
+    assert!(h.commit(unlinks("top", 0..FILES)).committed);
+    // Six down, it writes under 3 MiB and is charged over 9 MB.
+    assert_eq!(
+        h.submit(unlinks(deep, 0..FILES)),
+        inodedb_core::writer::Answer::Rejected(inodedb_core::ops::BatchError::TooLarge)
+    );
+    assert_eq!(h.writer.version(), before + 1, "it changed nothing");
+    // In halves it commits.
+    assert!(h.commit(unlinks(deep, 0..FILES / 2)).committed);
+    assert!(h.commit(unlinks(deep, FILES / 2..FILES)).committed);
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
 #[test]
 fn malformed_batches_are_rejected() {
     let mut h = Harness::new();
@@ -473,6 +509,157 @@ fn a_restarted_writer_reads_what_it_needs() {
     assert_eq!(applied(&result), [true, true]);
     assert_eq!(nlink(&mut restarted, "c/f"), 1);
     assert!(restarted.fsck().is_empty(), "{:?}", restarted.fsck());
+}
+
+/// How many inodes each commit after `after` put in the free queue.
+fn queued_by_commit(h: &Harness, after: u64) -> Vec<usize> {
+    let mut queued = std::collections::BTreeMap::new();
+    for (key, _) in h.storage.dump() {
+        if let Some(inodedb_core::keys::Parsed::Free(version, _, None)) =
+            inodedb_core::keys::parse(&key)
+            && version > after
+        {
+            *queued.entry(version).or_insert(0) += 1;
+        }
+    }
+    queued.into_values().collect()
+}
+
+#[test]
+fn detached_subtrees_free_together_in_one_commit() {
+    const PARTS: usize = 20;
+    let mut h = Harness::new();
+    h.ops([mkdir_p("t/a"), mkdir_p("u/b")]);
+    let part = |n: usize| [format!("t/a/p{n}"), format!("u/b/q{n}")];
+    for dir in (0..PARTS).flat_map(part) {
+        h.ops([
+            mkdir(&dir),
+            put(&format!("{dir}/x"), "v"),
+            put(&format!("{dir}/y"), "v"),
+            put(&format!("{dir}/z"), "v"),
+        ]);
+    }
+    let ino = |h: &mut Harness, path: &str| match h.stat(path) {
+        QueryResult::Stat { ino, .. } => ino,
+        other => panic!("{path}: {other:?}"),
+    };
+    let (t, a) = (ino(&mut h, "t"), ino(&mut h, "t/a"));
+    let (u, b) = (ino(&mut h, "u"), ino(&mut h, "u/b"));
+    // One batch detaches forty parts under two parents.
+    let dirs: Vec<String> = (0..PARTS).flat_map(part).collect();
+    let removed = h.ops(dirs.iter().map(|dir| remove_all(dir))).version;
+    assert_eq!(
+        h.writer.version() - removed,
+        1,
+        "forty subtrees of four inodes each fit one commit's budget"
+    );
+    assert_eq!(h.writer.detached(), 0);
+    assert_eq!(queued_by_commit(&h, removed), [8 * PARTS]);
+    // Each freed record names the directories that lay above its own
+    // subtree: a part's files and its top alike.
+    let page = h.list_freed(inodedb_core::auth::Caller::Trusted(h.root), None, 1_000);
+    let under = |above: [u64; 2], apart: [u64; 2]| {
+        page.entries
+            .iter()
+            .filter(|entry| {
+                above.iter().all(|dir| entry.ancestors.contains(dir))
+                    && apart.iter().all(|dir| !entry.ancestors.contains(dir))
+            })
+            .count()
+    };
+    assert_eq!(page.entries.len(), 8 * PARTS);
+    assert_eq!(under([t, a], [u, b]), 4 * PARTS);
+    assert_eq!(under([u, b], [t, a]), 4 * PARTS);
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn a_freeing_commit_spends_one_budget_across_subtrees() {
+    let mut h = Harness::new();
+    let dirs = ["a", "b", "c"];
+    for dir in dirs {
+        h.ops([mkdir(dir)]);
+        h.ops((0..400).map(|index| put(&format!("{dir}/f{index}"), "v")));
+    }
+    let removed = h.ops(dirs.map(remove_all)).version;
+    // 1,203 inodes: the first commit frees two subtrees whole and the
+    // third's files up to its budget, and the second frees the rest.
+    assert_eq!(queued_by_commit(&h, removed), [1_000, 203]);
+    assert_eq!(h.writer.detached(), 0);
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// Deep in the tree a freed inode writes a queue key under each of many
+/// directories, so a freeing commit stops at a number of keys before it
+/// reaches its number of inodes.
+#[test]
+fn a_freeing_commit_deep_in_the_tree_stops_at_its_keys() {
+    const DEPTH: usize = 300;
+    const FILES: usize = 600;
+    let mut h = Harness::new();
+    let deep = vec!["d"; DEPTH].join("/");
+    h.ops([mkdir_p(&deep)]);
+    h.ops((0..FILES).map(|index| put(&format!("{deep}/f{index}"), "v")));
+    let removed = h.ops([remove_all("d")]).version;
+    assert_eq!(h.writer.detached(), 0);
+    // Every key the queue gained, by the commit that wrote it.
+    let mut keys = std::collections::BTreeMap::new();
+    for (key, _) in h.storage.dump() {
+        let version = match inodedb_core::keys::parse(&key) {
+            Some(inodedb_core::keys::Parsed::Free(version, _, _)) => version,
+            Some(inodedb_core::keys::Parsed::FreeUnder(_, version, _, _)) => version,
+            _ => continue,
+        };
+        assert!(version > removed);
+        *keys.entry(version).or_insert(0) += 1;
+    }
+    let most = *keys.values().max().expect("the freeing queued its inodes");
+    // A file writes its key and one under each of the 300 directories
+    // above it, the last a commit frees among them.
+    assert!(
+        most <= inodedb_core::exec::REAP_KEYS + DEPTH + 1,
+        "{most} queue keys in one commit"
+    );
+    assert!(keys.len() >= 3, "{} commits", keys.len());
+    assert_eq!(
+        queued_by_commit(&h, removed).iter().sum::<usize>(),
+        FILES + DEPTH
+    );
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn cold_subtrees_ask_for_their_records_in_the_same_rounds() {
+    const PARTS: usize = 40;
+    let mut h = Harness::new();
+    let dirs: Vec<String> = (0..PARTS).map(|n| format!("p{n}")).collect();
+    for dir in &dirs {
+        h.ops([
+            mkdir(dir),
+            put(&format!("{dir}/x"), "v"),
+            put(&format!("{dir}/y"), "v"),
+        ]);
+    }
+    // The detach commits, and the writer stops before its freeing does.
+    let token = h.token();
+    h.writer.submit(
+        token,
+        inodedb_core::auth::Caller::Trusted(h.root),
+        Batch {
+            ops: dirs.iter().map(|dir| remove_all(dir)).collect(),
+            ..Batch::default()
+        },
+    );
+    h.run_until(token);
+    // A restarted writer frees the forty subtrees from a cold cache.
+    let h = Harness::with(h.storage.clone(), Default::default());
+    assert_eq!(h.writer.detached(), 0);
+    assert!(
+        h.reads <= 4,
+        "a round of reads per level, not per subtree: {}",
+        h.reads
+    );
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
 
 #[test]

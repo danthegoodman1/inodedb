@@ -7,7 +7,7 @@ Four machines:
 - **Metal,** for "Devices", "Operations", "Before and after", "Group commit", "Expiring records", "Failover" and "Path resolution": a Latitude.sh `f4.metal.medium` (AMD EPYC 4564P, 16 cores and 32 threads in two L3 groups, one NUMA node, 187 GiB) on Ubuntu 24.04 with Linux 6.8, its CPU governor at `performance`. Every store sits on one Micron NVMe drive (MTFDKCC1T9TGP), which reports no volatile write cache, under XFS. FoundationDB 7.3.79 runs one process per role on the `ssd-2` engine, with single replication and its data on the same drive: coordinator, cluster controller, master, commit proxy, GRV proxy, resolver, log, storage, ratekeeper, data distributor and consistency scan. `scripts/bench/setup` prepares the machine, and `scripts/bench/run` runs the benchmarks, checks that each role holds a process of its own, and records them in `fdb-roles.txt`. Every metal table comes from one sitting of about an hour. Each backend runs in its own process: in one process, whichever backend ran second lost up to 3%. Controls after the sitting stayed within 2% of its start on stats at 64 clients and within 4% on puts.
 - **EC2,** for "Network storage" and "Idle states": an i7ie.6xlarge (Intel Xeon Platinum 8559C, 24 vCPUs, 192 GiB) on Ubuntu 24.04 with Linux 7.0, with a gp3 volume provisioned at gp3's maximum of 80,000 IOPS and 2,000 MiB/s. Those runs predate the lionturtle backend. Its speed varies between sittings: on the same code and kernel, two instances launched later that day ran about 15% slower across the board, and path resolution, which touches neither disk nor network, 34% slower. So compare numbers only within one sitting on one machine.
 - **A Mac** for "Footprint" and "Freeing a subtree", which measure memory and CPU, and beside metal in "Path resolution": an Apple M3 Max (16 cores, 128 GB) on macOS 26.6.
-- **A Linux desktop** for "Revocation", which measures CPU, and the key rows of "Footprint": an Intel Core Ultra 9 285 (24 cores, 125 GiB) on Ubuntu 26.04 with Linux 7.0. The Footprint rows it shares with the Mac match byte for byte.
+- **A Linux desktop** for "Revocation", "Detaching beside many keys" and "Freeing and claiming across tenants", which measure CPU and count reads, "What FoundationDB charges small keys", which counts, and the key rows of "Footprint": an Intel Core Ultra 9 285 (24 cores, 125 GiB) on Ubuntu 26.04 with Linux 7.0. The Footprint rows it shares with the Mac match byte for byte.
 
 Every run uses a release build.
 
@@ -347,6 +347,23 @@ Deleting an expired key costs the writer about half a microsecond. Finding that 
 
 Revocation follows each key's minted keys through an index, so its cost grows with the keys it revokes. A store holds at most 100,000 keys, so revoking all of them fits one commit.
 
+## Detaching beside many keys
+
+```console
+cargo run --release -p inodedb-tests --example detach
+```
+
+Tenants, each a directory with two keys rooted at it, through the harness's writer over the memory backend. One commit removes 50 empty directories under one tenant, none of them a key's root, and the freeing follows: the median of 20 such commits. The first row holds no keys, so it shows what the removal costs apart from the search for keys beneath what it removes. "Before" is commit be669f1, which checked every key against every directory the commit detached.
+
+| Tenants | Keys | Before | Now |
+| ---: | ---: | ---: | ---: |
+| 10,000 | 0 | 0.27 ms | 0.22 ms |
+| 1,000 | 2,000 | 1.81 ms | 0.34 ms |
+| 10,000 | 20,000 | 19.67 ms | 1.32 ms |
+| 50,000 | 100,000 | 106.35 ms | 6.22 ms |
+
+The search follows each directory a key is rooted at up to the tree's root once for the commit, about 110 ns a root, whatever the commit detaches. Before, it cost about 20 ns for each pair of a key and a detached directory. These runs kept every record cached. From a cold cache the search before read one missing record a round and ran the batch again each time; it now asks for every record it lacks in one round per level (`keys::a_detach_reads_the_key_roots_a_cold_cache_lacks_in_rounds`: 9 rounds for 300 roots).
+
 ## Freeing a subtree
 
 ```console
@@ -357,7 +374,42 @@ A restarted writer, its cache empty, frees a detached subtree of 2,803 inodes: 2
 
 | Reads per round | Commits | Round trips |
 | --- | ---: | ---: |
-| Each directory's entries, then everything freeing them needs | 4 | 14 |
-| One fact, as the freeing first finds it missing | 4 | 5,611 |
+| Each directory's entries, then everything freeing them needs | 3 | 14 |
+| One fact, as the freeing first finds it missing | 3 | 5,611 |
 
 The writer frees subtrees only when it has nothing else to do, but a batch that arrives meanwhile waits until the commit being prepared has read what it needs. At about a millisecond per FoundationDB round trip, gathering each directory's reads keeps that wait to a few milliseconds rather than seconds.
+
+## Freeing and claiming across tenants
+
+```console
+cargo run --release -p inodedb-tests --example claims
+```
+
+Tenants through the harness's writer over the memory backend, each a directory `tenants/tN` holding one part, `store/aa/table/part`, of 20 files, so six directories lie between a file and the tree's root. The run removes every tenant's part, 50 to a commit, and times each commit with the freeing that follows. It then claims up to 60 entries under one tenant's root and acknowledges them, for 20 tenants spread across the queue, and reports the median. "Before" is commit be669f1.
+
+| Tenants | Queue entries | | Queue bytes an entry | One commit removing 50 parts | Reads for a claim | A claim and its acknowledgement |
+| ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 100 | 2,100 | Before | 29 | 2.95 ms | 2 | 0.227 ms |
+| | | Now | 184 | 4.98 ms | 2 | 0.068 ms |
+| 1,000 | 21,000 | Before | 31 | 2.80 ms | 21 | 1.899 ms |
+| | | Now | 186 | 4.71 ms | 2 | 0.088 ms |
+| 10,000 | 210,000 | Before | 35 | 2.97 ms | 205 | 29.070 ms |
+| | | Now | 190 | 5.38 ms | 2 | 0.126 ms |
+
+A claim under a tenant's root reads that root's part of the queue and then the entries it names: two reads, whatever the queue holds for other tenants. Before, it read the whole queue, a page of 1,024 entries at a time. The queue's keys under directories cost the removal: each freed inode writes a key of 26 bytes under each of the six directories above it, so a queued entry takes 5.4 times the bytes, and a commit that removes 50 parts, 1,050 inodes, takes 1.8 times as long in the writer. The freeing itself went from 50 commits, one for each part, to two of at most 1,000 inodes.
+
+## What FoundationDB charges small keys
+
+```console
+scripts/fdb cargo test --release -p inodedb-storage-conformance --features fdb --test fdb what_foundationdb_charges_small_keys -- --ignored --nocapture
+```
+
+FoundationDB 7.3.79 in the test container, a store whose prefix holds 32 bytes, with one more for the tree. The run finds the most sets, and the most clears, of keys of one length that a transaction commits, and divides FoundationDB's 10,000,000 bytes by it.
+
+| Key bytes | A set | A clear |
+| ---: | ---: | ---: |
+| 26 | 243 bytes | 302 bytes |
+| 34 | 268 bytes | 334 bytes |
+| 100 | 465 bytes | 599 bytes |
+
+FoundationDB counts a key three times over when set, once written and twice in the range that guards it from conflicts, and four times when cleared, each time with the store's prefix, and 66 bytes more for each write: 3 × (26 + 33) + 66 = 243. The backends' own limit counts the key once, so a transaction of 80,000 sets of 26-byte keys, 2 MB by that count, is refused. The writer sizes its groups, and refuses a batch, by `WriteSet::charged`, which counts as FoundationDB does with 72 bytes a write and room for a prefix of 16 bytes: `fdb::small_keys_fit_a_transaction_as_they_are_charged`.

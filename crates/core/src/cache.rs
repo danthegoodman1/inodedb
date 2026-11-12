@@ -812,7 +812,7 @@ impl View for Cache {
         self.keys.minted_by(id)
     }
 
-    fn key_roots(&self) -> Vec<(KeyId, Ino)> {
+    fn key_roots(&self) -> BTreeSet<Ino> {
         self.keys.roots()
     }
 }

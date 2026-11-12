@@ -210,8 +210,9 @@ fn batches_queued_before_a_drain_commit_together() {
 
 #[test]
 fn batches_wait_for_their_group_and_groups_close_at_their_size() {
+    // A put of 200 bytes is charged about 1,500, most of it for its keys.
     let config = Config {
-        group_max_bytes: 700,
+        group_max_bytes: 3_500,
         ..Config::default()
     };
     let mut d = Driver::new(Memory::new(), config, 1);
@@ -231,13 +232,18 @@ fn batches_wait_for_their_group_and_groups_close_at_their_size() {
     while !d.commits.is_empty() {
         let writes = d.settle(true, CommitOutcome::Committed);
         assert!(
-            writes.log.len() == 1 || writes.bytes() <= 700 + 100,
-            "a group stays near its size"
+            writes.log.len() == 1 || writes.charged() <= 3_500 + 300,
+            "a group stays near its size, as its writes are charged: {}",
+            writes.charged()
         );
         groups.push(writes.log.len());
     }
     assert_eq!(groups.iter().sum::<usize>(), 6);
     assert!(groups.len() > 1, "the cap splits the batches: {groups:?}");
+    assert!(
+        groups.contains(&2),
+        "and a group holds what fits: {groups:?}"
+    );
     for (index, token) in puts.into_iter().enumerate() {
         let result = d.committed(token);
         assert_eq!(

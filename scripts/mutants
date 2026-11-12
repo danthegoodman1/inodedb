@@ -58,6 +58,7 @@ SNAPSHOT = "crates/core/src/snapshot.rs"
 STANDBY = "crates/core/src/standby.rs"
 ENGINE = "crates/server/src/engine.rs"
 FSCK = "crates/core/src/fsck.rs"
+KEYS = "crates/core/src/keys.rs"
 PRELOAD = "crates/core/src/preload.rs"
 CONFIG = "crates/server/src/config.rs"
 TRANSPORT = "crates/transport/src/lib.rs"
@@ -500,7 +501,7 @@ MUTANTS = [
     ),
     (
         "detaching a key's ancestor leaves the key",
-        [(EXEC, "Ok(true) => {\n                            orphans.insert(id);\n                            break;\n                        }", "Ok(true) => break,")],
+        [(EXEC, "if beneath {\n                    orphans.extend(self.delta.keys_rooted_at(self.base, root));\n                }", "")],
     ),
     (
         "a batch runs under a key revoked ahead of it",
@@ -605,12 +606,46 @@ MUTANTS = [
         [(EXEC, "if !self.delta.detached.is_empty() {", "if false {")],
     ),
     (
+        "a detach settles what lies beneath it as outside",
+        [(EXEC, "settled.insert(dir, beneath);", "settled.insert(dir, false);")],
+    ),
+    (
+        "a detach settles what lies outside it as beneath",
+        [(EXEC, "settled.insert(dir, beneath);", "settled.insert(dir, true);")],
+    ),
+    (
+        "a batch's detaches revoke the keys beneath the first alone",
+        [(EXEC, "let detached: BTreeSet<Ino> = self.delta.detached.iter().copied().collect();",
+          "let detached: BTreeSet<Ino> = self.delta.detached.iter().copied().take(1).collect();")],
+    ),
+    (
+        "a detach revokes one of the keys that share a root",
+        [(EXEC, "orphans.extend(self.delta.keys_rooted_at(self.base, root));",
+          "orphans.extend(self.delta.keys_rooted_at(self.base, root).into_iter().take(1));")],
+    ),
+    (
+        "a detach follows every key's root all the way up",
+        [(EXEC, "if let Some(known) = settled.get(&current) {\n                        break Some(*known);\n                    }", "")],
+    ),
+    (
+        "a detach misses the keys an uncommitted batch minted",
+        [(OVERLAY, "Some(record) => {\n                    roots.insert(record.root);\n                }", "Some(_) => {}")],
+    ),
+    (
+        "uncommitted deletions leave their keys' roots listed",
+        [(OVERLAY, "&& self.keys_rooted_at(deleted.root).is_empty()", "&& false")],
+    ),
+    (
+        "a delta's deletions leave their keys' roots listed",
+        [(DELTA, "if self.keys_rooted_at(base, deleted.root).is_empty() {", "if false {")],
+    ),
+    (
         "the reaper frees a file linked outside its subtree",
         [(EXEC, "inode.nlink -= 1;\n        inode.version = self.version;\n        if inode.nlink == 0 {", "inode.nlink -= 1;\n        inode.version = self.version;\n        if inode.nlink == 0 || dir != ROOT {")],
     ),
     (
         "the reaper reads one fact per pass",
-        [(EXEC, "self.prefetch(&listing, needs)?;", "")],
+        [(EXEC, "self.prefetch(dir, &listing, needs)?;", "")],
     ),
     (
         "evicting the whole cache drops reads in progress",
@@ -690,15 +725,62 @@ MUTANTS = [
     ),
     (
         "the reaper frees a directory its budget cut short",
-        [(EXEC, "None if freed == REAP_BUDGET => return Ok(()),", "")],
+        [(EXEC, "None if *freed == REAP_BUDGET => return Ok(()),", "")],
     ),
     (
         "a reap routes to no one who saw its subtree",
-        [(EXEC, "if found.last() == Some(top) {\n                found.extend(above);\n            }", "")],
+        [(EXEC, "if let Some(above) = found.last().and_then(|top| self.reaping.get(top)) {\n                found.extend(*above);\n            }", "")],
+    ),
+    (
+        "a freeing commit takes one detached subtree",
+        [(WRITER, ".take(exec::REAP_BUDGET)", ".take(1)")],
+    ),
+    (
+        "a freeing commit spends a budget on each subtree",
+        [(EXEC, "exec.reap(subtree.top, subtree.at, &mut freed, &mut needs)",
+          "exec.reap(subtree.top, subtree.at, &mut 0, &mut needs)")],
+    ),
+    (
+        "a freeing commit deep in the tree writes every key its inodes take",
+        [(EXEC, "freed == REAP_BUDGET || self.queued >= REAP_KEYS", "freed == REAP_BUDGET"),
+         (EXEC, "if self.queued >= REAP_KEYS {\n                    return Ok(());\n                }\n                match entry.kind {", "match entry.kind {")],
+    ),
+    (
+        "a freeing commit counts no keys under the directories above",
+        [(EXEC, "self.queued += 1 + above.len();\n        self.delta.freed.push(freed);", "self.queued += 1;\n        self.delta.freed.push(freed);")],
+    ),
+    (
+        "a freed top costs the budget nothing",
+        [(EXEC, "*freed += 1;\n        let mut inode = self.must_inode(top)?;",
+          "let mut inode = self.must_inode(top)?;")],
+    ),
+    (
+        "a freed top names the directories above another subtree",
+        [(EXEC, "let above = self.reaping.get(&top).map_or(Vec::new(), |above| above.to_vec());",
+          "let above = self.reaping.values().next().map_or(Vec::new(), |above| above.to_vec());")],
+    ),
+    (
+        "a freed record names the directories above another subtree",
+        [(EXEC, "if let Some(above) = self.reaping.get(&current) {\n                found.extend(*above);\n                break;",
+          "if self.reaping.contains_key(&current) {\n                found.extend(*self.reaping.values().next().expect(\"a subtree\"));\n                break;")],
+    ),
+    (
+        "a subtree that lacks records keeps the rest from asking for theirs",
+        [(EXEC, "if let Err(Halt::Need(read)) = exec.reap(subtree.top, subtree.at, &mut freed, &mut needs) {\n            needs.insert(read);",
+          "if let Err(Halt::Need(read)) = exec.reap(subtree.top, subtree.at, &mut freed, &mut needs) {\n            needs.insert(read);\n            break;")],
+    ),
+    (
+        "freeing reads a directory's own record in a round of its own",
+        [(EXEC, "want(self.delta.inode(self.base, dir).err());", "")],
+    ),
+    (
+        "a detach reads one key root's record a round",
+        [(EXEC, "if needs.len() < MAX_READS {\n                                needs.insert(read);\n                            }\n                            break None;",
+          "needs.insert(read);\n                            return;")],
     ),
     (
         "a reaped record names what lies above its top now",
-        [(EXEC, "if current == *top {\n                found.extend(above);\n                break;\n            }", "")],
+        [(EXEC, "if let Some(above) = self.reaping.get(&current) {\n                found.extend(*above);\n                break;\n            }", "")],
     ),
     (
         "a lease opens at the version the cache read",
@@ -753,7 +835,11 @@ MUTANTS = [
         [(WRITER, "if !self.is_fresh() {\n            self.answer(waiting.token, Answer::Unavailable);\n            return Ok(());\n        }", "")]),
     (
         "a listing of the free queue stops at the release horizon",
-        [(WRITER, "range: keys::free_after(after.as_deref()),", "range: keys::released(after.as_deref(), self.leases.claim_horizon()),")],
+        [(WRITER, "keys::free_after(after.as_deref())", "keys::released(after.as_deref(), self.leases.claim_horizon())")],
+    ),
+    (
+        "a listing under a directory stops at the release horizon",
+        [(WRITER, "keys::free_under_after(root, after.as_deref())", "keys::released_under(root, after.as_deref(), self.leases.claim_horizon())")],
     ),
     (
         "a listing of the free queue skips claimed entries",
@@ -771,6 +857,153 @@ MUTANTS = [
         "a full page of the free queue goes on past what it left out",
         [(WRITER, "if entries.len() == waiting.limit {\n                    break;\n                }", ""),
          (WRITER, "if entry.within(waiting.root) {\n                entries.push(entry);", "if entry.within(waiting.root) && entries.len() < waiting.limit {\n                entries.push(entry);")],
+    ),
+    (
+        "a freed record stays out of the directories above it",
+        [(DELTA, "for dir in queued_under(above) {\n                writes.set(freed.key_under(dir, self.version), Vec::new());\n            }", "")],
+    ),
+    (
+        "an acknowledged entry stays under the directories above it",
+        [(DELTA, "for dir in queued_under(&acked.ancestors) {\n                writes.clear(acked.freed.key_under(dir, acked.version));\n            }", "")],
+    ),
+    (
+        "the tree's root holds a part of the queue of its own",
+        [(DELTA, "ancestors.iter().copied().filter(|dir| *dir != ROOT)", "ancestors.iter().copied()")],
+    ),
+    (
+        "an entry's key under a directory repeats the directories above it",
+        [(DELTA, "writes.set(freed.key_under(dir, self.version), Vec::new());",
+          "writes.set(freed.key_under(dir, self.version), encode_ancestors(above));")],
+    ),
+    (
+        "a consumer under a directory reads the whole queue",
+        [(WRITER, "root != ROOT && self.queue_indexed", "false")],
+    ),
+    (
+        "the root's consumer reads a part of the queue under the root",
+        [(WRITER, "root != ROOT && self.queue_indexed", "self.queue_indexed")],
+    ),
+    (
+        "a root's claim starts over its part of the queue each time",
+        [(WRITER, ".map(|(_, key)| key.clone());", ".and_then(|_| None::<Vec<u8>>);")],
+    ),
+    (
+        "a listing under a directory resumes in the whole queue",
+        [(WRITER, "let after = after.map(|(version, freed)| freed.key_under(root, version));",
+          "let after = after.map(|(version, freed)| freed.key(version));")],
+    ),
+    (
+        "a page of a listing under a directory skips its first entry",
+        [(WRITER, ".iter()\n                        .take(waiting.limit)\n                        .map(|(key, _)| part_key(key))",
+          ".iter().skip(1).take(waiting.limit).map(|(key, _)| part_key(key))")],
+    ),
+    (
+        "a writer trusts the parts of a queue an earlier writer filled",
+        [(WRITER, "Some((key, value)) => free_entry(key, value)?.version > from,\n                None => true,",
+          "_ => true,")],
+    ),
+    (
+        "a queue from before it had parts never reads as whole",
+        [(WRITER, "if first.is_none_or(|first| first > from) {", "if false {")],
+    ),
+    (
+        "a read that finds older entries takes the queue as whole",
+        [(WRITER, "if first.is_none_or(|first| first > from) {", "if true {")],
+    ),
+    (
+        "a claim from the queue's start learns nothing of its age",
+        [(WRITER, "if from_start && let Some((key, value)) = pairs.first() {", "if false && let Some((key, value)) = pairs.first() {")],
+    ),
+    (
+        "an empty listing leaves a queue from before as it was",
+        [(WRITER, "if waiting.from_start {", "if waiting.from_start && !pairs.is_empty() {")],
+    ),
+    (
+        "a listing from the queue's start learns nothing of its age",
+        [(WRITER, "if waiting.from_start {", "if false {")],
+    ),
+    (
+        "a later page of a listing takes the queue's age from where it starts",
+        [(WRITER, "from_start: after.is_none(),", "from_start: true,")],
+    ),
+    (
+        "a store from before the queue had parts gets no record of them",
+        [(WRITER, "if self.indexed_from.is_none() {\n                    writes.set(keys::free_index(), encode_indexed_from(head.version));\n                }", "")],
+    ),
+    (
+        "a store from before records its queue's parts from the start",
+        [(WRITER, "writes.set(keys::free_index(), encode_indexed_from(head.version));",
+          "writes.set(keys::free_index(), encode_indexed_from(0));")],
+    ),
+    (
+        "a new store records no version for its queue's parts",
+        [(WRITER, "writes.set(keys::free_index(), encode_indexed_from(0));", "")],
+    ),
+    (
+        "a claim goes on from a cursor into another part of the queue",
+        [(WRITER, ".filter(|(part, _)| *part == own)", "")],
+    ),
+    (
+        "a claim under a directory takes an entry acknowledged as it read",
+        [(WRITER, "// An acknowledgement took the entry as the claim read.\n                    let Some(value) = value else {\n                        continue;\n                    };",
+          "let value = value.unwrap_or_else(|| crate::delta::encode_ancestors(&[waiting.root]));")],
+    ),
+    (
+        "a listing under a directory holds an entry acknowledged as it read",
+        [(WRITER, "// An acknowledgement took the entry as the page read.\n                    if let Some(value) = value {",
+          "let value = Some(value.unwrap_or_else(|| crate::delta::encode_ancestors(&[waiting.root])));\n                    if let Some(value) = value {")],
+    ),
+    (
+        "a claim under a directory takes entries another claim holds",
+        [(WRITER, "if !self.leases.is_claimed(&entry)\n                            && !waiting.found.iter().any(|found| found.key() == entry)",
+          "if !waiting.found.iter().any(|found| found.key() == entry)"),
+         (WRITER, "if waiting.found.len() < waiting.limit\n                        && self.leases.claimable(waiting.root, &entry)\n                    {\n                        waiting.found.push(entry);\n                    }\n                }\n                full",
+          "if waiting.found.len() < waiting.limit {\n                        waiting.found.push(entry);\n                    }\n                }\n                full")],
+    ),
+    (
+        "a full page of a directory's part leaves a claim short",
+        [(WRITER, "waiting.naming = Some((named.clone(), full));", "waiting.naming = Some((named.clone(), false));")],
+    ),
+    (
+        "fsck passes an entry missing under a directory above it",
+        [(FSCK, "None if whole => problems.push(format!(", "None if false => problems.push(format!(")],
+    ),
+    (
+        "fsck passes an entry under a directory when the queue lacks it",
+        [(FSCK, "if !self.queue.contains_key(entry) {", "if false {")],
+    ),
+    (
+        "fsck passes an entry under a directory it doesn't name",
+        [(FSCK, "for dir in under.keys().filter(|dir| !named.contains(dir)) {", "for dir in under.keys().filter(|_| false) {")],
+    ),
+    (
+        "fsck passes a key under a directory that holds a value",
+        [(FSCK, "Some(held) if *held != 0 => problems.push(format!(", "Some(held) if *held != 0 && false => problems.push(format!(")],
+    ),
+    (
+        "a batch is too large by its keys and values alone",
+        [(WRITER, "writes.bytes() > MAX_BATCH_BYTES || writes.charged() > MAX_GROUP_BYTES", "writes.bytes() > MAX_BATCH_BYTES")],
+    ),
+    (
+        "a group packs its batches by their keys and values",
+        [(WRITER, "let bytes = writes.charged();", "let bytes = writes.bytes();")],
+    ),
+    (
+        "a small key set is charged its own bytes",
+        [(KEYS, "3 * (key.len() + STORE_PREFIX) + value.len() + WRITE_CHARGE", "key.len() + value.len()")],
+    ),
+    (
+        "a key cleared is charged as a key set",
+        [(KEYS, "KvWrite::Clear(key) => 4 * (key.len() + STORE_PREFIX) + WRITE_CHARGE", "KvWrite::Clear(key) => 3 * (key.len() + STORE_PREFIX) + WRITE_CHARGE")],
+    ),
+    (
+        "a claim stops short at an entry acknowledged as it read",
+        [(WRITER, "full |= keys.next().is_some();", "")],
+    ),
+    (
+        "a claim's cursor passes keys it left unexamined",
+        [(WRITER, "named.push(entry);\n                            if waiting.found.len() + named.len() == waiting.limit {\n                                break;\n                            }",
+          "if waiting.found.len() + named.len() < waiting.limit {\n                                named.push(entry);\n                            }")],
     ),
     (
         "a listing reports freeing done past a detached subtree",

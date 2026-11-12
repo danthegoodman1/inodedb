@@ -1,12 +1,18 @@
 //! Scripted scenarios for keys: roots, grants, minting, revocation,
 //! expiry, and reads by handle.
 
-use inodedb_core::auth::{Caller, Denied, Grant, KeyError, KeyOp};
-use inodedb_core::ops::{CommitResult, Outcome, Skip};
+use inodedb_core::Bytes;
+use inodedb_core::auth::{Caller, Denied, Grant, KeyError, KeyId, KeyOp, KeyRecord};
+use inodedb_core::exec::{self, Input};
+use inodedb_core::ops::{Batch, CommitResult, Outcome, Skip};
 use inodedb_core::query::{Query, QueryResult, Target};
-use inodedb_core::types::{Error, Ino, ROOT};
+use inodedb_core::types::{Entry, Error, Ino, Inode, Name, ROOT, Version};
+use inodedb_core::view::{Lookup, View};
 use inodedb_core::writer::Answer;
 use inodedb_sim::harness::*;
+use std::cell::Cell;
+use std::collections::BTreeSet;
+use std::ops::Bound;
 
 const ADMIN: Caller = Caller::Trusted(ROOT);
 
@@ -195,6 +201,222 @@ fn freeing_or_detaching_a_root_revokes_its_keys() {
         denied(&stat_as(&mut h, at_y, Target::Path(p("")))),
         Some(Denied::Unknown)
     );
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn a_batch_that_detaches_several_directories_revokes_the_keys_beneath_each() {
+    let mut h = Harness::new();
+    h.ops([
+        mkdir_p("t/a/x/m/deep"),
+        mkdir_p("t/a/y"),
+        mkdir_p("t/b/x"),
+        mkdir_p("t/c/x"),
+        mkdir_p("u/d"),
+    ]);
+    let mut at = |root: &str| h.mint(ADMIN, root, Grant::Read, 0);
+    // Beneath the first directory the batch detaches: a root, a root under
+    // that one, which two keys share, and the directory itself.
+    let gone = [
+        at("t/a/x/m"),
+        at("t/a/x/m/deep"),
+        at("t/a/x/m/deep"),
+        at("t/a/x"),
+        // Beneath the second and the third.
+        at("t/b/x"),
+        at("u/d"),
+    ];
+    // Above a detached directory, beside one, and under a directory the
+    // search has already passed on its way up from another root.
+    let stay = [at("t/a"), at("t/a/y"), at("t/c/x"), at("t")];
+    let result = h.ops([remove_all("t/a/x"), remove_all("t/b"), remove_all("u")]);
+    assert!(result.outcomes.iter().all(Outcome::applied));
+    // The detaching commit revokes them all itself, ahead of the freeing
+    // that would reach each root in time.
+    assert_eq!(h.key_deletions(), vec![(result.version, gone.len())]);
+    for key in gone {
+        assert_eq!(
+            denied(&stat_as(&mut h, key, Target::Path(p("")))),
+            Some(Denied::Unknown)
+        );
+    }
+    for key in stay {
+        assert!(found(&stat_as(&mut h, key, Target::Path(p("")))));
+    }
+    assert_eq!(h.writer.keys().len(), stay.len());
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn a_detach_revokes_a_key_minted_in_its_own_group() {
+    let mut h = Harness::new();
+    h.ops([mkdir_p("t/a/b")]);
+    // Both arrive before either commits, so the detach runs against a key
+    // only the writer's uncommitted changes hold.
+    let (mint, detach) = (h.token(), h.token());
+    h.writer.submit_key(
+        mint,
+        ADMIN,
+        KeyOp::Mint {
+            id: None,
+            hash: key_hash(5),
+            root: p("t/a/b"),
+            grant: Grant::Read,
+            ttl: 0,
+        },
+    );
+    h.writer.submit(
+        detach,
+        ADMIN,
+        inodedb_core::ops::Batch {
+            ops: vec![remove_all("t/a")],
+            ..Default::default()
+        },
+    );
+    h.run();
+    let Answer::Key(Ok(id)) = h.answer(mint) else {
+        panic!("the mint commits");
+    };
+    let detached = committed(h.answer(detach));
+    assert!(detached.committed);
+    assert_eq!(h.key_deletions(), vec![(detached.version, 1)]);
+    let minted = Caller::Key {
+        id,
+        hash: key_hash(5),
+    };
+    assert_eq!(
+        denied(&stat_as(&mut h, minted, Target::Path(p("")))),
+        Some(Denied::Unknown)
+    );
+    assert!(h.writer.keys().is_empty());
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// A view that counts the inode records asked of it, and can hide the keys.
+struct Counting<'a> {
+    base: &'a dyn View,
+    keyless: bool,
+    inodes: Cell<usize>,
+}
+
+impl View for Counting<'_> {
+    fn inode(&self, ino: Ino) -> Lookup<Option<Inode>> {
+        self.inodes.set(self.inodes.get() + 1);
+        self.base.inode(ino)
+    }
+    fn entry(&self, dir: Ino, name: &[u8]) -> Lookup<Option<Entry>> {
+        self.base.entry(dir, name)
+    }
+    fn has_entry_outside(&self, dir: Ino, removed: &BTreeSet<Name>) -> Lookup<bool> {
+        self.base.has_entry_outside(dir, removed)
+    }
+    fn backptrs(&self, ino: Ino) -> Lookup<BTreeSet<(Ino, Name)>> {
+        self.base.backptrs(ino)
+    }
+    fn value(&self, ino: Ino, version: Version) -> Lookup<Option<Bytes>> {
+        self.base.value(ino, version)
+    }
+    fn request(&self, id: u128) -> Lookup<Option<CommitResult>> {
+        self.base.request(id)
+    }
+    fn listing(&self, dir: Ino, start: Bound<&[u8]>, limit: usize) -> Lookup<Vec<(Name, Entry)>> {
+        self.base.listing(dir, start, limit)
+    }
+    fn free_entry(&self, version: Version, ino: Ino) -> Lookup<Option<Vec<Ino>>> {
+        self.base.free_entry(version, ino)
+    }
+    fn detach_entry(&self, version: Version, ino: Ino) -> Lookup<Option<Vec<Ino>>> {
+        self.base.detach_entry(version, ino)
+    }
+    fn key(&self, id: KeyId) -> Option<KeyRecord> {
+        self.base.key(id)
+    }
+    fn key_retired(&self, id: KeyId) -> bool {
+        self.base.key_retired(id)
+    }
+    fn keys_rooted_at(&self, dir: Ino) -> Vec<KeyId> {
+        self.base.keys_rooted_at(dir)
+    }
+    fn keys_minted_by(&self, id: KeyId) -> Vec<KeyId> {
+        self.base.keys_minted_by(id)
+    }
+    fn key_roots(&self) -> BTreeSet<Ino> {
+        if self.keyless {
+            BTreeSet::new()
+        } else {
+            self.base.key_roots()
+        }
+    }
+}
+
+#[test]
+fn a_detach_looks_up_each_key_root_once_however_many_directories_go() {
+    const TENANTS: usize = 200;
+    const PARTS: usize = 50;
+    let mut h = Harness::new();
+    let tenant = |n: usize| format!("a/b/c/d/t{n}");
+    h.ops((0..TENANTS).map(|n| mkdir_p(&tenant(n))));
+    h.ops((0..PARTS).map(|n| mkdir_p(&format!("{}/parts/p{n}", tenant(0)))));
+    for n in 0..TENANTS {
+        h.mint(ADMIN, &tenant(n), Grant::Write, 0);
+        h.mint(ADMIN, &tenant(n), Grant::Read, 0);
+    }
+    // One batch detaches every part of one tenant.
+    let batch = Batch {
+        ops: (0..PARTS)
+            .map(|n| remove_all(&format!("{}/parts/p{n}", tenant(0))))
+            .collect(),
+        ..Batch::default()
+    };
+    let lookups = |keyless: bool| {
+        let view = Counting {
+            base: h.writer.cache(),
+            keyless,
+            inodes: Cell::new(0),
+        };
+        let input = Input {
+            batch: &batch,
+            root: ROOT,
+            now: h.now,
+            version: h.writer.version() + 1,
+            next_ino: h.writer.head().next_ino,
+        };
+        let executed = exec::execute(input, &view).expect("the cache holds the tree");
+        assert_eq!(executed.delta.detached.len(), PARTS);
+        assert!(executed.delta.keys.is_empty(), "no key lies beneath a part");
+        view.inodes.get()
+    };
+    // The search for keys beneath the parts reads each tenant's record
+    // once, and the four directories above the tenants once among them.
+    let searched = lookups(false) - lookups(true);
+    assert!(
+        searched <= TENANTS + 4,
+        "{searched} inode lookups for {TENANTS} key roots"
+    );
+}
+
+#[test]
+fn a_detach_reads_the_key_roots_a_cold_cache_lacks_in_rounds() {
+    const ROOTS: usize = 300;
+    let mut h = Harness::new();
+    h.ops((0..ROOTS).map(|n| mkdir_p(&format!("a/b/t{n}"))));
+    h.ops([mkdir_p("parts/p")]);
+    for n in 0..ROOTS {
+        h.mint(ADMIN, &format!("a/b/t{n}"), Grant::Read, 0);
+    }
+    // A restarted writer holds every key and none of the tree.
+    let mut h = Harness::with(h.storage.clone(), Default::default());
+    let started = h.reads;
+    let result = h.ops([remove_all("parts/p")]);
+    assert!(result.outcomes.iter().all(Outcome::applied));
+    // The search reads every root's record in one round, then each level
+    // above them in a round of its own.
+    let rounds = h.reads - started;
+    assert!(
+        rounds <= 12,
+        "{rounds} rounds of reads for {ROOTS} key roots"
+    );
+    assert_eq!(h.writer.keys().len(), ROOTS);
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
 

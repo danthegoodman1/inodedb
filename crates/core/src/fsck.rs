@@ -8,6 +8,10 @@ use crate::types::{Entry, Ino, Inode, Kind, Life, ROOT, Version};
 use crate::writer::Head;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+/// A free-queue entry: the version that freed it, the inode, and the
+/// value's version when a value was freed.
+type QueueEntry = (Version, Ino, Option<Version>);
+
 #[derive(Default)]
 struct Tree {
     inodes: BTreeMap<Ino, Inode>,
@@ -16,6 +20,14 @@ struct Tree {
     values: BTreeMap<(Ino, Version), usize>,
     free_inodes: BTreeMap<Ino, Version>,
     free_values: BTreeSet<(Ino, Version)>,
+    /// Each free-queue entry's value: the directories above what it frees.
+    queue: BTreeMap<QueueEntry, Vec<u8>>,
+    /// The directories each entry has a key under, with how many bytes
+    /// each key holds.
+    queue_under: BTreeMap<QueueEntry, BTreeMap<Ino, usize>>,
+    /// The version after which every entry has a key under each directory
+    /// above it, as the store records it.
+    indexed_from: Option<Version>,
     detached: BTreeMap<Ino, Version>,
     head: Option<Head>,
     /// Request records' parts, by request id.
@@ -140,6 +152,13 @@ fn load<'a>(
                         tree.free_values.insert((ino, value));
                     }
                 }
+                tree.queue.insert((version, ino, freed), value.to_vec());
+            }
+            Some(Parsed::FreeUnder(dir, version, ino, freed)) => {
+                tree.queue_under
+                    .entry((version, ino, freed))
+                    .or_default()
+                    .insert(dir, value.len());
             }
             Some(Parsed::Detached(version, ino)) => {
                 tree.detached.insert(ino, version);
@@ -178,6 +197,10 @@ fn load<'a>(
                 }
             }
             Some(Parsed::System(b'm', [])) => tree.handle_secret = Some(value.len()),
+            Some(Parsed::System(b'q', [])) => match crate::writer::decode_indexed_from(value) {
+                Ok(from) => tree.indexed_from = Some(from),
+                Err(_) => problems.push("the free queue's index record doesn't decode".into()),
+            },
             Some(Parsed::System(b'k' | b'm', _)) => problems.push(format!("malformed key {key:?}")),
             Some(Parsed::System(..) | Parsed::Log) => {}
             None => problems.push(format!("unknown key {key:?}")),
@@ -208,6 +231,57 @@ impl Tree {
             {
                 problems.push(format!(
                     "key {id:016x} was minted by missing key {minter:016x}"
+                ));
+            }
+        }
+    }
+
+    /// Each free-queue entry freed after the store began keeping them
+    /// under directories has a key, holding nothing, under each directory
+    /// it names above what it frees, apart from the root; an older entry
+    /// may have none. No directory holds an entry the queue lacks, or one
+    /// that doesn't name it.
+    fn check_queue(&self, head: &Head, problems: &mut Vec<String>) {
+        match self.indexed_from {
+            Some(from) if from > head.version => problems.push(format!(
+                "the free queue keeps entries under directories from {from}, past the head"
+            )),
+            None if !self.queue_under.is_empty() => problems.push(
+                "directories hold free-queue entries, and no record says from which version".into(),
+            ),
+            _ => {}
+        }
+        let none = BTreeMap::new();
+        for (entry, value) in &self.queue {
+            let (version, ino, _) = *entry;
+            let named: BTreeSet<Ino> = crate::delta::decode_ancestors(value)
+                .map(|dirs| dirs.into_iter().filter(|dir| *dir != ROOT).collect())
+                .unwrap_or_default();
+            let under = self.queue_under.get(entry).unwrap_or(&none);
+            let whole = self.indexed_from.is_some_and(|from| version > from);
+            for dir in &named {
+                match under.get(dir) {
+                    Some(held) if *held != 0 => problems.push(format!(
+                        "the free-queue entry for inode {ino} at {version} holds {held} bytes under directory {dir}"
+                    )),
+                    None if whole => problems.push(format!(
+                        "the free-queue entry for inode {ino} at {version} is missing under directory {dir}"
+                    )),
+                    _ => {}
+                }
+            }
+            for dir in under.keys().filter(|dir| !named.contains(dir)) {
+                problems.push(format!(
+                    "directory {dir} holds the free-queue entry for inode {ino} at {version}, which doesn't name it"
+                ));
+            }
+        }
+        for (entry, under) in &self.queue_under {
+            let (version, ino, _) = entry;
+            if !self.queue.contains_key(entry) {
+                let dirs: Vec<Ino> = under.keys().copied().collect();
+                problems.push(format!(
+                    "directories {dirs:?} hold a free-queue entry for inode {ino} at {version} that the queue lacks"
                 ));
             }
         }
@@ -307,6 +381,7 @@ impl Tree {
         }
         self.check_requests(head, problems);
         self.check_keys(problems);
+        self.check_queue(head, problems);
         for (ino, parent, name) in &self.backptrs {
             match self.entries.get(&(*parent, name.clone())) {
                 Some(entry) if entry.child == *ino && entry.kind == Kind::File => {}

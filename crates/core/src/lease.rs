@@ -491,6 +491,11 @@ impl Leases {
             && entry.within(root)
     }
 
+    /// Whether a claim holds the entry freed at a version.
+    pub fn is_claimed(&self, entry: &(Version, Freed)) -> bool {
+        self.claimed.contains_key(entry)
+    }
+
     /// The horizon claims may use.
     pub fn claim_horizon(&self) -> Version {
         self.stored.horizon

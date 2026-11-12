@@ -290,11 +290,9 @@ impl Keys {
             .unwrap_or_default()
     }
 
-    pub fn roots(&self) -> Vec<(KeyId, Ino)> {
-        self.records
-            .iter()
-            .map(|(id, record)| (*id, record.root))
-            .collect()
+    /// Every directory a key is rooted at.
+    pub fn roots(&self) -> BTreeSet<Ino> {
+        self.by_root.keys().copied().collect()
     }
 
     pub fn len(&self) -> usize {

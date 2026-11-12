@@ -298,14 +298,67 @@ impl View for Overlaid<'_> {
         )
     }
 
-    fn key_roots(&self) -> Vec<(KeyId, Ino)> {
-        let mut roots: BTreeMap<KeyId, Ino> = self.base.key_roots().into_iter().collect();
+    fn key_roots(&self) -> BTreeSet<Ino> {
+        let mut roots = self.base.key_roots();
         for (id, (_, record)) in &self.overlay.keys {
             match record {
-                Some(record) => roots.insert(*id, record.root),
-                None => roots.remove(id),
-            };
+                Some(record) => {
+                    roots.insert(record.root);
+                }
+                // The root of a key the overlay deleted may hold no other.
+                None => {
+                    if let Some(deleted) = self.base.key(*id)
+                        && self.keys_rooted_at(deleted.root).is_empty()
+                    {
+                        roots.remove(&deleted.root);
+                    }
+                }
+            }
         }
-        roots.into_iter().collect()
+        roots
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{Grant, Keys};
+    use crate::cache::Cache;
+
+    fn record(root: Ino) -> KeyRecord {
+        KeyRecord {
+            hash: [7; 32],
+            root,
+            grant: Grant::Read,
+            expires: 0,
+            minted_by: None,
+        }
+    }
+
+    #[test]
+    fn key_roots_follow_the_keys_uncommitted_batches_mint_and_delete() {
+        let mut keys = Keys::default();
+        keys.put(1, Some(record(5)));
+        keys.put(2, Some(record(5)));
+        keys.put(3, Some(record(6)));
+        let mut cache = Cache::new();
+        cache.load_keys(keys);
+        // One of the two keys at 5 goes, the only key at 6 goes, 7 gains
+        // one, and 8 gains one that a later batch deletes.
+        let mut first = Delta::new(9);
+        first.set_key(1, Some(record(5)), None);
+        first.set_key(3, Some(record(6)), None);
+        first.set_key(4, None, Some(record(7)));
+        first.set_key(10, None, Some(record(8)));
+        let mut second = Delta::new(10);
+        second.set_key(10, Some(record(8)), None);
+        let mut overlay = Overlay::default();
+        overlay.add(&first);
+        overlay.add(&second);
+        let view = Overlaid {
+            overlay: &overlay,
+            base: &cache,
+        };
+        assert_eq!(view.key_roots(), BTreeSet::from([5, 7]));
     }
 }

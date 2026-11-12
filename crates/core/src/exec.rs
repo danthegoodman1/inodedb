@@ -75,9 +75,12 @@ struct Exec<'a> {
     now: Millis,
     version: Version,
     next_ino: Ino,
-    /// While freeing a detached subtree: its top, and the directories
-    /// above the top as it detached.
-    reaping: Option<(Ino, Vec<Ino>)>,
+    /// While freeing detached subtrees: each one's top, with the
+    /// directories above the top as it detached.
+    reaping: BTreeMap<Ino, &'a [Ino]>,
+    /// The free-queue keys the batch writes: one for each record it frees,
+    /// and one under each directory above the record.
+    queued: usize,
 }
 
 pub fn execute(input: Input<'_>, base: &dyn View) -> Result<Executed, Vec<Read>> {
@@ -89,7 +92,8 @@ pub fn execute(input: Input<'_>, base: &dyn View) -> Result<Executed, Vec<Read>>
         now: input.now,
         version: input.version,
         next_ino: input.next_ino,
-        reaping: None,
+        reaping: BTreeMap::new(),
+        queued: 0,
     };
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(batch.ops.len());
     let mut needs = BTreeSet::new();
@@ -115,10 +119,8 @@ pub fn execute(input: Input<'_>, base: &dyn View) -> Result<Executed, Vec<Read>>
     if needs.is_empty() {
         exec.finish_holders(&mut needs);
     }
-    if needs.is_empty()
-        && let Err(read) = exec.revoke_orphans()
-    {
-        needs.insert(read);
+    if needs.is_empty() {
+        exec.revoke_orphans(&mut needs);
     }
     if !needs.is_empty() {
         return Err(needs.into_iter().collect());
@@ -188,7 +190,8 @@ pub fn execute_key(
         now,
         version,
         next_ino: 0,
-        reaping: None,
+        reaping: BTreeMap::new(),
+        queued: 0,
     };
     let failed = match op {
         KeyOp::Mint {
@@ -259,7 +262,8 @@ pub fn execute_expiry(ids: &[KeyId], now: Millis, version: Version, base: &dyn V
         now,
         version,
         next_ino: 0,
-        reaping: None,
+        reaping: BTreeMap::new(),
+        queued: 0,
     };
     for id in ids {
         if exec.key(*id).is_some_and(|record| !record.live(now)) {
@@ -269,21 +273,37 @@ pub fn execute_expiry(ids: &[KeyId], now: Millis, version: Version, base: &dyn V
     exec.delta
 }
 
-/// The most inodes one commit of a detached subtree's freeing frees.
+/// The most inodes one commit of detached subtrees' freeing frees.
 pub const REAP_BUDGET: usize = 1_000;
 
-/// Frees up to `REAP_BUDGET` inodes of the subtree detached at `at` under
-/// `top`, deepest first: a file loses its link in the subtree and is freed
-/// once it has none left. Once the subtree is empty, frees `top` and drops
-/// its detach record. What it frees names the directories inside the
-/// subtree above it, then `above`, which lay above `top` as it detached.
-pub fn execute_reap(
-    top: Ino,
-    at: Version,
-    above: &[Ino],
+/// The free-queue keys past which such a commit frees no more. A freed
+/// inode writes a key, and another under each directory above it, so a
+/// commit deep in the tree frees fewer inodes and still fits a storage
+/// transaction: FoundationDB charges about 200 bytes for each of these
+/// keys (`WriteSet::charged`), 2 MB for this many.
+pub const REAP_KEYS: usize = 10_000;
+
+/// A detached subtree to free: its top, the version that detached it, and
+/// the directories above the top as it detached.
+#[derive(Clone, Copy, Debug)]
+pub struct Reap<'a> {
+    pub top: Ino,
+    pub at: Version,
+    pub above: &'a [Ino],
+}
+
+/// Frees up to `REAP_BUDGET` inodes of detached subtrees, or fewer once
+/// their free-queue keys pass `REAP_KEYS`, taking the subtrees in order
+/// and each deepest first: a file loses its link in the subtree and is
+/// freed once it has none left. Once a subtree is empty, frees its top and
+/// drops its detach record. What it frees names the directories inside
+/// the subtree above it, then those that lay above the subtree's top as it
+/// detached.
+pub fn execute_reap<'a>(
+    subtrees: &[Reap<'a>],
     now: Millis,
     version: Version,
-    base: &dyn View,
+    base: &'a dyn View,
 ) -> Result<Executed, Vec<Read>> {
     let mut exec = Exec {
         base,
@@ -292,19 +312,29 @@ pub fn execute_reap(
         now,
         version,
         next_ino: 0,
-        reaping: Some((top, above.to_vec())),
+        reaping: subtrees
+            .iter()
+            .map(|subtree| (subtree.top, subtree.above))
+            .collect(),
+        queued: 0,
     };
     let mut needs = BTreeSet::new();
-    if let Err(Halt::Need(read)) = exec.reap(top, at, &mut needs) {
-        needs.insert(read);
+    let mut freed = 0;
+    for subtree in subtrees {
+        // A subtree that lacks records leaves the rest to ask for theirs
+        // in the same round of reads.
+        if exec.spent(freed) || needs.len() >= MAX_READS {
+            break;
+        }
+        if let Err(Halt::Need(read)) = exec.reap(subtree.top, subtree.at, &mut freed, &mut needs) {
+            needs.insert(read);
+        }
     }
     if needs.is_empty() {
         exec.finish_holders(&mut needs);
     }
-    if needs.is_empty()
-        && let Err(read) = exec.revoke_orphans()
-    {
-        needs.insert(read);
+    if needs.is_empty() {
+        exec.revoke_orphans(&mut needs);
     }
     if !needs.is_empty() {
         return Err(needs.into_iter().collect());
@@ -385,16 +415,17 @@ pub fn execute_ack(
 /// A directory's chain to the root through `view`, starting with itself.
 /// A directory the view lacks has no chain.
 fn chain(view: &dyn View, dir: Ino) -> Lookup<Vec<Ino>> {
-    chain_until(view, dir, ROOT)
+    chain_until(view, dir, &BTreeMap::new())
 }
 
-/// `dir` and its ancestors up to `top`, or to the root.
-fn chain_until(view: &dyn View, dir: Ino, top: Ino) -> Lookup<Vec<Ino>> {
+/// `dir` and its ancestors up to the first that `tops` holds, or to the
+/// root.
+fn chain_until(view: &dyn View, dir: Ino, tops: &BTreeMap<Ino, &[Ino]>) -> Lookup<Vec<Ino>> {
     let mut chain = Vec::new();
     let mut current = dir;
     while let Some(inode) = view.inode(current)? {
         chain.push(current);
-        if current == top || current == ROOT || chain.len() >= MAX_DEPTH {
+        if tops.contains_key(&current) || current == ROOT || chain.len() >= MAX_DEPTH {
             break;
         }
         current = inode.parent;
@@ -570,7 +601,16 @@ impl Exec<'_> {
     /// Revokes the keys whose roots the batch freed or detached. A freed
     /// directory was empty, so only keys rooted at it go; a detached one
     /// takes every key rooted beneath it.
-    fn revoke_orphans(&mut self) -> Result<(), Read> {
+    ///
+    /// The search follows each directory a key is rooted at up toward the
+    /// root, and settles every directory it passes for the roots that
+    /// reach it later. Its cost is the number of directories that hold or
+    /// lie above a key's root, however many keys share a root and however
+    /// many directories the batch detached. Each round of reads asks for
+    /// the records the view lacks on the way, up to `MAX_READS` of them,
+    /// so a cold cache costs a round for each thousand roots at each level
+    /// rather than one for each root.
+    fn revoke_orphans(&mut self, needs: &mut BTreeSet<Read>) {
         let mut orphans = BTreeSet::new();
         for freed in &self.delta.freed {
             if let Freed::Inode(ino) = freed {
@@ -578,39 +618,84 @@ impl Exec<'_> {
             }
         }
         if !self.delta.detached.is_empty() {
-            for (id, root) in self.delta.key_roots(self.base) {
-                for dir in &self.delta.detached {
-                    match self.is_under(root, *dir) {
-                        Ok(true) => {
-                            orphans.insert(id);
-                            break;
-                        }
-                        Ok(false) | Err(Halt::Fail(_)) => {}
-                        Err(Halt::Need(read)) => return Err(read),
+            let detached: BTreeSet<Ino> = self.delta.detached.iter().copied().collect();
+            // Whether each directory passed lies at or beneath a detached one.
+            let mut settled: BTreeMap<Ino, bool> = BTreeMap::new();
+            for root in self.delta.key_roots(self.base) {
+                let mut passed = Vec::new();
+                let mut current = root;
+                let beneath = loop {
+                    if let Some(known) = settled.get(&current) {
+                        break Some(*known);
                     }
+                    if detached.contains(&current) {
+                        break Some(true);
+                    }
+                    if current == ROOT || passed.len() == MAX_DEPTH {
+                        break Some(false);
+                    }
+                    passed.push(current);
+                    match self.must_inode(current) {
+                        Ok(inode) => current = inode.parent,
+                        Err(Halt::Fail(_)) => break Some(false),
+                        Err(Halt::Need(read)) => {
+                            if needs.len() < MAX_READS {
+                                needs.insert(read);
+                            }
+                            break None;
+                        }
+                    }
+                };
+                // A root whose way up lacks a record settles nothing.
+                let Some(beneath) = beneath else {
+                    continue;
+                };
+                for dir in passed {
+                    settled.insert(dir, beneath);
+                }
+                if beneath {
+                    orphans.extend(self.delta.keys_rooted_at(self.base, root));
                 }
             }
         }
-        for id in orphans {
-            self.revoke(id);
+        if needs.is_empty() {
+            for id in orphans {
+                self.revoke(id);
+            }
         }
-        Ok(())
     }
 
-    fn reap(&mut self, top: Ino, at: Version, needs: &mut BTreeSet<Read>) -> Step<()> {
-        let mut freed = 0;
+    /// Whether a commit that has freed `freed` inodes of detached subtrees
+    /// frees no more.
+    fn spent(&self, freed: usize) -> bool {
+        freed == REAP_BUDGET || self.queued >= REAP_KEYS
+    }
+
+    /// Frees the subtree detached at `at` under `top` while `freed`, the
+    /// count of inodes the commit frees, and the free-queue keys it writes
+    /// stay within the commit's budget.
+    fn reap(
+        &mut self,
+        top: Ino,
+        at: Version,
+        freed: &mut usize,
+        needs: &mut BTreeSet<Read>,
+    ) -> Step<()> {
         let mut stack = vec![top];
         while let Some(&dir) = stack.last() {
-            if freed == REAP_BUDGET {
+            if self.spent(*freed) {
                 return Ok(());
             }
             // As many entries as the budget can still free.
             let listing =
                 self.delta
-                    .listing(self.base, dir, Bound::Unbounded, REAP_BUDGET - freed)?;
-            self.prefetch(&listing, needs)?;
+                    .listing(self.base, dir, Bound::Unbounded, REAP_BUDGET - *freed)?;
+            self.prefetch(dir, &listing, needs)?;
             let mut deeper = None;
             for (name, entry) in listing {
+                if self.queued >= REAP_KEYS {
+                    return Ok(());
+                }
                 match entry.kind {
                     Kind::File => self.unlink_file(dir, &name, entry)?,
                     Kind::Dir if self.has_entries(entry.child)? => {
@@ -623,24 +708,31 @@ impl Exec<'_> {
                         self.free_dir(entry.child, inode)?;
                     }
                 }
-                freed += 1;
+                *freed += 1;
             }
             match deeper {
                 Some(child) => stack.push(child),
                 // A listing the budget cut short may leave entries.
-                None if freed == REAP_BUDGET => return Ok(()),
+                None if *freed == REAP_BUDGET => return Ok(()),
                 None => {
                     stack.pop();
                 }
             }
         }
+        // The loop ends under the budget of inodes, which the top counts
+        // against like any inode.
+        if self.queued >= REAP_KEYS {
+            return Ok(());
+        }
+        *freed += 1;
         let mut inode = self.must_inode(top)?;
         inode.life = Life::Freed(self.version);
         inode.version = self.version;
         let above = self
             .reaping
-            .as_ref()
-            .map_or(Vec::new(), |(_, above)| above.clone());
+            .get(&top)
+            .map_or(Vec::new(), |above| above.to_vec());
+        self.queued += 1 + above.len();
         self.delta.freed.push(Freed::Inode(top));
         self.delta.ancestors.insert(Freed::Inode(top), above);
         self.put_inode(top, inode)?;
@@ -648,17 +740,25 @@ impl Exec<'_> {
         Ok(())
     }
 
-    /// Asks at once for what freeing `entries` reads, so a cold subtree
-    /// costs a round of reads per directory rather than per entry.
-    fn prefetch(&self, entries: &[(Name, Entry)], needs: &mut BTreeSet<Read>) -> Step<()> {
+    /// Asks at once for what freeing `dir`'s `entries` reads, the
+    /// directory's own record among it, so a cold subtree costs a round of
+    /// reads per directory rather than per entry, and subtrees freed
+    /// together share their rounds.
+    fn prefetch(
+        &self,
+        dir: Ino,
+        entries: &[(Name, Entry)],
+        needs: &mut BTreeSet<Read>,
+    ) -> Step<()> {
+        let mut want = |read: Option<Read>| {
+            if let Some(read) = read
+                && needs.len() < MAX_READS
+            {
+                needs.insert(read);
+            }
+        };
+        want(self.delta.inode(self.base, dir).err());
         for (_, entry) in entries {
-            let mut want = |read: Option<Read>| {
-                if let Some(read) = read
-                    && needs.len() < MAX_READS
-                {
-                    needs.insert(read);
-                }
-            };
             want(self.delta.inode(self.base, entry.child).err());
             want(match entry.kind {
                 Kind::File => self.delta.backptrs(self.base, entry.child).err(),
@@ -683,15 +783,15 @@ impl Exec<'_> {
             delta: &self.delta,
             base: self.base,
         };
-        let Some((top, above)) = &self.reaping else {
+        if self.reaping.is_empty() {
             return Ok(chain(&view, dir)?);
-        };
+        }
         let mut found = Vec::new();
         let mut current = dir;
         while found.len() < MAX_DEPTH {
             found.push(current);
-            if current == *top {
-                found.extend(above);
+            if let Some(above) = self.reaping.get(&current) {
+                found.extend(*above);
                 break;
             }
             current = self.must_inode(current)?.parent;
@@ -800,6 +900,7 @@ impl Exec<'_> {
         for dir in holders {
             above.extend(self.chain(*dir)?);
         }
+        self.queued += 1 + above.len();
         self.delta.freed.push(freed);
         self.delta
             .ancestors
@@ -1295,12 +1396,9 @@ impl Exec<'_> {
         // before it left sees it freed, and no one else does, wherever the
         // top's old parent lies now.
         let route = |view: &dyn View, dir: Ino| -> Lookup<Vec<Ino>> {
-            let Some((top, above)) = &self.reaping else {
-                return chain(view, dir);
-            };
-            let mut found = chain_until(view, dir, *top)?;
-            if found.last() == Some(top) {
-                found.extend(above);
+            let mut found = chain_until(view, dir, &self.reaping)?;
+            if let Some(above) = found.last().and_then(|top| self.reaping.get(top)) {
+                found.extend(*above);
             }
             Ok(found)
         };

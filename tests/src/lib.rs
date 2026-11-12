@@ -37,6 +37,7 @@ macro_rules! api_conformance {
             leases_hold_the_log, caches_hold_a_lease, snapshots_hold_their_version,
             snapshots_hold_what_they_read, caches_start_under_steady_writes,
             claims_read_values_their_file_outlived, listings_hold_the_whole_free_queue,
+            consumers_take_their_own_roots_entries, deep_batches_of_unlinks_commit_or_are_refused,
             checks_take_a_root_admin_key, keys_expire_and_leave_the_store,
             dropping_a_server_closes_its_store, a_stream_ends_when_its_client_leaves,
             clients_reconnect_to_a_restarted_server, a_stream_outlives_its_client_handle,
@@ -2290,6 +2291,142 @@ pub async fn leases_hold_freed_records<B: Backend>(backend: &mut B) {
         lease.beat(db.version(), db.version()).await,
         Err(Error::LeaseExpired)
     ));
+}
+
+/// A batch that unlinks thousands of files several directories down
+/// writes a queue key under each directory above every file. The server
+/// refuses it as too large by what FoundationDB would charge for those
+/// keys, and takes it in parts, which commit on every backend.
+pub async fn deep_batches_of_unlinks_commit_or_are_refused<B: Backend>(backend: &mut B) {
+    const FILES: usize = 9_000;
+    // The server lives as long as its handle does.
+    let Fixture {
+        db,
+        server: _server,
+        ..
+    } = fresh(backend).await;
+    let deep = "a/b/c/d/e/f";
+    db.commit([Op::mkdir(deep).parents()])
+        .await
+        .expect("commits");
+    for chunk in (0..FILES).collect::<Vec<_>>().chunks(3_000) {
+        let mut puts = db.batch();
+        for index in chunk {
+            puts.push(Op::put(format!("{deep}/f{index}"), "v"));
+        }
+        puts.commit().await.expect("commits");
+    }
+    let mut all = db.batch();
+    for index in 0..FILES {
+        all.push(Op::unlink(format!("{deep}/f{index}")));
+    }
+    assert!(matches!(
+        all.commit().await,
+        Err(Error::Rejected(Rejection::TooLarge))
+    ));
+    db.stat(format!("{deep}/f0")).await.expect("still there");
+    for chunk in (0..FILES).collect::<Vec<_>>().chunks(3_000) {
+        let mut part = db.batch();
+        for index in chunk {
+            part.push(Op::unlink(format!("{deep}/f{index}")));
+        }
+        let outcomes = part.commit().await.expect("commits").outcomes;
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Outcome::Applied { .. }))
+        );
+    }
+    assert_eq!(
+        db.list(deep).await.expect("lists").entries.len(),
+        0,
+        "every file is gone"
+    );
+    let checked = db.check().await.expect("checks");
+    assert_eq!(checked.problems, Vec::<String>::new());
+}
+
+/// Consumers under two tenants' roots each claim, list and acknowledge
+/// their own entries, files several directories down among them, and
+/// leave the store sound.
+pub async fn consumers_take_their_own_roots_entries<B: Backend>(backend: &mut B) {
+    let Fixture { db, server, .. } = fresh(backend).await;
+    db.commit([
+        Op::mkdir("t/store/part").parents(),
+        Op::mkdir("u/store/part").parents(),
+        Op::put("t/store/part/a", "1"),
+        Op::put("t/store/part/b", "2"),
+        Op::put("u/store/part/c", "3"),
+        Op::put("u/top", "4"),
+    ])
+    .await
+    .expect("commits");
+    let mut inos = Vec::new();
+    for path in [
+        "t/store/part/a",
+        "t/store/part/b",
+        "u/store/part/c",
+        "u/top",
+    ] {
+        inos.push(db.stat(path).await.expect("stats").handle.ino);
+    }
+    db.commit([
+        Op::remove_all("t/store/part"),
+        Op::unlink("u/store/part/c"),
+        Op::unlink("u/top"),
+    ])
+    .await
+    .expect("commits");
+    let day = std::time::Duration::from_secs(86_400);
+    let mut consumers = Vec::new();
+    for root in ["t", "u"] {
+        let key = db
+            .mint_key(root, inodedb::Grant::Write, day)
+            .await
+            .expect("mints");
+        consumers.push(
+            Client::connect(server.endpoint(), &key)
+                .await
+                .expect("connects"),
+        );
+    }
+    // The part's files reach the queue as the writer frees its subtree.
+    let files = |entries: &[inodedb::Freed]| -> Vec<u64> {
+        let mut files: Vec<u64> = entries
+            .iter()
+            .filter(|entry| entry.value.is_some())
+            .map(|entry| entry.handle.ino)
+            .collect();
+        files.sort();
+        files
+    };
+    let expected = [&inos[..2], &inos[2..]];
+    for (consumer, expected) in consumers.iter().zip(expected) {
+        let mut listed = Vec::new();
+        for _ in 0..200 {
+            listed = consumer.list_freed(None, 60).await.expect("lists").entries;
+            if files(&listed) == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(files(&listed), expected);
+        let claim = consumer.claim_freed(60).await.expect("claims");
+        assert_eq!(files(&claim.entries), expected);
+        assert_eq!(claim.entries.len(), listed.len());
+        consumer
+            .ack_freed(claim.id, &claim.entries)
+            .await
+            .expect("acknowledges");
+        assert_eq!(consumer.claim_freed(60).await.expect("claims").entries, []);
+        assert_eq!(
+            consumer.list_freed(None, 60).await.expect("lists").entries,
+            []
+        );
+    }
+    assert_eq!(db.list_freed(None, 60).await.expect("lists").entries, []);
+    let checked = db.check().await.expect("checks");
+    assert_eq!(checked.problems, Vec::<String>::new());
 }
 
 /// A listing of the free queue holds entries a lease holds and entries a

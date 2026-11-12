@@ -29,7 +29,7 @@ use inodedb_core::fsck;
 use inodedb_core::keys::{self, KvRead, KvResult, Parsed, WriteSet};
 use inodedb_core::lease::{ClaimId, FreeEntry, LeaseError, LeaseId, LeaseRecord};
 use inodedb_core::log::LogEntry;
-use inodedb_core::ops::{Batch, BatchError, CommitResult};
+use inodedb_core::ops::{Batch, BatchError, CommitResult, Outcome};
 use inodedb_core::query::{self as core_query, Query, QueryResult, Target};
 use inodedb_core::snapshot::Miss;
 use inodedb_core::standby::Follower;
@@ -128,6 +128,9 @@ pub struct Options {
     /// Clients that only read, and so keep reading through a writer's
     /// stall.
     pub reader_percent: u64,
+    /// Chance each of the consumer's claims and listings runs under a
+    /// directory it picks, rather than under the tree's root.
+    pub scoped_percent: u64,
 }
 
 impl Options {
@@ -205,6 +208,7 @@ impl Options {
         let options = Options {
             release_percent: *Prng::stream(seed, "release options").pick(&[0, 0, 50, 100]),
             preload: Prng::stream(seed, "preload options").percent(50),
+            scoped_percent: *Prng::stream(seed, "consumer scope options").pick(&[0, 20, 40, 60]),
             ..options
         };
         let prng = &mut Prng::stream(seed, "takeover options");
@@ -274,6 +278,7 @@ impl Options {
             drift_ppm: 0,
             reader_percent: 0,
             key_ttl: 0,
+            scoped_percent: 0,
         }
     }
 }
@@ -641,19 +646,33 @@ enum LeaseCall {
         oldest: Version,
         position: Version,
     },
-    Claim,
+    /// A claim under a directory.
+    Claim {
+        root: Ino,
+    },
     Ack {
         entries: Vec<FreeEntry>,
     },
     List,
 }
 
-/// A listing of the free queue that goes on page by page until a page
-/// reaches the queue's end.
-#[derive(Debug, Default)]
+/// A listing of the free queue under a directory, which goes on page by
+/// page until a page reaches the queue's end.
+#[derive(Debug)]
 struct Listing {
+    root: Ino,
     next: Option<(Version, Freed)>,
     seen: BTreeSet<(Version, Freed)>,
+}
+
+impl Listing {
+    fn under(root: Ino) -> Listing {
+        Listing {
+            root,
+            next: None,
+            seen: BTreeSet::new(),
+        }
+    }
 }
 
 struct Client {
@@ -757,11 +776,16 @@ pub struct Simulator {
     /// Lease and free-queue calls awaiting answers, each with the writer
     /// asked.
     lease_calls: BTreeMap<u64, (u64, LeaseCall)>,
-    /// The consumer's claim awaiting acknowledgement, and whether a call
-    /// of its is in flight.
-    claim: Option<(ClaimId, Vec<FreeEntry>)>,
+    /// The consumer's claim awaiting acknowledgement, with the directory
+    /// it claimed under, and whether a call of its is in flight.
+    claim: Option<(ClaimId, Vec<FreeEntry>, Ino)>,
     consuming: bool,
     lease_prng: Prng,
+    /// Draws the directories the consumer claims and lists under.
+    scope_prng: Prng,
+    /// Every free-queue entry a claim or a listing has shown the consumer,
+    /// with the directories it records above what it frees.
+    queued: BTreeMap<(Version, Freed), Vec<Ino>>,
     /// The consumer's listing in progress, each page asked for as the one
     /// before it answers.
     listing: Option<Listing>,
@@ -980,6 +1004,8 @@ impl Simulator {
             claim: None,
             consuming: false,
             lease_prng: Prng::stream(seed, "leases"),
+            scope_prng: Prng::stream(seed, "consumer scopes"),
+            queued: BTreeMap::new(),
             listing: None,
             list_prng: Prng::stream(seed, "listings"),
             maybe_acked: BTreeSet::new(),
@@ -1789,7 +1815,7 @@ impl Simulator {
         self.next_token += 1;
         self.consuming = true;
         match self.claim.take() {
-            Some((claim, entries)) if !self.lease_prng.percent(10) => {
+            Some((claim, entries, root)) if !self.lease_prng.percent(10) => {
                 let acked: Vec<(Version, Freed)> = entries
                     .iter()
                     .map(|entry| (entry.version, entry.freed))
@@ -1802,16 +1828,44 @@ impl Simulator {
                 self.lease_calls
                     .insert(token, (self.current, LeaseCall::Ack { entries }));
                 self.writer_mut()
-                    .acknowledge(token, Caller::Trusted(ROOT), claim, &acked);
+                    .acknowledge(token, Caller::Trusted(root), claim, &acked);
             }
             _ => {
                 let limit = self.lease_prng.range(1..=20) as usize;
+                let root = self.consumer_root();
                 self.lease_calls
-                    .insert(token, (self.current, LeaseCall::Claim));
-                self.writer_mut().claim(token, Caller::Trusted(ROOT), limit);
+                    .insert(token, (self.current, LeaseCall::Claim { root }));
+                self.writer_mut().claim(token, Caller::Trusted(root), limit);
             }
         }
         self.actions()
+    }
+
+    /// The directory a claim or a listing runs under: the tree's root, or
+    /// now and then a directory an answer has named, removed or not.
+    fn consumer_root(&mut self) -> Ino {
+        if !self.scope_prng.percent(self.options.scoped_percent) {
+            return ROOT;
+        }
+        let Some(model) = &self.model else {
+            return ROOT;
+        };
+        let dirs: Vec<Ino> = self
+            .mapping
+            .ino_to_node
+            .iter()
+            .filter(|(_, node)| {
+                model
+                    .nodes
+                    .get(node)
+                    .is_some_and(|node| node.kind == Kind::Dir)
+            })
+            .map(|(ino, _)| *ino)
+            .collect();
+        match dirs.len() as u64 {
+            0 => ROOT,
+            count => dirs[self.scope_prng.below(count) as usize],
+        }
     }
 
     /// Now and then starts a listing of the free queue, unless one is in
@@ -1820,7 +1874,8 @@ impl Simulator {
         if self.listing.is_some() || !self.list_prng.percent(30) {
             return false;
         }
-        self.listing = Some(Listing::default());
+        let root = self.consumer_root();
+        self.listing = Some(Listing::under(root));
         self.next_page();
         true
     }
@@ -1828,21 +1883,28 @@ impl Simulator {
     /// Asks for the listing's next page.
     fn next_page(&mut self) {
         let limit = self.list_prng.range(1..=20) as usize;
-        let after = self.listing.as_ref().and_then(|listing| listing.next);
+        let (root, after) = self
+            .listing
+            .as_ref()
+            .map_or((ROOT, None), |listing| (listing.root, listing.next));
         let token = self.next_token;
         self.next_token += 1;
         self.lease_calls
             .insert(token, (self.current, LeaseCall::List));
         self.writer_mut()
-            .list_freed(token, Caller::Trusted(ROOT), after, limit);
+            .list_freed(token, Caller::Trusted(root), after, limit);
     }
 
     /// Property 10: a page of the free queue lists nothing a name holds or
-    /// an acknowledgement removed by its version, and a listing that
+    /// an acknowledgement removed by its version, and nothing outside the
+    /// directory it lists under. A listing under the tree's root that
     /// reaches the queue's end holds every file the model at that page's
-    /// version says was freed, unless an acknowledgement went out for it.
-    /// No subtree detached at or before the page's `freed_through` still
-    /// links a file.
+    /// version says was freed, unless an acknowledgement went out for it,
+    /// and no subtree detached at or before the page's `freed_through`
+    /// still links a file. A listing under another directory that reaches
+    /// its end holds every entry the consumer has seen that names the
+    /// directory above what it frees, unless an acknowledgement went out
+    /// for it.
     fn check_listing(
         &mut self,
         version: Version,
@@ -1850,7 +1912,14 @@ impl Simulator {
         next: Option<(Version, Freed)>,
         freed_through: Version,
     ) -> Result<(), Failure> {
-        let mut listing = self.listing.take().unwrap_or_default();
+        let mut listing = self.listing.take().unwrap_or_else(|| Listing::under(ROOT));
+        let root = listing.root;
+        for entry in &entries {
+            if !entry.within(root) {
+                return Err(self.fail(format!("a listing under directory {root} holds {entry:?}")));
+            }
+            self.queued.insert(entry.key(), entry.ancestors.clone());
+        }
         let model = self.snapshot(version)?;
         let named = model.named_nodes();
         if freed_through > version {
@@ -1883,6 +1952,24 @@ impl Simulator {
             self.next_page();
             return Ok(());
         }
+        if root != ROOT {
+            // The entries came from claims and listings of the whole queue
+            // as well as of its parts, so a part that lacks one disagrees
+            // with the queue.
+            let missing = self.queued.iter().find(|(key, above)| {
+                key.0 <= version
+                    && above.contains(&root)
+                    && matches!(key.1, Freed::Inode(ino) if !self.maybe_acked.contains(&ino))
+                    && !listing.seen.contains(key)
+            });
+            if let Some((key, _)) = missing {
+                return Err(self.fail(format!(
+                    "a listing under directory {root} that reached its end at {version} left out {key:?}"
+                )));
+            }
+            self.summary.listings += 1;
+            return Ok(());
+        }
         let listed: BTreeSet<Ino> = listing
             .seen
             .iter()
@@ -1896,8 +1983,8 @@ impl Simulator {
                 continue;
             }
             // The model counts down a file's detached links as freeing
-            // removes them, by its inode; a file created inside a subtree
-            // its own batch detached never had its inode seen.
+            // removes them, by its inode, which the record of the commit
+            // that made the file names.
             let Some(ino) = self.mapping.ino(id) else {
                 continue;
             };
@@ -1968,11 +2055,17 @@ impl Simulator {
                 watcher.reset(head);
                 watcher.lease = Held::None;
             }
-            (LeaseCall::Claim, Answer::Claimed { claim, entries }) => {
+            (LeaseCall::Claim { root }, Answer::Claimed { claim, entries }) => {
                 self.consuming = false;
                 // Property 7: nothing a live lease may still read is
-                // released.
+                // released, and a consumer claims only under its root.
                 for entry in &entries {
+                    if !entry.within(root) {
+                        return Err(
+                            self.fail(format!("a claim under directory {root} holds {entry:?}"))
+                        );
+                    }
+                    self.queued.insert(entry.key(), entry.ancestors.clone());
                     for index in 0..self.watchers.len() {
                         if let Some(oldest) = self.leased(index)
                             && entry.version > oldest
@@ -1984,7 +2077,7 @@ impl Simulator {
                     }
                 }
                 if !entries.is_empty() {
-                    self.claim = Some((claim, entries));
+                    self.claim = Some((claim, entries, root));
                 }
             }
             (LeaseCall::Ack { entries }, Answer::Acked(result)) => {
@@ -2006,7 +2099,7 @@ impl Simulator {
                 },
             ) => self.check_listing(version, entries, next, freed_through)?,
             // A writer that stopped answers nothing more.
-            (LeaseCall::Claim | LeaseCall::Ack { .. }, Answer::Unavailable) => {
+            (LeaseCall::Claim { .. } | LeaseCall::Ack { .. }, Answer::Unavailable) => {
                 self.consuming = false;
             }
             (LeaseCall::List, Answer::Unavailable) => self.listing = None,
@@ -2510,7 +2603,7 @@ impl Simulator {
                     }
                 }
                 LeaseCall::Beat { .. } => {}
-                LeaseCall::Claim | LeaseCall::Ack { .. } => self.consuming = false,
+                LeaseCall::Claim { .. } | LeaseCall::Ack { .. } => self.consuming = false,
                 LeaseCall::List => self.listing = None,
             }
         }
@@ -2663,16 +2756,14 @@ impl Simulator {
                 parts.entry(id).or_default().insert(part, value.clone());
             }
         }
-        let mut by_version: BTreeMap<Version, u128> = BTreeMap::new();
+        let mut by_version: BTreeMap<Version, (u128, CommitResult)> = BTreeMap::new();
         for (id, chunks) in parts {
             let bytes: Vec<u8> = chunks.into_values().flatten().collect();
             let result = CommitResult::decode(&bytes)
                 .map_err(|_| self.fail("a request record doesn't decode"))?;
-            if by_version.insert(result.version, id).is_some() {
-                return Err(self.fail(format!(
-                    "two requests committed at version {}",
-                    result.version
-                )));
+            let version = result.version;
+            if by_version.insert(version, (id, result)).is_some() {
+                return Err(self.fail(format!("two requests committed at version {version}")));
             }
         }
         for (version, entry) in &writes.log {
@@ -2689,7 +2780,7 @@ impl Simulator {
                 self.publish(&entry);
                 continue;
             }
-            let Some(id) = by_version.get(version).copied() else {
+            let Some((id, recorded)) = by_version.get(version).cloned() else {
                 self.unrecorded(&entry)?;
                 continue;
             };
@@ -2782,6 +2873,19 @@ impl Simulator {
                     && let Err(why) = self.mapping.bind(after.child, node)
                 {
                     return Err(self.fail(format!("version {version} names {path:?}: {why}")));
+                }
+            }
+            // The record the commit wrote tells the rest: the inode of each
+            // node an op touched, a file in a subtree the batch went on to
+            // detach among them, which no name reaches once the batch is
+            // done. Freeing that subtree counts down the file's links by
+            // its inode, and may land before any reply to the batch does.
+            for (expected, outcome) in outcomes.iter().zip(&recorded.outcomes) {
+                if let (ModelOutcome::Applied(Some(node)), Outcome::Applied { ino: Some(ino) }) =
+                    (expected, outcome)
+                    && let Err(why) = self.mapping.bind(*ino, *node)
+                {
+                    return Err(self.fail(format!("version {version} records {outcome:?}: {why}")));
                 }
             }
             self.history.insert(*version, model.clone());

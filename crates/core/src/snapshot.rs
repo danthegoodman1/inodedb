@@ -431,7 +431,7 @@ impl View for Current<'_> {
         self.cache.keys_minted_by(id)
     }
 
-    fn key_roots(&self) -> Vec<(KeyId, Ino)> {
+    fn key_roots(&self) -> BTreeSet<Ino> {
         self.cache.key_roots()
     }
 }
@@ -617,7 +617,7 @@ impl View for SnapshotView<'_> {
         self.current.keys_minted_by(id)
     }
 
-    fn key_roots(&self) -> Vec<(KeyId, Ino)> {
+    fn key_roots(&self) -> BTreeSet<Ino> {
         self.current.key_roots()
     }
 }

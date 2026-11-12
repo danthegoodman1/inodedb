@@ -43,7 +43,8 @@ pub type Token = u64;
 const REQUEST_PART: usize = 64 * 1024;
 /// The most expired request records one group deletes.
 const EXPIRE_PER_GROUP: usize = 256;
-/// The most a group's batches write. With the head, the group's expiry
+/// The most a group's batches write, as FoundationDB charges a transaction
+/// for them (`WriteSet::charged`). With the head, the group's expiry
 /// deletions and `LEASE_BYTES` of heartbeats, a group stays under a storage
 /// transaction's 10,000,000 bytes.
 pub const MAX_GROUP_BYTES: usize = 9_000_000;
@@ -56,8 +57,8 @@ const READ_AHEAD_OPS: usize = 1_024;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// A group closes once its writes would pass this, at most
-    /// `MAX_GROUP_BYTES`.
+    /// A group closes once what its writes are charged would pass this,
+    /// at most `MAX_GROUP_BYTES`.
     pub group_max_bytes: usize,
     /// How long a request record lasts.
     pub request_ttl: Millis,
@@ -280,8 +281,9 @@ enum Work {
     Lease(LeaseId, Option<LeaseRecord>),
     /// Deletes acknowledged entries and what they kept.
     Ack(Vec<FreeEntry>),
-    /// Frees part of the subtree detached at a version under a directory.
-    Reap(Version, Ino),
+    /// Frees part of the subtrees detached at these versions under these
+    /// directories, in order.
+    Reap(Vec<(Version, Ino)>),
     /// Deletes these keys if they have expired, with what they minted.
     Expire(Vec<KeyId>),
 }
@@ -348,7 +350,7 @@ struct Sending {
 /// The least time between commits that carry heartbeats alone.
 const CHORE_EVERY: Millis = 1_000;
 
-/// The most time a detached subtree waits for its next freeing while the
+/// The most time detached subtrees wait for their next freeing while the
 /// writer is busy.
 const REAP_EVERY: Millis = 100;
 
@@ -394,6 +396,12 @@ struct WaitingClaim {
     /// Whether the scan has gone back to the queue's start, for entries
     /// behind where it began.
     wrapped: bool,
+    /// Whether the scan reads the root's own part of the queue, or the
+    /// whole queue for the entries under the root.
+    own: bool,
+    /// The entries a page of the root's part named, whose records the
+    /// claim is reading from the queue, and whether that page was full.
+    naming: Option<(Vec<(Version, Freed)>, bool)>,
 }
 
 /// A listing of the free queue awaiting its page.
@@ -405,7 +413,18 @@ struct WaitingList {
     /// The committed version when the page's read went out.
     version: Version,
     freed_through: Version,
+    /// Whether the page starts at the queue's start, and whether it reads
+    /// the root's own part of the queue.
+    from_start: bool,
+    own: bool,
+    /// The entries the page of the root's part named, whose records the
+    /// listing is reading from the queue, and where the next page starts.
+    naming: Option<Named>,
 }
+
+/// Entries a page named, and the last of those the page covers unless it
+/// reached the queue's end.
+type Named = (Vec<(Version, Freed)>, Option<(Version, Freed)>);
 
 #[derive(Debug)]
 struct Outstanding {
@@ -522,8 +541,17 @@ pub struct Writer {
     chore: Option<Chore>,
     /// When the last chore went out.
     chored_at: Millis,
-    /// Where each consumer root's next claim scan begins.
-    claim_cursors: BTreeMap<Ino, Vec<u8>>,
+    /// Where each consumer root's next claim scan begins: a key, and
+    /// whether it lies in the root's own part of the queue or in the
+    /// whole queue.
+    claim_cursors: BTreeMap<Ino, (bool, Vec<u8>)>,
+    /// The version from which every free-queue entry has its keys under
+    /// the directories above it, once storage holds the record.
+    indexed_from: Option<Version>,
+    /// Whether the queue holds only such entries, so a consumer under a
+    /// directory reads that directory's part of the queue alone. A store
+    /// an earlier writer filled gets there once its older entries go.
+    queue_indexed: bool,
     next_id: u64,
     next_seq: u64,
     actions: Vec<Action>,
@@ -597,6 +625,8 @@ impl Writer {
             chore: None,
             chored_at: now,
             claim_cursors: BTreeMap::new(),
+            indexed_from: None,
+            queue_indexed: false,
             next_id: 1,
             next_seq: 0,
             actions: Vec::new(),
@@ -789,8 +819,15 @@ impl Writer {
         };
         let id = self.id();
         // A claim goes on from where the root's last one stopped, so what
-        // it skipped before stays skipped.
-        let after = self.claim_cursors.get(&scope.root).cloned();
+        // it skipped before stays skipped. A cursor into the whole queue
+        // says nothing of the root's own part, which the claim then reads
+        // from its start.
+        let own = self.reads_own(scope.root);
+        let after = self
+            .claim_cursors
+            .get(&scope.root)
+            .filter(|(part, _)| *part == own)
+            .map(|(_, key)| key.clone());
         self.claiming.insert(
             id,
             WaitingClaim {
@@ -801,6 +838,8 @@ impl Writer {
                 after,
                 found: Vec::new(),
                 scanning: false,
+                own,
+                naming: None,
             },
         );
         if self.leases.release_due() {
@@ -832,7 +871,12 @@ impl Writer {
             return;
         };
         waiting.scanning = true;
-        let range = keys::released(waiting.after.as_deref(), self.leases.claim_horizon());
+        let horizon = self.leases.claim_horizon();
+        let range = if waiting.own {
+            keys::released_under(waiting.root, waiting.after.as_deref(), horizon)
+        } else {
+            keys::released(waiting.after.as_deref(), horizon)
+        };
         self.reads.insert(
             id,
             Outstanding {
@@ -853,24 +897,120 @@ impl Writer {
         });
     }
 
+    /// Reads the records of entries a page of a root's part of the queue
+    /// named, which hold the directories above what each frees.
+    fn read_named(&mut self, id: u64, named: &[(Version, Freed)], purpose: Purpose) {
+        let mut reads = Vec::with_capacity(named.len() + 1);
+        reads.push(KvRead::Get(keys::head()));
+        reads.extend(
+            named
+                .iter()
+                .map(|(version, freed)| KvRead::Get(freed.key(*version))),
+        );
+        self.reads.insert(
+            id,
+            Outstanding {
+                issued_at: self.version,
+                reads: Vec::new(),
+                purpose,
+            },
+        );
+        self.actions.push(Action::Read { id, reads });
+    }
+
     fn claim_read(&mut self, id: u64, results: Vec<KvResult>) -> Result<(), DecodeError> {
-        let Some(KvResult::Scan(pairs)) = results.into_iter().nth(1) else {
-            return Err(DecodeError);
+        let mut results = results.into_iter().skip(1);
+        let naming = self
+            .claiming
+            .get_mut(&id)
+            .and_then(|waiting| waiting.naming.take());
+        let full = match naming {
+            // The records of the entries a page of the root's part named.
+            Some((named, full)) => {
+                let Some(waiting) = self.claiming.get_mut(&id) else {
+                    return Ok(());
+                };
+                for ((version, freed), result) in named.into_iter().zip(results) {
+                    let KvResult::Get(value) = result else {
+                        return Err(DecodeError);
+                    };
+                    // An acknowledgement took the entry as the claim read.
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let entry = FreeEntry {
+                        version,
+                        freed,
+                        ancestors: crate::delta::decode_ancestors(&value)?,
+                    };
+                    if waiting.found.len() < waiting.limit
+                        && self.leases.claimable(waiting.root, &entry)
+                    {
+                        waiting.found.push(entry);
+                    }
+                }
+                full
+            }
+            None => {
+                let Some(KvResult::Scan(pairs)) = results.next() else {
+                    return Err(DecodeError);
+                };
+                let from_start = self
+                    .claiming
+                    .get(&id)
+                    .is_some_and(|waiting| !waiting.own && waiting.after.is_none());
+                if from_start && let Some((key, value)) = pairs.first() {
+                    let first = free_entry(key, value)?.version;
+                    self.queue_starts(Some(first));
+                }
+                let Some(waiting) = self.claiming.get_mut(&id) else {
+                    return Ok(());
+                };
+                let mut full = pairs.len() == CLAIM_PAGE;
+                if waiting.own {
+                    // The root's part holds keys alone: take the entries
+                    // free to claim, as many as the claim still lacks, and
+                    // read their records. The scan stops at the key that
+                    // fills the claim, so the cursor passes no key
+                    // unexamined, and the part goes on past it.
+                    let mut named = Vec::new();
+                    let mut keys = pairs.into_iter();
+                    for (key, _) in keys.by_ref() {
+                        let entry = part_key(&key)?;
+                        waiting.after = Some(key);
+                        if !self.leases.is_claimed(&entry)
+                            && !waiting.found.iter().any(|found| found.key() == entry)
+                        {
+                            named.push(entry);
+                            if waiting.found.len() + named.len() == waiting.limit {
+                                break;
+                            }
+                        }
+                    }
+                    full |= keys.next().is_some();
+                    if !named.is_empty() {
+                        waiting.naming = Some((named.clone(), full));
+                        self.read_named(id, &named, Purpose::Claim(id));
+                        return Ok(());
+                    }
+                } else {
+                    for (key, value) in pairs {
+                        let entry = free_entry(&key, &value)?;
+                        waiting.after = Some(key);
+                        if waiting.found.len() < waiting.limit
+                            && self.leases.claimable(waiting.root, &entry)
+                            && !waiting.found.iter().any(|found| found.key() == entry.key())
+                        {
+                            waiting.found.push(entry);
+                        }
+                    }
+                }
+                full
+            }
         };
         let Some(waiting) = self.claiming.get_mut(&id) else {
             return Ok(());
         };
-        let full = pairs.len() == CLAIM_PAGE;
-        for (key, value) in pairs {
-            let entry = free_entry(&key, &value)?;
-            waiting.after = Some(key);
-            if waiting.found.len() < waiting.limit
-                && self.leases.claimable(waiting.root, &entry)
-                && !waiting.found.iter().any(|found| found.key() == entry.key())
-            {
-                waiting.found.push(entry);
-            }
-        }
         if waiting.found.len() < waiting.limit {
             if full {
                 self.scan_claim(id);
@@ -893,7 +1033,8 @@ impl Writer {
         }
         match (&waiting.after, waiting.found.len() == waiting.limit) {
             (Some(after), true) => {
-                self.claim_cursors.insert(waiting.root, after.clone());
+                self.claim_cursors
+                    .insert(waiting.root, (waiting.own, after.clone()));
             }
             _ => {
                 self.claim_cursors.remove(&waiting.root);
@@ -945,6 +1086,7 @@ impl Writer {
             .find(|(_, above)| root == ROOT || above.contains(&root))
             .map_or(self.version, |(&(at, _), _)| at - 1);
         let id = self.id();
+        let own = self.reads_own(root);
         self.listing.insert(
             id,
             WaitingList {
@@ -953,6 +1095,9 @@ impl Writer {
                 limit: limit.max(1),
                 version: self.version,
                 freed_through,
+                from_start: after.is_none(),
+                own,
+                naming: None,
             },
         );
         self.reads.insert(
@@ -963,42 +1108,125 @@ impl Writer {
                 purpose: Purpose::List(id),
             },
         );
-        let after = after.map(|(version, freed)| freed.key(version));
+        let range = if own {
+            let after = after.map(|(version, freed)| freed.key_under(root, version));
+            keys::free_under_after(root, after.as_deref())
+        } else {
+            let after = after.map(|(version, freed)| freed.key(version));
+            keys::free_after(after.as_deref())
+        };
         self.actions.push(Action::Read {
             id,
             reads: vec![
                 KvRead::Get(keys::head()),
                 KvRead::Scan {
-                    range: keys::free_after(after.as_deref()),
+                    range,
                     limit: CLAIM_PAGE,
                 },
             ],
         });
     }
 
-    fn list_read(&mut self, id: u64, results: Vec<KvResult>) -> Result<(), DecodeError> {
-        let Some(KvResult::Scan(pairs)) = results.into_iter().nth(1) else {
-            return Err(DecodeError);
+    /// Whether a consumer at `root` reads the root's own part of the free
+    /// queue. The tree's root reads the queue itself, and so does every
+    /// root while the queue holds entries from before it kept its parts.
+    fn reads_own(&self, root: Ino) -> bool {
+        root != ROOT && self.queue_indexed
+    }
+
+    /// Takes what a read from the queue's start found there: the version
+    /// that freed its first entry, or None for an empty queue. Once
+    /// nothing is left from before the queue kept its parts under
+    /// directories, consumers read those parts.
+    fn queue_starts(&mut self, first: Option<Version>) {
+        if self.queue_indexed {
+            return;
+        }
+        let Some(from) = self.indexed_from else {
+            return;
         };
-        let Some(waiting) = self.listing.remove(&id) else {
+        if first.is_none_or(|first| first > from) {
+            self.queue_indexed = true;
+        }
+    }
+
+    fn list_read(&mut self, id: u64, results: Vec<KvResult>) -> Result<(), DecodeError> {
+        let mut results = results.into_iter().skip(1);
+        let Some(mut waiting) = self.listing.remove(&id) else {
             return Ok(());
         };
-        let full = pairs.len() == CLAIM_PAGE;
-        let mut entries = Vec::new();
-        let mut next = None;
-        for (key, value) in pairs {
-            let entry = free_entry(&key, &value)?;
-            next = Some(entry.key());
-            if entry.within(waiting.root) {
-                entries.push(entry);
-                if entries.len() == waiting.limit {
-                    break;
+        let (entries, next) = match waiting.naming.take() {
+            // The records of the entries the page of the root's part named.
+            Some((named, next)) => {
+                let mut entries = Vec::with_capacity(named.len());
+                for ((version, freed), result) in named.into_iter().zip(results) {
+                    let KvResult::Get(value) = result else {
+                        return Err(DecodeError);
+                    };
+                    // An acknowledgement took the entry as the page read.
+                    if let Some(value) = value {
+                        entries.push(FreeEntry {
+                            version,
+                            freed,
+                            ancestors: crate::delta::decode_ancestors(&value)?,
+                        });
+                    }
+                }
+                (entries, next)
+            }
+            None => {
+                let Some(KvResult::Scan(pairs)) = results.next() else {
+                    return Err(DecodeError);
+                };
+                let full = pairs.len() == CLAIM_PAGE;
+                if waiting.own {
+                    // The root's part holds keys alone, each an entry under
+                    // the root: read the records of as many as the page
+                    // takes.
+                    let named = pairs
+                        .iter()
+                        .take(waiting.limit)
+                        .map(|(key, _)| part_key(key))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let next = if named.len() < waiting.limit && !full {
+                        None
+                    } else {
+                        named.last().copied()
+                    };
+                    if !named.is_empty() {
+                        self.read_named(id, &named, Purpose::List(id));
+                        waiting.naming = Some((named, next));
+                        self.listing.insert(id, waiting);
+                        return Ok(());
+                    }
+                    (Vec::new(), None)
+                } else {
+                    if waiting.from_start {
+                        let first = match pairs.first() {
+                            Some((key, value)) => Some(free_entry(key, value)?.version),
+                            None => None,
+                        };
+                        self.queue_starts(first);
+                    }
+                    let mut entries = Vec::new();
+                    let mut next = None;
+                    for (key, value) in pairs {
+                        let entry = free_entry(&key, &value)?;
+                        next = Some(entry.key());
+                        if entry.within(waiting.root) {
+                            entries.push(entry);
+                            if entries.len() == waiting.limit {
+                                break;
+                            }
+                        }
+                    }
+                    if entries.len() < waiting.limit && !full {
+                        next = None;
+                    }
+                    (entries, next)
                 }
             }
-        }
-        if entries.len() < waiting.limit && !full {
-            next = None;
-        }
+        };
         // A writer whose lease lapsed during the read may have a successor.
         let answer = if self.phase == Phase::Ready && self.is_fresh() {
             Answer::FreeQueue {
@@ -1181,6 +1409,12 @@ impl Writer {
     /// Detached subtrees still to free, for tests and metrics.
     pub fn detached(&self) -> usize {
         self.detached.len()
+    }
+
+    /// Whether a consumer under a directory reads that directory's own
+    /// part of the free queue, for tests and metrics.
+    pub fn queue_indexed(&self) -> bool {
+        self.queue_indexed
     }
 
     /// Live request records of more than one part, for tests and metrics.
@@ -1387,17 +1621,21 @@ impl Writer {
                 }
                 Ok(())
             }
-            Work::Reap(at, top) => {
+            Work::Reap(tops) => {
                 let executed = {
                     let view = Overlaid {
                         overlay: &self.overlay,
                         base: &self.cache,
                     };
-                    let above = self
-                        .detached
-                        .get(&(*at, *top))
-                        .map_or(&[][..], Vec::as_slice);
-                    exec::execute_reap(*top, *at, above, self.now, self.next_version, &view)?
+                    let subtrees: Vec<exec::Reap<'_>> = tops
+                        .iter()
+                        .map(|key| exec::Reap {
+                            top: key.1,
+                            at: key.0,
+                            above: self.detached.get(key).map_or(&[][..], Vec::as_slice),
+                        })
+                        .collect();
+                    exec::execute_reap(&subtrees, self.now, self.next_version, &view)?
                 };
                 let version = self.next_version;
                 let delta = executed.delta;
@@ -1453,7 +1691,7 @@ impl Writer {
         let mut writes = delta.write_set();
         let log = LogEntry::from_delta(&delta, self.now, &BTreeMap::new(), BTreeMap::new());
         writes.log.push((version, log.encode()));
-        if writes.bytes() > MAX_BATCH_BYTES {
+        if too_large(&writes) {
             let seen = self.seen();
             self.hold(seen, sub.clone(), Answer::Rejected(BatchError::TooLarge));
             return;
@@ -1497,7 +1735,7 @@ impl Writer {
         writes: WriteSet,
         expires: Option<(Millis, u16)>,
     ) {
-        let bytes = writes.bytes();
+        let bytes = writes.charged();
         // The group closes before this batch's inodes count against it.
         if !self.forming.is_empty() && self.forming_bytes + bytes > self.group_max_bytes() {
             self.close_group();
@@ -1600,7 +1838,7 @@ impl Writer {
             expires = Some((at, parts));
         }
         writes.log.push((version, log.encode()));
-        if writes.bytes() > MAX_BATCH_BYTES {
+        if too_large(&writes) {
             // Its size depends on the changes it ran against, which may not
             // commit.
             let seen = self.seen();
@@ -1655,19 +1893,27 @@ impl Writer {
             }
             return;
         }
-        // Free part of a detached subtree when there is nothing else to
-        // do, and now and then however busy the writer is.
+        // Free part of the detached subtrees when there is nothing else
+        // to do, and now and then however busy the writer is. One commit
+        // takes them oldest first, as many as its budget frees; each frees
+        // an inode at least.
         let idle = self.in_flight.is_none()
             && self.queue.is_empty()
             && self.forming.is_empty()
             && self.groups.is_empty();
         if !self.reaping
             && (idle || self.now >= self.reaped_at + REAP_EVERY)
-            && let Some((&(at, top), _)) = self.detached.first_key_value()
+            && !self.detached.is_empty()
         {
             self.reaping = true;
             self.reaped_at = self.now;
-            self.enqueue(INTERNAL, Caller::Trusted(ROOT), Work::Reap(at, top));
+            let tops = self
+                .detached
+                .keys()
+                .take(exec::REAP_BUDGET)
+                .copied()
+                .collect();
+            self.enqueue(INTERNAL, Caller::Trusted(ROOT), Work::Reap(tops));
             return self.send();
         }
         // Delete expired keys once a second, in commits of a bounded
@@ -2176,7 +2422,11 @@ impl Writer {
                 Some(KvResult::Scan(retired)),
                 Some(KvResult::Scan(detached)),
                 Some(KvResult::Get(release)),
+                Some(KvResult::Get(indexed_from)),
+                Some(KvResult::Scan(queue_start)),
             ) = (
+                results.next(),
+                results.next(),
                 results.next(),
                 results.next(),
                 results.next(),
@@ -2187,6 +2437,20 @@ impl Writer {
             )
             else {
                 return Err(DecodeError);
+            };
+            // A store without the record gets it with this writer's first
+            // commit, from the version it starts at: an earlier writer
+            // freed what the queue holds, and kept none of it under
+            // directories.
+            self.indexed_from = indexed_from
+                .map(|bytes| decode_indexed_from(&bytes))
+                .transpose()?;
+            let from = self
+                .indexed_from
+                .unwrap_or_else(|| head.as_ref().map_or(0, |head| head.version));
+            self.queue_indexed = match queue_start.first() {
+                Some((key, value)) => free_entry(key, value)?.version > from,
+                None => true,
             };
             let prefix = keys::leases().start.len();
             let mut leases = Vec::with_capacity(stored.len());
@@ -2315,8 +2579,11 @@ impl Writer {
                     released: false,
                     ..head.clone()
                 };
-                self.head = head;
                 let mut writes = WriteSet::default();
+                if self.indexed_from.is_none() {
+                    writes.set(keys::free_index(), encode_indexed_from(head.version));
+                }
+                self.head = head;
                 writes.set(keys::head(), claim.encode());
                 self.send_claim(claim, stored, writes);
             }
@@ -2372,6 +2639,8 @@ impl Writer {
         };
         writes.set(keys::head(), head.encode());
         writes.set(keys::handle_secret(), self.handle_secret.to_vec());
+        // A new store keeps every entry under its directories.
+        writes.set(keys::free_index(), encode_indexed_from(0));
         self.bootstrap = Some(Arc::new(delta));
         self.send_claim(head, None, writes);
     }
@@ -2382,6 +2651,11 @@ impl Writer {
         let bootstrap = self.bootstrap.take();
         match outcome {
             CommitOutcome::Committed => {
+                // The commit stored the free queue's index record in a
+                // store that lacked it: a new store's from the start, and
+                // an older one's from the version this writer began at.
+                let from = if bootstrap.is_some() { 0 } else { self.version };
+                self.indexed_from.get_or_insert(from);
                 if let Some(delta) = bootstrap {
                     self.cache.apply(&delta);
                     self.secret_stored = true;
@@ -2490,11 +2764,28 @@ pub fn scoped_request(id: u128, key: Option<KeyId>) -> u128 {
     }
 }
 
+/// Whether a batch writes more than a batch may: more than 8 MiB of keys
+/// and values, or more than a group holds as FoundationDB charges it,
+/// which no group could commit. Small keys reach the second first: a batch
+/// that frees thousands of files deep in the tree writes little, in keys
+/// under each directory above them, and is charged several times as much.
+fn too_large(writes: &WriteSet) -> bool {
+    writes.bytes() > MAX_BATCH_BYTES || writes.charged() > MAX_GROUP_BYTES
+}
+
+/// The entry a key in a directory's part of the free queue names: the
+/// version that freed it, and what it frees.
+fn part_key(key: &[u8]) -> Result<(Version, Freed), DecodeError> {
+    match keys::parse(key) {
+        Some(Parsed::FreeUnder(_, version, ino, value)) => Ok((version, Freed::named(ino, value))),
+        _ => Err(DecodeError),
+    }
+}
+
 /// A free-queue entry from its key and the ancestors it stores.
 fn free_entry(key: &[u8], value: &[u8]) -> Result<FreeEntry, DecodeError> {
     let (version, freed) = match keys::parse(key) {
-        Some(Parsed::Free(version, ino, None)) => (version, Freed::Inode(ino)),
-        Some(Parsed::Free(version, ino, Some(value))) => (version, Freed::Value(ino, value)),
+        Some(Parsed::Free(version, ino, value)) => (version, Freed::named(ino, value)),
         _ => return Err(DecodeError),
     };
     Ok(FreeEntry {
@@ -2506,7 +2797,8 @@ fn free_entry(key: &[u8], value: &[u8]) -> Result<FreeEntry, DecodeError> {
 
 /// What a starting writer reads: the head, the request records' expiries,
 /// every key, the handle secret, every lease, revoked keys' ids, the
-/// detach records, and the release record.
+/// detach records, the release record, the version the free queue keeps
+/// its parts under directories from, and the queue's first entry.
 fn startup_reads() -> Vec<KvRead> {
     vec![
         KvRead::Get(keys::head()),
@@ -2532,5 +2824,25 @@ fn startup_reads() -> Vec<KvRead> {
             limit: usize::MAX,
         },
         KvRead::Get(keys::release()),
+        KvRead::Get(keys::free_index()),
+        KvRead::Scan {
+            range: keys::free_range(),
+            limit: 1,
+        },
     ]
+}
+
+/// The free-queue index record's value: the version every entry freed
+/// after has its keys under the directories above it.
+pub fn encode_indexed_from(version: Version) -> Vec<u8> {
+    let mut enc = Enc::with_capacity(10);
+    enc.varint(version);
+    enc.finish()
+}
+
+pub fn decode_indexed_from(bytes: &[u8]) -> Result<Version, DecodeError> {
+    let mut dec = Dec::new(bytes);
+    let version = dec.varint()?;
+    dec.end()?;
+    Ok(version)
 }
