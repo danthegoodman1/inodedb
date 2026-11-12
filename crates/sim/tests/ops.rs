@@ -662,6 +662,45 @@ fn cold_subtrees_ask_for_their_records_in_the_same_rounds() {
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
 
+/// Each subtree holds a directory of its own. A subtree asks for what it
+/// lacks at each level in the round the others ask in, whichever of them
+/// still lack records.
+#[test]
+fn cold_subtrees_with_directories_inside_share_their_rounds() {
+    const PARTS: usize = 40;
+    let mut h = Harness::new();
+    let dirs: Vec<String> = (0..PARTS).map(|n| format!("p{n}")).collect();
+    for dir in &dirs {
+        h.ops([
+            mkdir(dir),
+            put(&format!("{dir}/x"), "v"),
+            mkdir(&format!("{dir}/in")),
+            put(&format!("{dir}/in/a"), "v"),
+            put(&format!("{dir}/in/b"), "v"),
+        ]);
+    }
+    // The detach commits, and the writer stops before its freeing does.
+    let token = h.token();
+    h.writer.submit(
+        token,
+        inodedb_core::auth::Caller::Trusted(h.root),
+        Batch {
+            ops: dirs.iter().map(|dir| remove_all(dir)).collect(),
+            ..Batch::default()
+        },
+    );
+    h.run_until(token);
+    // A restarted writer frees the forty subtrees from a cold cache.
+    let h = Harness::with(h.storage.clone(), Default::default());
+    assert_eq!(h.writer.detached(), 0);
+    assert!(
+        h.reads <= 6,
+        "a round of reads per level, not per subtree: {}",
+        h.reads
+    );
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
 #[test]
 fn a_wide_directory_frees_over_several_commits() {
     let mut h = Harness::new();

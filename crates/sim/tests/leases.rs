@@ -469,6 +469,72 @@ fn a_listing_reports_freeing_done_only_past_every_detached_subtree() {
     assert_eq!(page.entries.len(), 2, "the subtree's top and its file");
 }
 
+/// A listing under a key's root answers for the subtrees detached beneath
+/// that root alone: its `freed_through` stays below the oldest of them
+/// still waiting, whatever waits elsewhere, and passes them once they are
+/// freed.
+#[test]
+fn a_listing_under_a_root_waits_for_the_subtrees_detached_beneath_it() {
+    let mut h = Harness::new();
+    h.ops([
+        mkdir_p("t/a"),
+        put("t/a/f", "v"),
+        mkdir_p("t/b"),
+        put("t/b/f", "v"),
+        mkdir_p("u/c"),
+        put("u/c/f", "v"),
+        mkdir("w"),
+    ]);
+    let at_t = h.mint(ADMIN, "t", Grant::Write, 0);
+    let at_u = h.mint(ADMIN, "u", Grant::Write, 0);
+    let at_w = h.mint(ADMIN, "w", Grant::Write, 0);
+    // Three detaches commit in turn, and the writer stops before it frees.
+    let tokens: Vec<u64> = ["t/a", "t/b", "u/c"]
+        .into_iter()
+        .map(|path| {
+            let token = h.token();
+            h.writer.submit(
+                token,
+                ADMIN,
+                inodedb_core::ops::Batch {
+                    ops: vec![remove_all(path)],
+                    ..Default::default()
+                },
+            );
+            token
+        })
+        .collect();
+    let held = h.run_until(tokens[2]);
+    let detached: Vec<u64> = tokens
+        .iter()
+        .map(|token| match h.answer(*token) {
+            inodedb_core::writer::Answer::Commit(detach) => detach.version,
+            other => panic!("the detach commits: {other:?}"),
+        })
+        .collect();
+    assert!(detached[0] < detached[1] && detached[1] < detached[2]);
+    assert_eq!(h.writer.detached(), 3);
+    assert_eq!(
+        h.list_freed(at_t, None, 10).freed_through,
+        detached[0] - 1,
+        "the older of the two beneath t"
+    );
+    assert_eq!(
+        h.list_freed(at_u, None, 10).freed_through,
+        detached[2] - 1,
+        "the one beneath u, whatever older ones wait beneath t"
+    );
+    let page = h.list_freed(at_w, None, 10);
+    assert_eq!(page.freed_through, page.version, "none lies beneath w");
+    assert_eq!(h.list_freed(ADMIN, None, 10).freed_through, detached[0] - 1);
+    h.resume(held);
+    assert_eq!(h.writer.detached(), 0);
+    for caller in [at_t, at_u, at_w, ADMIN] {
+        let page = h.list_freed(caller, None, 10);
+        assert_eq!(page.freed_through, page.version);
+    }
+}
+
 /// A queue that holds one consumer's entries behind thousands of another's.
 fn a_long_queue() -> (Harness, Caller, [Ino; 2]) {
     let mut h = Harness::new();

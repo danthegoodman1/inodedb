@@ -802,18 +802,23 @@ impl Exec<'_> {
     /// Asks at once for what freeing `dir`'s `entries` reads, the
     /// directory's own record among it, so a cold subtree costs a round of
     /// reads per directory rather than per entry, and subtrees freed
-    /// together share their rounds.
+    /// together share their rounds. It halts only for what this directory
+    /// lacks: a directory that has its records goes on to the directories
+    /// inside it while earlier subtrees wait for theirs, so those inside
+    /// every subtree ask for their records in the same round.
     fn prefetch(
         &self,
         dir: Ino,
         entries: &[(Name, Entry)],
         needs: &mut BTreeSet<Read>,
     ) -> Step<()> {
+        let mut lacks = None;
         let mut want = |read: Option<Read>| {
-            if let Some(read) = read
-                && needs.len() < MAX_READS
-            {
-                needs.insert(read);
+            if let Some(read) = read {
+                if needs.len() < MAX_READS {
+                    needs.insert(read.clone());
+                }
+                lacks.get_or_insert(read);
             }
         };
         want(self.delta.inode(self.base, dir).err());
@@ -827,8 +832,8 @@ impl Exec<'_> {
                     .err(),
             });
         }
-        match needs.first() {
-            Some(read) => Err(Halt::Need(read.clone())),
+        match lacks {
+            Some(read) => Err(Halt::Need(read)),
             None => Ok(()),
         }
     }

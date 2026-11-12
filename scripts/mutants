@@ -841,6 +841,10 @@ MUTANTS = [
         [(EXEC, "want(self.delta.inode(self.base, dir).err());", "")],
     ),
     (
+        "a subtree that has its records waits for the reads of those before it",
+        [(EXEC, "match lacks {", "match lacks.or_else(|| needs.first().cloned()) {")],
+    ),
+    (
         "a detach reads one key root's record a round",
         [(EXEC, "if needs.len() < MAX_READS {\n                                needs.insert(read);\n                            }\n                            break None;",
           "needs.insert(read);\n                            return;")],
@@ -1074,7 +1078,23 @@ MUTANTS = [
     ),
     (
         "a listing reports freeing done past a detached subtree",
-        [(WRITER, ".map_or(self.version, |(&(at, _), _)| at - 1);", ".map_or(self.version, |_| self.version);")],
+        [(WRITER, ".map_or(self.version, |at| at - 1);", ".map_or(self.version, |_| self.version);")],
+    ),
+    (
+        "a listing under a root passes a subtree detached beneath it",
+        [(WRITER, "*self.under.entry((*dir, at)).or_default() += 1;", "let _ = (dir, at);")],
+    ),
+    (
+        "a freed subtree holds back the listings under the directories above it",
+        [(WRITER, "*count -= 1;\n                if *count == 0 {", "if *count == 0 {")],
+    ),
+    (
+        "a listing under a root waits for the subtrees detached under others",
+        [(WRITER, ".range((root, 0)..=(root, Version::MAX))", ".iter()")],
+    ),
+    (
+        "a listing under a root reports the newest subtree detached beneath it",
+        [(WRITER, ".range((root, 0)..=(root, Version::MAX))\n            .next()", ".range((root, 0)..=(root, Version::MAX))\n            .next_back()")],
     ),
     (
         "a writer whose lease lapsed answers the listing it read",
