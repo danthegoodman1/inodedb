@@ -6,8 +6,11 @@
 //! through the harness's writer over the memory backend. It then times a
 //! commit that removes 50 empty directories under one tenant, none of them
 //! a key's root, with the freeing that follows it: the median of 20 such
-//! commits. The first row holds no keys, so it shows what the removal
-//! costs apart from the search for keys beneath what it removes.
+//! commits. The first of them searches for keys beneath what it removes,
+//! and leaves the writer the directories at and above the key roots; the
+//! others look their directories up among those. Last it times a commit
+//! that removes one tenant, a key's root, which searches every time: the
+//! median of 20 again. The first row holds no keys.
 
 use inodedb_core::auth::{Caller, Grant};
 use inodedb_core::types::ROOT;
@@ -18,8 +21,10 @@ const PARTS: usize = 50;
 const ROUNDS: usize = 20;
 
 fn main() {
-    println!("| Tenants | Keys | One commit removing {PARTS} directories |");
-    println!("| ---: | ---: | ---: |");
+    println!(
+        "| Tenants | Keys | One commit removing {PARTS} directories | One commit removing a tenant |"
+    );
+    println!("| ---: | ---: | ---: | ---: |");
     for (tenants, keyed) in [
         (10_000, false),
         (1_000, true),
@@ -50,10 +55,20 @@ fn main() {
             .collect();
         times.sort();
         assert_eq!(h.writer.detached(), 0);
+        let keys = h.writer.keys().len();
+        let mut tenants_gone: Vec<Duration> = (1..=ROUNDS)
+            .map(|n| {
+                let started = Instant::now();
+                h.ops([remove_all(&tenant(n))]);
+                started.elapsed()
+            })
+            .collect();
+        tenants_gone.sort();
+        assert_eq!(h.writer.detached(), 0);
         println!(
-            "| {tenants} | {} | {:.2} ms |",
-            h.writer.keys().len(),
-            times[ROUNDS / 2].as_secs_f64() * 1000.0
+            "| {tenants} | {keys} | {:.2} ms | {:.2} ms |",
+            times[ROUNDS / 2].as_secs_f64() * 1000.0,
+            tenants_gone[ROUNDS / 2].as_secs_f64() * 1000.0
         );
     }
 }

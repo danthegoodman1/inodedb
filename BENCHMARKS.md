@@ -353,16 +353,18 @@ Revocation follows each key's minted keys through an index, so its cost grows wi
 cargo run --release -p inodedb-tests --example detach
 ```
 
-Tenants, each a directory with two keys rooted at it, through the harness's writer over the memory backend. One commit removes 50 empty directories under one tenant, none of them a key's root, and the freeing follows: the median of 20 such commits. The first row holds no keys, so it shows what the removal costs apart from the search for keys beneath what it removes. "Before" is commit be669f1, which checked every key against every directory the commit detached.
+Tenants, each a directory with two keys rooted at it, through the harness's writer over the memory backend, with the freeing that follows each commit: the median of 20 commits. One commit removes 50 empty directories under one tenant, none of them a key's root. The other removes one tenant, which is a key's root. The first row holds no keys.
 
-| Tenants | Keys | Before | Now |
+| Tenants | Keys | Removing 50 directories | Removing a tenant |
 | ---: | ---: | ---: | ---: |
-| 10,000 | 0 | 0.27 ms | 0.22 ms |
-| 1,000 | 2,000 | 1.81 ms | 0.34 ms |
-| 10,000 | 20,000 | 19.67 ms | 1.32 ms |
-| 50,000 | 100,000 | 106.35 ms | 6.22 ms |
+| 10,000 | 0 | 0.19 ms | 0.01 ms |
+| 1,000 | 2,000 | 0.19 ms | 0.10 ms |
+| 10,000 | 20,000 | 0.21 ms | 1.10 ms |
+| 50,000 | 100,000 | 0.21 ms | 5.99 ms |
 
-The search follows each directory a key is rooted at up to the tree's root once for the commit, about 110 ns a root, whatever the commit detaches. Before, it cost about 20 ns for each pair of a key and a detached directory. These runs kept every record cached. From a cold cache the search before read one missing record a round and ran the batch again each time; it now asks for every record it lacks in one round per level (`keys::a_detach_reads_the_key_roots_a_cold_cache_lacks_in_rounds`: 9 rounds for 300 roots).
+The 50 directories lie outside the cover, the directories that hold or lie above a key's root, so their commit looks at no key and costs the same beside any number of keys. A tenant lies inside it, so its commit searches: it follows each directory a key is rooted at up to the tree's root once, about 110 ns a root, whatever the commit detaches. A writer's first detach searches too, whatever it removes, and leaves the cover.
+
+These runs kept every record cached. From a cold cache the search asks for every record it lacks in one round per level (`keys::a_detach_reads_the_key_roots_a_cold_cache_lacks_in_rounds`: 9 rounds for 300 roots).
 
 ## Freeing a subtree
 

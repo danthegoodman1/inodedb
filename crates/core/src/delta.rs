@@ -99,6 +99,14 @@ pub struct Delta {
     pub dropped: BTreeSet<(Ino, Version)>,
     pub request: Option<(u128, CommitResult)>,
     pub keys: BTreeMap<KeyId, Change<KeyRecord>>,
+    /// Directories that come to hold or lie above a key's root: where the
+    /// commit roots a key, and where it moves a directory that held or lay
+    /// above one. They join the writer's cover as it commits.
+    pub covers: BTreeSet<Ino>,
+    /// Every directory that holds or lies above a key's root, when the
+    /// commit searched for the keys beneath what it detached under a view
+    /// that knew no cover: the writer's cover from this commit on.
+    pub cover: Option<BTreeSet<Ino>>,
     /// Leases opened, whose records commit before the opening is answered.
     pub leases: BTreeMap<crate::lease::LeaseId, Option<crate::lease::StoredLease>>,
 }
@@ -276,6 +284,15 @@ impl Delta {
         auth::layered(base.keys_minted_by(id), self.key_layer(), |record| {
             record.minted_by == Some(id)
         })
+    }
+
+    /// Whether `dir` holds or lies above a key's root once the delta
+    /// applies, when the view beneath knows the directories that do.
+    pub fn covered(&self, base: &dyn View, dir: Ino) -> Option<bool> {
+        if self.covers.contains(&dir) {
+            return Some(true);
+        }
+        base.covers(dir)
     }
 
     /// Every directory a key is rooted at once the delta applies.
@@ -519,6 +536,10 @@ impl View for After<'_> {
 
     fn key_roots(&self) -> BTreeSet<Ino> {
         self.delta.key_roots(self.base)
+    }
+
+    fn covers(&self, dir: Ino) -> Option<bool> {
+        self.delta.covered(self.base, dir)
     }
 }
 

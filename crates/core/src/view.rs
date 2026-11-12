@@ -175,6 +175,11 @@ pub trait View {
     fn keys_minted_by(&self, id: KeyId) -> Vec<KeyId>;
     /// Every directory a key is rooted at.
     fn key_roots(&self) -> BTreeSet<Ino>;
+    /// Whether `dir` holds or lies above a key's root, for a view that
+    /// knows the directories that do: the writer's, once a search has
+    /// found them. Such a view may still count a directory that held or
+    /// lay above a root earlier.
+    fn covers(&self, dir: Ino) -> Option<bool>;
 }
 
 /// A ranged listing of a layer of changes over `base`. `changes` are the
@@ -271,6 +276,9 @@ mod tests {
             unreachable!()
         }
         fn key_roots(&self) -> BTreeSet<Ino> {
+            unreachable!()
+        }
+        fn covers(&self, _: Ino) -> Option<bool> {
             unreachable!()
         }
     }

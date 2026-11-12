@@ -33,6 +33,11 @@ pub struct Overlay {
     /// Detach records, by the version that detached each top.
     detach: BTreeMap<(Version, Ino), FreeChange>,
     dropped: BTreeMap<(Ino, Version), Version>,
+    /// Directories uncommitted batches bring to hold or lie above a key's
+    /// root, with the latest version that did.
+    covers: BTreeMap<Ino, Version>,
+    /// The cover the latest uncommitted search found, with its version.
+    cover: Option<(Version, BTreeSet<Ino>)>,
 }
 
 impl Overlay {
@@ -87,6 +92,12 @@ impl Overlay {
         for key in &delta.dropped {
             self.values.remove(key);
             self.dropped.insert(*key, version);
+        }
+        for dir in &delta.covers {
+            self.covers.insert(*dir, version);
+        }
+        if let Some(cover) = &delta.cover {
+            self.cover = Some((version, cover.clone()));
         }
     }
 
@@ -145,6 +156,14 @@ impl Overlay {
         self.free.retain(|_, (version, _)| *version > committed);
         self.detach.retain(|_, (version, _)| *version > committed);
         self.dropped.retain(|_, version| *version > committed);
+        self.covers.retain(|_, version| *version > committed);
+        if self
+            .cover
+            .as_ref()
+            .is_some_and(|(version, _)| *version <= committed)
+        {
+            self.cover = None;
+        }
     }
 
     pub fn clear(&mut self) {
@@ -316,6 +335,18 @@ impl View for Overlaid<'_> {
             }
         }
         roots
+    }
+
+    fn covers(&self, dir: Ino) -> Option<bool> {
+        if self.overlay.covers.contains_key(&dir) {
+            return Some(true);
+        }
+        // A search's cover holds what every batch before it covered; the
+        // batches after it add theirs above.
+        match &self.overlay.cover {
+            Some((_, cover)) => Some(cover.contains(&dir)),
+            None => self.base.covers(dir),
+        }
     }
 }
 

@@ -33,6 +33,10 @@ pub struct Input<'a> {
     /// The version the batch commits at if it changes anything.
     pub version: Version,
     pub next_ino: Ino,
+    /// Whether the batch runs ahead of its turn, for the reads it lacks
+    /// alone. Such a run leaves out the search for keys beneath what it
+    /// detaches, whose cost would recur each round the batch waits.
+    pub ahead: bool,
 }
 
 #[derive(Debug)]
@@ -119,7 +123,7 @@ pub fn execute(input: Input<'_>, base: &dyn View) -> Result<Executed, Vec<Read>>
     if needs.is_empty() {
         exec.finish_holders(&mut needs);
     }
-    if needs.is_empty() {
+    if needs.is_empty() && !input.ahead {
         exec.revoke_orphans(&mut needs);
     }
     if !needs.is_empty() {
@@ -207,25 +211,29 @@ pub fn execute_key(
                 Err(Halt::Fail(error)) => Some(KeyError::Fs(error)),
                 Ok((_, inode)) if inode.kind != Kind::Dir => Some(KeyError::Fs(Error::NotDir)),
                 Ok(_) if base.key(id).is_some() || base.key_retired(id) => Some(KeyError::Exists),
-                Ok((ino, _)) => {
-                    let mut expires = if *ttl == 0 {
-                        scope.expires
-                    } else {
-                        now.saturating_add(*ttl)
-                    };
-                    if scope.expires != 0 {
-                        expires = expires.min(scope.expires);
+                Ok((ino, _)) => match exec.cover_from(ino) {
+                    Err(Halt::Need(read)) => return Err(vec![read]),
+                    Err(Halt::Fail(error)) => Some(KeyError::Fs(error)),
+                    Ok(()) => {
+                        let mut expires = if *ttl == 0 {
+                            scope.expires
+                        } else {
+                            now.saturating_add(*ttl)
+                        };
+                        if scope.expires != 0 {
+                            expires = expires.min(scope.expires);
+                        }
+                        let record = KeyRecord {
+                            hash: *hash,
+                            root: ino,
+                            grant: *grant,
+                            expires,
+                            minted_by: scope.key,
+                        };
+                        exec.delta.set_key(id, None, Some(record));
+                        None
                     }
-                    let record = KeyRecord {
-                        hash: *hash,
-                        root: ino,
-                        grant: *grant,
-                        expires,
-                        minted_by: scope.key,
-                    };
-                    exec.delta.set_key(id, None, Some(record));
-                    None
-                }
+                },
             }
         }
         KeyOp::Revoke { id } => {
@@ -602,14 +610,20 @@ impl Exec<'_> {
     /// directory was empty, so only keys rooted at it go; a detached one
     /// takes every key rooted beneath it.
     ///
-    /// The search follows each directory a key is rooted at up toward the
-    /// root, and settles every directory it passes for the roots that
-    /// reach it later. Its cost is the number of directories that hold or
-    /// lie above a key's root, however many keys share a root and however
-    /// many directories the batch detached. Each round of reads asks for
-    /// the records the view lacks on the way, up to `MAX_READS` of them,
-    /// so a cold cache costs a round for each thousand roots at each level
-    /// rather than one for each root.
+    /// No key is rooted at or beneath a directory outside the cover, so a
+    /// batch whose detached directories all lie outside it searches for
+    /// nothing. The search runs when one lies inside, or while the view
+    /// knows no cover. It follows each directory a key is rooted at up
+    /// toward the root, and settles every directory it passes for the
+    /// roots that reach it later. Its cost is the number of directories
+    /// that hold or lie above a key's root, however many keys share a root
+    /// and however many directories the batch detached. Each round of
+    /// reads asks for the records the view lacks on the way, up to
+    /// `MAX_READS` of them, so a cold cache costs a round for each
+    /// thousand roots at each level rather than one for each root. A
+    /// search under a view that knows no cover leaves it one: the
+    /// directories it passed. Those beneath what the batch detached leave
+    /// the cover as the freeing reaches them.
     fn revoke_orphans(&mut self, needs: &mut BTreeSet<Read>) {
         let mut orphans = BTreeSet::new();
         for freed in &self.delta.freed {
@@ -617,7 +631,14 @@ impl Exec<'_> {
                 orphans.extend(self.delta.keys_rooted_at(self.base, *ino));
             }
         }
-        if !self.delta.detached.is_empty() {
+        let covered: Vec<Option<bool>> = self
+            .delta
+            .detached
+            .iter()
+            .map(|dir| self.delta.covered(self.base, *dir))
+            .collect();
+        let search = covered.iter().any(|covered| *covered != Some(false));
+        if search {
             let detached: BTreeSet<Ino> = self.delta.detached.iter().copied().collect();
             // Whether each directory passed lies at or beneath a detached one.
             let mut settled: BTreeMap<Ino, bool> = BTreeMap::new();
@@ -657,12 +678,50 @@ impl Exec<'_> {
                     orphans.extend(self.delta.keys_rooted_at(self.base, root));
                 }
             }
+            if needs.is_empty() && covered.contains(&None) {
+                let mut cover: BTreeSet<Ino> = settled.into_keys().collect();
+                cover.insert(ROOT);
+                self.delta.cover = Some(cover);
+            }
         }
         if needs.is_empty() {
             for id in orphans {
                 self.revoke(id);
             }
         }
+    }
+
+    /// Adds `dir` and the directories above it to the cover, when the
+    /// batch brings them to hold or lie above a key's root. It stops at a
+    /// directory the cover holds, since the cover holds the directories
+    /// above each one it holds. While the view knows no cover it adds
+    /// nothing: the next search finds the cover whole.
+    fn cover_from(&mut self, dir: Ino) -> Step<()> {
+        let mut found = Vec::new();
+        let mut current = dir;
+        while found.len() < MAX_DEPTH {
+            match self.delta.covered(self.base, current) {
+                None => return Ok(()),
+                Some(true) => break,
+                Some(false) => {}
+            }
+            found.push(current);
+            if current == ROOT {
+                break;
+            }
+            current = self.must_inode(current)?.parent;
+        }
+        self.delta.covers.extend(found);
+        Ok(())
+    }
+
+    /// Covers the directories above `parent` when a directory that holds
+    /// or lies above a key's root moves into it.
+    fn cover_move(&mut self, moved: Entry, parent: Ino) -> Step<()> {
+        if moved.kind == Kind::Dir && self.delta.covered(self.base, moved.child) == Some(true) {
+            self.cover_from(parent)?;
+        }
+        Ok(())
     }
 
     /// Whether a commit that has freed `freed` inodes of detached subtrees
@@ -1218,6 +1277,9 @@ impl Exec<'_> {
         };
         self.must_inode(from_dir)?;
         self.must_inode(to_dir)?;
+        if from_dir != to_dir {
+            self.cover_move(source, to_dir)?;
+        }
 
         self.put_entry(from_dir, from_name, None)?;
         let moved = self.entry_for(source.child, source.kind);
@@ -1282,6 +1344,10 @@ impl Exec<'_> {
         };
         self.must_inode(from_dir)?;
         self.must_inode(to_dir)?;
+        if from_dir != to_dir {
+            self.cover_move(source, to_dir)?;
+            self.cover_move(target, from_dir)?;
+        }
 
         let swapped_in = self.entry_for(target.child, target.kind);
         self.put_entry(from_dir, from_name, Some(swapped_in))?;

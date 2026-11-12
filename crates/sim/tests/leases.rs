@@ -230,9 +230,17 @@ fn a_writer_that_starts_over_keeps_the_leases_it_loads() {
     writer.set_now(1_000 + Config::default().lease_ttl);
     writer.commit_done(commit, CommitOutcome::Failed);
     let mut started = Harness::with_writer(h.storage.clone(), writer);
+    // Its first commit writes nothing against the lease: a writer over a
+    // copy of the store finds the lease there. A heartbeat would write the
+    // lease again, so none comes first.
+    started.ops([mkdir("after")]);
+    let mut beside = Harness::with(started.storage.copy_now(), Config::default());
+    let version = beside.writer.version();
+    beside
+        .beat(ADMIN, lease, version)
+        .expect("the lease stays in storage");
     let version = started.writer.version();
     started.beat(ADMIN, lease, version).expect("beats");
-    started.ops([mkdir("after")]);
     started.ops([mkdir("later")]);
     let mut next = Harness::with(started.storage.clone(), Config::default());
     let version = next.writer.version();

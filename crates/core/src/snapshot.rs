@@ -434,6 +434,10 @@ impl View for Current<'_> {
     fn key_roots(&self) -> BTreeSet<Ino> {
         self.cache.key_roots()
     }
+
+    fn covers(&self, _: Ino) -> Option<bool> {
+        None
+    }
 }
 
 /// The tree at a snapshot's version: undo records over the current state.
@@ -619,5 +623,9 @@ impl View for SnapshotView<'_> {
 
     fn key_roots(&self) -> BTreeSet<Ino> {
         self.current.key_roots()
+    }
+
+    fn covers(&self, _: Ino) -> Option<bool> {
+        None
     }
 }

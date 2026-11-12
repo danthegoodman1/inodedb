@@ -1422,6 +1422,12 @@ impl Writer {
         self.long_records.len()
     }
 
+    /// How many directories the writer counts as holding or lying above
+    /// a key's root, once a search has found them, for tests and metrics.
+    pub fn covered(&self) -> Option<usize> {
+        self.cache.covered()
+    }
+
     /// Ops run ahead of batches waiting on reads, for tests and metrics.
     pub fn read_ahead_ops(&self) -> u64 {
         self.read_ahead_ops
@@ -1558,6 +1564,7 @@ impl Writer {
                 now: self.now,
                 version: self.next_version,
                 next_ino: self.next_ino,
+                ahead: true,
             };
             if let Err(more) = exec::execute(input, &view) {
                 needs.extend(more);
@@ -1796,6 +1803,7 @@ impl Writer {
                     now: self.now,
                     version: self.next_version,
                     next_ino: self.next_ino,
+                    ahead: false,
                 },
                 &view,
             )?
