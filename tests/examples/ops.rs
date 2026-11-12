@@ -336,6 +336,7 @@ async fn bench<S: Storage + Clone>(backend: &str, storage: S, seconds: u64, chos
 }
 
 fn main() {
+    inodedb_server::keep_freed_memory();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(8)
         .thread_name("client")

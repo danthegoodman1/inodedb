@@ -86,8 +86,16 @@ async fn drive<S: Storage + Clone>(backend: &str, storage: S, ttl: u64, after: u
     report(backend, "while records expire", after as f64, during);
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    inodedb_server::keep_freed_memory();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("starts a runtime")
+        .block_on(run());
+}
+
+async fn run() {
     let mut args = std::env::args().skip(1);
     let ttl = args.next().and_then(|arg| arg.parse().ok()).unwrap_or(30);
     let after = args.next().and_then(|arg| arg.parse().ok()).unwrap_or(30);

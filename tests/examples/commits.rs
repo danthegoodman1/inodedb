@@ -83,8 +83,16 @@ fn report(backend: &str, grouping: &str, clients: usize, run: &Run) {
     );
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    inodedb_server::keep_freed_memory();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("starts a runtime")
+        .block_on(run());
+}
+
+async fn run() {
     let mut args = std::env::args().skip(1);
     let seconds = args.next().and_then(|arg| arg.parse().ok()).unwrap_or(3);
     let backends = args

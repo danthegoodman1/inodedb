@@ -24,6 +24,7 @@ inodedb-storage-lionturtle.workspace = true
 inodedb-storage-rocksdb = { workspace = true, optional = true }
 inodedb-storage-sqlite.workspace = true
 inodedb-transport.workspace = true
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 mimalloc = { version = "0.1.52", default-features = false }
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true

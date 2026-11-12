@@ -96,6 +96,7 @@ Grouping hides most of a sync's cost: at 128 clients it multiplies FoundationDB'
 - **Disk at open.** Opening a store writes its log files: 128 MiB on SQLite and 235 MiB on RocksDB. They stay at about that size whatever the store holds. lionturtle fills its log as it goes.
 - **A failed write on lionturtle.** It stops the store, which answers `Unavailable` until the server restarts and recovers from its log.
 - **Idle power.** A running server keeps every core out of idle states deeper than C1, which costs power. On EC2, a put on RocksDB took 9 times as long without that ([Idle states](BENCHMARKS.md#idle-states)). `shallow_idle = false` leaves the states alone.
+- **Memory.** A server keeps the memory it frees for its next allocations, so it holds the most it has used. Returning it stalled commits on lionturtle for 4 to 40 ms ([Sustained puts](BENCHMARKS.md#sustained-puts)). `keep_memory = false` returns it.
 - **Small values.** A file holds up to 64 KiB. Larger data belongs in object storage, with its location in the file.
 - **Replication.** Standbys need FoundationDB. SQLite, RocksDB and lionturtle keep one copy on one host.
 
@@ -174,6 +175,7 @@ The server reads one TOML file. Fields, with defaults:
 | `listen` | | The address to serve gRPC on |
 | `advertise` | `http://` and `listen` | The address standbys send clients to for this server |
 | `shallow_idle` | on | Keep every core out of idle states deeper than C1 while the server runs; it needs root or a device rule for `/dev/cpu_dma_latency` |
+| `keep_memory` | on | Keep freed memory for the server's next allocations, where the allocator would return it to the kernel |
 | `storage.backend` | | `memory`; `sqlite`, `rocksdb` or `lionturtle` with a `path`; or `fdb` with a `prefix` and an optional `cluster_file` |
 | `writer.group_max_bytes` | 9 MB | The most one group commits, under FoundationDB's 10 MB transaction limit |
 | `writer.request_ttl_ms` | 10 min | How long a request id answers retries |
