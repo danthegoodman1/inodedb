@@ -610,13 +610,9 @@ impl InodeDb for Service {
         let after = match &request.after[..] {
             [] => None,
             after => match keys::parse(after) {
-                Some(Parsed::Free(version, ino, value)) => Some((
-                    version,
-                    match value {
-                        Some(value) => Freed::Value(ino, value),
-                        None => Freed::Inode(ino),
-                    },
-                )),
+                Some(Parsed::Free(version, ino, value)) => {
+                    Some((version, Freed::named(ino, value)))
+                }
                 _ => return Err(Status::invalid_argument("not a cursor ListFreed gave")),
             },
         };

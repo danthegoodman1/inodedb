@@ -420,3 +420,129 @@ fn a_log_that_ends_before_the_head() {
         "the log ends at",
     );
 }
+
+/// A sound store whose free queue holds one entry: the file a/b/f, freed
+/// at `at`, which lies under a and b.
+fn queued() -> (Store, Version) {
+    let mut h = Harness::new();
+    h.ops([mkdir_p("a/b"), mkdir("c"), put("a/b/f", "value")]);
+    let ino = |h: &mut Harness, path| match h.stat(path) {
+        QueryResult::Stat { ino, .. } => ino,
+        other => panic!("{other:?}"),
+    };
+    let (a, b, f) = (ino(&mut h, "a"), ino(&mut h, "a/b"), ino(&mut h, "a/b/f"));
+    let at = h.ops([unlink("a/b/f")]).version;
+    let store = Store {
+        a,
+        b,
+        f,
+        pairs: h.storage.dump(),
+        log: h.storage.log_now(0, usize::MAX),
+    };
+    assert_eq!(problems(&store), Vec::<String>::new());
+    (store, at)
+}
+
+/// Breaks the store that holds a queue entry and checks fsck names the
+/// break.
+fn finds_queued(change: impl FnOnce(&mut Store, Version), expected: &str) {
+    let (mut store, at) = queued();
+    change(&mut store, at);
+    let found = problems(&store);
+    assert!(
+        found.iter().any(|problem| problem.contains(expected)),
+        "expected {expected:?} in {found:?}"
+    );
+}
+
+#[test]
+fn a_queue_entry_missing_under_a_directory_above_it() {
+    finds_queued(
+        |s, at| clear(s, &keys::free_under(s.a, at, s.f, None)),
+        "is missing under directory",
+    );
+}
+
+#[test]
+fn a_directory_holding_an_entry_the_queue_lacks() {
+    finds_queued(
+        |s, at| {
+            // Another inode's, which the queue never held.
+            set(s, keys::free_under(s.a, at, s.f + 100, None), Vec::new());
+        },
+        "that the queue lacks",
+    );
+}
+
+#[test]
+fn a_directory_holding_an_entry_that_names_another() {
+    finds_queued(
+        |s, at| set(s, keys::free_under(s.b + 1, at, s.f, None), Vec::new()),
+        "which doesn't name it",
+    );
+}
+
+#[test]
+fn the_root_holding_an_entry_under_it() {
+    finds_queued(
+        |s, at| set(s, keys::free_under(ROOT, at, s.f, None), Vec::new()),
+        "which doesn't name it",
+    );
+}
+
+#[test]
+fn a_key_under_a_directory_that_holds_a_value() {
+    finds_queued(
+        |s, at| {
+            let chain = inodedb_core::delta::encode_ancestors(&[ROOT]);
+            set(s, keys::free_under(s.b, at, s.f, None), chain);
+        },
+        "bytes under directory",
+    );
+}
+
+#[test]
+fn a_queue_kept_under_directories_from_past_the_head() {
+    finds_queued(
+        |s, _| {
+            set(
+                s,
+                keys::free_index(),
+                inodedb_core::writer::encode_indexed_from(u64::MAX),
+            )
+        },
+        "past the head",
+    );
+}
+
+#[test]
+fn directories_holding_entries_with_no_record_of_when_they_began() {
+    finds_queued(
+        |s, _| clear(s, &keys::free_index()),
+        "no record says from which version",
+    );
+}
+
+#[test]
+fn a_record_of_the_queues_parts_that_doesnt_decode() {
+    finds_queued(
+        |s, _| set(s, keys::free_index(), vec![0xff]),
+        "index record doesn't decode",
+    );
+}
+
+/// An entry freed before the queue kept its parts may lie under no
+/// directory.
+#[test]
+fn an_older_entry_under_no_directory_is_sound() {
+    let (mut store, at) = queued();
+    let (a, b, f) = (store.a, store.b, store.f);
+    clear(&mut store, &keys::free_under(a, at, f, None));
+    clear(&mut store, &keys::free_under(b, at, f, None));
+    set(
+        &mut store,
+        keys::free_index(),
+        inodedb_core::writer::encode_indexed_from(at),
+    );
+    assert_eq!(problems(&store), Vec::<String>::new());
+}

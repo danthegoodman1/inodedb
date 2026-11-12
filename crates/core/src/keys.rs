@@ -14,6 +14,7 @@ const VALUE: u8 = b'v';
 const ENTRY: u8 = b'e';
 const BACKPTR: u8 = b'p';
 const FREE: u8 = b'f';
+const UNDER: u8 = b'u';
 const DETACHED: u8 = b'd';
 const SYSTEM: u8 = b's';
 pub const LOG: u8 = b'l';
@@ -83,7 +84,49 @@ pub struct WriteSet {
     pub log: Vec<(Version, Vec<u8>)>,
 }
 
+/// The longest store prefix the charge for a write leaves room for.
+const STORE_PREFIX: usize = 16;
+/// What FoundationDB charges for each write beside its keys and value.
+const WRITE_CHARGE: usize = 72;
+/// A log entry's key within a store: a tag, a version and a chunk's number.
+const LOG_KEY: usize = 11;
+/// The most of a log entry one value holds.
+const LOG_CHUNK: usize = 100_000;
+
 impl WriteSet {
+    /// What FoundationDB counts toward a transaction's size for these
+    /// writes, in a store whose prefix holds up to 16 bytes. It counts a
+    /// key three times over when set, once written and twice in the range
+    /// that guards it from conflicts, and four times when cleared, with
+    /// about 72 bytes beside for each write (`BENCHMARKS.md`). A write of
+    /// a small key therefore costs several times its bytes, and a group of
+    /// such writes fits a transaction only by this count.
+    pub fn charged(&self) -> usize {
+        let writes: usize = self
+            .writes
+            .iter()
+            .map(|write| match write {
+                KvWrite::Set(key, value) => {
+                    3 * (key.len() + STORE_PREFIX) + value.len() + WRITE_CHARGE
+                }
+                KvWrite::Clear(key) => 4 * (key.len() + STORE_PREFIX) + WRITE_CHARGE,
+                KvWrite::ClearRange(range) => {
+                    2 * (range.start.len() + range.end.len() + 2 * STORE_PREFIX) + WRITE_CHARGE
+                }
+            })
+            .sum();
+        writes
+            + self
+                .log
+                .iter()
+                .map(|(_, entry)| {
+                    let chunks = entry.len().div_ceil(LOG_CHUNK).max(1);
+                    chunks * (3 * (LOG_KEY + STORE_PREFIX) + WRITE_CHARGE) + entry.len()
+                })
+                .sum::<usize>()
+    }
+
+    /// The bytes of the keys and values written.
     pub fn bytes(&self) -> usize {
         let writes: usize = self
             .writes
@@ -206,6 +249,25 @@ pub fn free_range() -> KeyRange {
     KeyRange::prefix(key(FREE, 0))
 }
 
+/// A free-queue entry again, under one of the directories it records above
+/// what it frees. Each directory's keys hold its part of the queue in the
+/// queue's own order, so a consumer rooted there reads its entries alone.
+pub fn free_under(dir: Ino, version: Version, ino: Ino, value: Option<Version>) -> Vec<u8> {
+    let mut key = free_under_prefix(dir);
+    key.extend_from_slice(&version.to_be_bytes());
+    key.extend_from_slice(&ino.to_be_bytes());
+    if let Some(value) = value {
+        key.extend_from_slice(&value.to_be_bytes());
+    }
+    key
+}
+
+fn free_under_prefix(dir: Ino) -> Vec<u8> {
+    let mut key = key(UNDER, 32);
+    key.extend_from_slice(&dir.to_be_bytes());
+    key
+}
+
 pub fn detached(version: Version, ino: Ino) -> Vec<u8> {
     let mut key = key(DETACHED, 16);
     key.extend_from_slice(&version.to_be_bytes());
@@ -324,14 +386,46 @@ pub fn free_after(after: Option<&[u8]>) -> KeyRange {
 }
 
 fn free_start(after: Option<&[u8]>) -> Vec<u8> {
+    start_after(after, key(FREE, 0))
+}
+
+/// The free-queue entries under `dir` freed at or before `version`, from
+/// `after` on.
+pub fn released_under(dir: Ino, after: Option<&[u8]>, version: Version) -> KeyRange {
+    let mut end = free_under_prefix(dir);
+    end.extend_from_slice(&(version + 1).to_be_bytes());
+    KeyRange {
+        start: start_after(after, free_under_prefix(dir)),
+        end,
+    }
+}
+
+/// The whole free queue under `dir` past `after`.
+pub fn free_under_after(dir: Ino, after: Option<&[u8]>) -> KeyRange {
+    let prefix = free_under_prefix(dir);
+    KeyRange {
+        end: prefix_end(&prefix),
+        start: start_after(after, prefix),
+    }
+}
+
+/// Where a scan resumes: just past `after`, or at `first`.
+fn start_after(after: Option<&[u8]>, first: Vec<u8>) -> Vec<u8> {
     match after {
         Some(key) => {
             let mut next = key.to_vec();
             next.push(0);
             next
         }
-        None => key(FREE, 0),
+        None => first,
     }
+}
+
+/// The version from which every free-queue entry has its keys under the
+/// directories above it: the store's version when a writer first kept
+/// them. Entries freed at or before it may have none.
+pub fn free_index() -> Vec<u8> {
+    system(b'q', 0)
 }
 
 /// The secret that handles' MACs are made under.
@@ -362,6 +456,8 @@ pub enum Parsed<'a> {
     Entry(Ino, &'a [u8]),
     Backptr(Ino, Ino, &'a [u8]),
     Free(Version, Ino, Option<Version>),
+    /// A free-queue entry under a directory above what it frees.
+    FreeUnder(Ino, Version, Ino, Option<Version>),
     Detached(Version, Ino),
     System(u8, &'a [u8]),
     Log,
@@ -386,6 +482,15 @@ pub fn parse(key: &[u8]) -> Option<Parsed<'_>> {
         FREE if rest.len() == 24 => {
             Parsed::Free(be64(rest)?, be64(&rest[8..])?, Some(be64(&rest[16..])?))
         }
+        UNDER if rest.len() == 24 => {
+            Parsed::FreeUnder(be64(rest)?, be64(&rest[8..])?, be64(&rest[16..])?, None)
+        }
+        UNDER if rest.len() == 32 => Parsed::FreeUnder(
+            be64(rest)?,
+            be64(&rest[8..])?,
+            be64(&rest[16..])?,
+            Some(be64(&rest[24..])?),
+        ),
         DETACHED if rest.len() == 16 => Parsed::Detached(be64(rest)?, be64(&rest[8..])?),
         SYSTEM if !rest.is_empty() => Parsed::System(rest[0], &rest[1..]),
         LOG => Parsed::Log,
@@ -412,6 +517,41 @@ mod tests {
             Some(Parsed::Free(4, 5, Some(2)))
         );
         assert_eq!(parse(&detached(4, 5)), Some(Parsed::Detached(4, 5)));
+        assert_eq!(
+            parse(&free_under(3, 4, 5, None)),
+            Some(Parsed::FreeUnder(3, 4, 5, None))
+        );
+        assert_eq!(
+            parse(&free_under(3, 4, 5, Some(2))),
+            Some(Parsed::FreeUnder(3, 4, 5, Some(2)))
+        );
+    }
+
+    #[test]
+    fn a_directorys_part_of_the_queue_scans_in_the_queues_order() {
+        let all = free_under_after(3, None);
+        assert!(all.contains(&free_under(3, 1, 9, None)));
+        assert!(all.contains(&free_under(3, u64::MAX, u64::MAX, Some(u64::MAX))));
+        assert!(!all.contains(&free_under(2, 9, 9, None)));
+        assert!(!all.contains(&free_under(4, 1, 1, None)));
+        // By version, then inode, as the queue itself runs.
+        assert!(free_under(3, 4, 9, None) < free_under(3, 5, 1, None));
+        assert!(free_under(3, 4, 5, None) < free_under(3, 4, 6, None));
+        // Released entries stop at the horizon.
+        let released = released_under(3, None, 4);
+        assert!(released.contains(&free_under(3, 4, 9, Some(2))));
+        assert!(!released.contains(&free_under(3, 5, 1, None)));
+        assert!(!released.contains(&free_under(4, 1, 1, None)));
+        // A scan resumes just past the last key it read.
+        let last = free_under(3, 4, 5, None);
+        let rest = released_under(3, Some(&last), 9);
+        assert!(!rest.contains(&last));
+        assert!(rest.contains(&free_under(3, 4, 5, Some(1))));
+        assert!(rest.contains(&free_under(3, 4, 6, None)));
+        let rest = free_under_after(3, Some(&last));
+        assert!(!rest.contains(&last));
+        assert!(rest.contains(&free_under(3, 4, 6, None)));
+        assert!(!rest.contains(&free_under(4, 1, 1, None)));
     }
 
     #[test]
@@ -425,6 +565,40 @@ mod tests {
         assert!(!after.contains(&entry(3, b"b")));
         assert!(after.contains(&entry(3, b"b\0")));
         assert!(after.contains(&entry(3, b"c")));
+    }
+
+    #[test]
+    fn writes_are_charged_as_foundationdb_charges_them() {
+        let charged = |writes: Vec<KvWrite>, log: Vec<(Version, Vec<u8>)>| {
+            let set = WriteSet { writes, log };
+            (set.bytes(), set.charged())
+        };
+        // A key three times over with its store prefix, and 72 bytes.
+        let small = free_under(3, 4, 5, None);
+        assert_eq!(small.len(), 26);
+        assert_eq!(
+            charged(vec![KvWrite::Set(small.clone(), Vec::new())], Vec::new()),
+            (26, 3 * (26 + 16) + 72)
+        );
+        // Four times over when cleared.
+        assert_eq!(
+            charged(vec![KvWrite::Clear(small)], Vec::new()),
+            (26, 4 * (26 + 16) + 72)
+        );
+        // A value once.
+        assert_eq!(
+            charged(vec![KvWrite::Set(inode(7), vec![0; 100])], Vec::new()),
+            (110, 3 * (10 + 16) + 100 + 72)
+        );
+        // A log entry by the chunks that hold it.
+        assert_eq!(
+            charged(Vec::new(), vec![(9, vec![0; 50])]),
+            (68, 3 * (11 + 16) + 72 + 50)
+        );
+        assert_eq!(
+            charged(Vec::new(), vec![(9, vec![0; 250_000])]).1,
+            3 * (3 * (11 + 16) + 72) + 250_000
+        );
     }
 
     #[test]

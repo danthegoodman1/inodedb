@@ -173,8 +173,8 @@ pub trait View {
     fn key_retired(&self, id: KeyId) -> bool;
     fn keys_rooted_at(&self, dir: Ino) -> Vec<KeyId>;
     fn keys_minted_by(&self, id: KeyId) -> Vec<KeyId>;
-    /// Every key, with its root.
-    fn key_roots(&self) -> Vec<(KeyId, Ino)>;
+    /// Every directory a key is rooted at.
+    fn key_roots(&self) -> BTreeSet<Ino>;
 }
 
 /// A ranged listing of a layer of changes over `base`. `changes` are the
@@ -270,7 +270,7 @@ mod tests {
         fn keys_minted_by(&self, _: KeyId) -> Vec<KeyId> {
             unreachable!()
         }
-        fn key_roots(&self) -> Vec<(KeyId, Ino)> {
+        fn key_roots(&self) -> BTreeSet<Ino> {
             unreachable!()
         }
     }

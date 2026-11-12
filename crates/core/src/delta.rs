@@ -4,7 +4,7 @@ use crate::auth::{self, KeyId, KeyRecord};
 use crate::codec::{Dec, DecodeError, Enc};
 use crate::keys::{self, WriteSet};
 use crate::ops::CommitResult;
-use crate::types::{Entry, Ino, Inode, Name, Version};
+use crate::types::{Entry, Ino, Inode, Name, ROOT, Version};
 use crate::view::{Lookup, View, layered_listing};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,6 +25,15 @@ pub enum Freed {
 }
 
 impl Freed {
+    /// What a free-queue key names by its inode and, when a value was
+    /// freed, the value's version.
+    pub fn named(ino: Ino, value: Option<Version>) -> Freed {
+        match value {
+            Some(value) => Freed::Value(ino, value),
+            None => Freed::Inode(ino),
+        }
+    }
+
     /// Its free-queue key under the version that freed it.
     pub fn key(self, version: Version) -> Vec<u8> {
         match self {
@@ -32,6 +41,22 @@ impl Freed {
             Freed::Value(ino, value) => keys::free(version, ino, Some(value)),
         }
     }
+
+    /// Its key in the part of the free queue under `dir`, a directory
+    /// above it.
+    pub fn key_under(self, dir: Ino, version: Version) -> Vec<u8> {
+        match self {
+            Freed::Inode(ino) => keys::free_under(dir, version, ino, None),
+            Freed::Value(ino, value) => keys::free_under(dir, version, ino, Some(value)),
+        }
+    }
+}
+
+/// The directories whose parts of the free queue hold an entry: those it
+/// records above what it frees, apart from the tree's root, whose part is
+/// the queue itself.
+pub fn queued_under(ancestors: &[Ino]) -> impl Iterator<Item = Ino> + '_ {
+    ancestors.iter().copied().filter(|dir| *dir != ROOT)
 }
 
 pub type Links = BTreeSet<(Ino, Name)>;
@@ -253,15 +278,24 @@ impl Delta {
         })
     }
 
-    pub fn key_roots(&self, base: &dyn View) -> Vec<(KeyId, Ino)> {
-        let mut roots: BTreeMap<KeyId, Ino> = base.key_roots().into_iter().collect();
-        for (id, change) in &self.keys {
-            match change.after {
-                Some(record) => roots.insert(*id, record.root),
-                None => roots.remove(id),
-            };
+    /// Every directory a key is rooted at once the delta applies.
+    pub fn key_roots(&self, base: &dyn View) -> BTreeSet<Ino> {
+        let mut roots = base.key_roots();
+        for change in self.keys.values() {
+            match (change.before, change.after) {
+                (_, Some(record)) => {
+                    roots.insert(record.root);
+                }
+                // The root of a key the delta deleted may hold no other.
+                (Some(deleted), None) => {
+                    if self.keys_rooted_at(base, deleted.root).is_empty() {
+                        roots.remove(&deleted.root);
+                    }
+                }
+                (None, None) => {}
+            }
         }
-        roots.into_iter().collect()
+        roots
     }
 
     /// Records a key's new state; `before` is its state ahead of this delta.
@@ -350,10 +384,15 @@ impl Delta {
         for ((ino, version), value) in &self.values {
             writes.set(keys::value(*ino, *version), value.to_vec());
         }
+        // An entry goes in the queue, and its key again under each
+        // directory above what it frees, so a consumer rooted at one finds
+        // its own entries alone.
         for freed in &self.freed {
-            let key = freed.key(self.version);
             let above = self.ancestors.get(freed).map_or(&[][..], Vec::as_slice);
-            writes.set(key, encode_ancestors(above));
+            for dir in queued_under(above) {
+                writes.set(freed.key_under(dir, self.version), Vec::new());
+            }
+            writes.set(freed.key(self.version), encode_ancestors(above));
         }
         for ino in &self.detached {
             let above = self.above.get(ino).map_or(&[][..], Vec::as_slice);
@@ -378,6 +417,9 @@ impl Delta {
         }
         for acked in &self.acked {
             writes.clear(acked.freed.key(acked.version));
+            for dir in queued_under(&acked.ancestors) {
+                writes.clear(acked.freed.key_under(dir, acked.version));
+            }
         }
         for (ino, version) in &self.dropped {
             writes.clear(keys::value(*ino, *version));
@@ -475,7 +517,42 @@ impl View for After<'_> {
         self.delta.keys_minted_by(self.base, id)
     }
 
-    fn key_roots(&self) -> Vec<(KeyId, Ino)> {
+    fn key_roots(&self) -> BTreeSet<Ino> {
         self.delta.key_roots(self.base)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{Grant, Keys};
+    use crate::cache::Cache;
+
+    fn record(root: Ino) -> KeyRecord {
+        KeyRecord {
+            hash: [7; 32],
+            root,
+            grant: Grant::Read,
+            expires: 0,
+            minted_by: None,
+        }
+    }
+
+    #[test]
+    fn key_roots_follow_the_keys_a_delta_mints_and_deletes() {
+        let mut keys = Keys::default();
+        keys.put(1, Some(record(5)));
+        keys.put(2, Some(record(5)));
+        keys.put(3, Some(record(6)));
+        let mut cache = Cache::new();
+        cache.load_keys(keys);
+        assert_eq!(cache.key_roots(), BTreeSet::from([5, 6]));
+        // One of the two keys at 5 goes, the only key at 6 goes, and 7
+        // gains one.
+        let mut delta = Delta::new(9);
+        delta.set_key(1, Some(record(5)), None);
+        delta.set_key(3, Some(record(6)), None);
+        delta.set_key(4, None, Some(record(7)));
+        assert_eq!(delta.key_roots(&cache), BTreeSet::from([5, 7]));
     }
 }

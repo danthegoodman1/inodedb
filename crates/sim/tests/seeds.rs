@@ -111,3 +111,20 @@ fn seed_15179128079008634066() {
 fn seed_16586037544200087192() {
     passes(16586037544200087192);
 }
+
+/// A writer crashed after committing a batch that made a file inside a
+/// subtree it went on to detach. Its successor freed the subtree in the
+/// commit that let the batch's reply go, so the model learned the file's
+/// inode after the freeing, kept counting the link, and took a listing's
+/// `freed_through` past the detach as too high. The model now takes each
+/// inode from the record its commit writes.
+#[test]
+fn seed_6959() {
+    passes(6959);
+}
+
+/// The same, on another run.
+#[test]
+fn seed_9832() {
+    passes(9832);
+}

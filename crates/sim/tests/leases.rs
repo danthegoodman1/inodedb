@@ -2,10 +2,11 @@
 
 use inodedb_core::auth::{Caller, Grant};
 use inodedb_core::delta::Freed;
+use inodedb_core::keys::KvRead;
 use inodedb_core::lease::{ClaimError, LeaseError};
 use inodedb_core::query::{Query, QueryResult, Target};
 use inodedb_core::types::{Error, Ino, ROOT};
-use inodedb_core::writer::{Action, CommitOutcome, Config, Writer};
+use inodedb_core::writer::{Action, Answer, CommitOutcome, Config, Writer};
 use inodedb_sim::harness::*;
 use inodedb_storage::Memory;
 
@@ -340,6 +341,35 @@ fn a_listing_holds_every_entry_and_claims_none() {
     assert_eq!(listed(&h.list_freed(ADMIN, None, 10)), [Freed::Inode(b)]);
 }
 
+/// A listing under a directory holds what a listing of the whole queue
+/// would: entries a lease holds, and entries a consumer claimed.
+#[test]
+fn a_listing_under_a_directory_holds_every_entry_and_claims_none() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t"), put("t/a", "1"), put("t/b", "2")]);
+    let (a, b) = (ino(&mut h, "t/a"), ino(&mut h, "t/b"));
+    let at_t = Caller::Trusted(ino(&mut h, "t"));
+    h.ops([unlink("t/a")]);
+    let at = h.writer.version();
+    h.open_lease(ADMIN, at).expect("opens");
+    h.ops([unlink("t/b")]);
+    assert_eq!(
+        listed(&h.list_freed(at_t, None, 10)),
+        [Freed::Inode(a), Freed::Inode(b)]
+    );
+    let (_, claimed) = h.claim(at_t, 10);
+    assert_eq!(
+        claimed.iter().map(|entry| entry.freed).collect::<Vec<_>>(),
+        [Freed::Inode(a)],
+        "the listing claimed nothing, and the lease holds b"
+    );
+    assert_eq!(
+        listed(&h.list_freed(at_t, None, 10)),
+        [Freed::Inode(a), Freed::Inode(b)],
+        "a claimed entry stays listed"
+    );
+}
+
 #[test]
 fn a_listing_holds_a_replaced_value() {
     let mut h = Harness::new();
@@ -382,6 +412,7 @@ fn listings_stay_under_their_root_and_page_through_the_queue() {
         let page = h.list_freed(at_t, after, 1);
         assert!(page.entries.len() <= 1, "{page:?}");
         seen.extend(listed(&page));
+        assert!(seen.len() <= 2, "the listing goes round: {seen:?}");
         match page.next {
             Some(next) => after = Some(next),
             None => break,
@@ -428,4 +459,426 @@ fn a_listing_reports_freeing_done_only_past_every_detached_subtree() {
     assert_eq!(page.freed_through, page.version);
     assert!(page.freed_through > detach.version);
     assert_eq!(page.entries.len(), 2, "the subtree's top and its file");
+}
+
+/// A queue that holds one consumer's entries behind thousands of another's.
+fn a_long_queue() -> (Harness, Caller, [Ino; 2]) {
+    let mut h = Harness::new();
+    h.ops([mkdir_p("t/a"), mkdir("u")]);
+    for chunk in 0..3 {
+        h.ops((0..1_000).map(|n| put(&format!("u/f{chunk}-{n}"), "v")));
+        h.ops((0..1_000).map(|n| unlink(&format!("u/f{chunk}-{n}"))));
+    }
+    h.ops([put("t/x", "1"), put("t/a/y", "2")]);
+    let mine = [ino(&mut h, "t/x"), ino(&mut h, "t/a/y")];
+    h.ops([unlink("t/x"), unlink("t/a/y")]);
+    let at_t = h.mint(ADMIN, "t", Grant::Write, 0);
+    (h, at_t, mine)
+}
+
+/// A consumer reads the part of the queue under its root, however much
+/// the queue holds for others.
+#[test]
+fn a_claim_reads_its_own_roots_entries_alone() {
+    let (mut h, at_t, [x, y]) = a_long_queue();
+    assert!(h.writer.queue_indexed());
+    let before = h.reads;
+    let (claim, mine) = h.claim(at_t, 10);
+    assert_eq!(
+        mine.iter().map(|entry| entry.freed).collect::<Vec<_>>(),
+        [Freed::Inode(x), Freed::Inode(y)]
+    );
+    assert_eq!(
+        h.reads - before,
+        2,
+        "a page of its part of the queue, then its two entries' records"
+    );
+    h.ack(at_t, claim, &mine).expect("acknowledges");
+    let before = h.reads;
+    assert_eq!(h.claim(at_t, 10).1, []);
+    assert_eq!(h.reads - before, 1);
+    // The root's consumer reads the queue itself.
+    let before = h.reads;
+    assert_eq!(h.claim(ADMIN, 10).1.len(), 10);
+    assert_eq!(h.reads - before, 1);
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn a_listing_reads_its_own_roots_entries_alone() {
+    let (mut h, at_t, [x, y]) = a_long_queue();
+    let before = h.reads;
+    let page = h.list_freed(at_t, None, 10);
+    assert_eq!(listed(&page), [Freed::Inode(x), Freed::Inode(y)]);
+    assert_eq!(page.next, None, "its first page reaches its entries' end");
+    assert_eq!(h.reads - before, 2);
+    // A page of the whole queue covers a page's worth of other entries.
+    assert_eq!(h.list_freed(ADMIN, None, 2_000).entries.len(), 1_024);
+}
+
+/// An entry lies under every directory above what it freed: each one's
+/// consumer finds it, and an acknowledgement takes it from them all.
+#[test]
+fn an_entry_is_queued_under_every_directory_above_it() {
+    let mut h = Harness::new();
+    h.ops([mkdir_p("t/a/b"), mkdir_p("u/c"), put("t/a/b/f", "v")]);
+    let f = ino(&mut h, "t/a/b/f");
+    // A value that `Put` replaces lies under every directory holding a
+    // link to its file.
+    h.ops([put("t/a/g", "old"), link("t/a/g", "u/c/g")]);
+    let g = ino(&mut h, "t/a/g");
+    let QueryResult::Stat { inode, .. } = h.stat("t/a/g") else {
+        panic!()
+    };
+    h.ops([unlink("t/a/b/f"), put("u/c/g", "new")]);
+    let roots = ["t", "t/a", "t/a/b", "u", "u/c"].map(|root| (root, ino(&mut h, root)));
+    let mut under = |root: Ino| listed(&h.list_freed(Caller::Trusted(root), None, 10));
+    let (file, value) = (Freed::Inode(f), Freed::Value(g, inode.value));
+    for (path, root) in roots {
+        let expected = match path {
+            "t" | "t/a" => vec![file, value],
+            "t/a/b" => vec![file],
+            _ => vec![value],
+        };
+        assert_eq!(under(root), expected, "under {path}");
+    }
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+    // A consumer deep in the tree acknowledges the file's entry, and one
+    // beside it the value's.
+    let at_b = Caller::Trusted(roots[2].1);
+    let (claim, entries) = h.claim(at_b, 10);
+    assert_eq!(entries.len(), 1);
+    h.ack(at_b, claim, &entries).expect("acknowledges");
+    let at_c = Caller::Trusted(roots[4].1);
+    let (claim, entries) = h.claim(at_c, 10);
+    assert_eq!(entries.len(), 1);
+    h.ack(at_c, claim, &entries).expect("acknowledges");
+    for (path, root) in roots {
+        assert_eq!(
+            listed(&h.list_freed(Caller::Trusted(root), None, 10)),
+            [],
+            "under {path}"
+        );
+    }
+    assert_eq!(h.list_freed(ADMIN, None, 10).entries, []);
+    let stored = h.storage.dump();
+    assert!(
+        stored.iter().all(|(key, _)| !matches!(
+            inodedb_core::keys::parse(key),
+            Some(inodedb_core::keys::Parsed::FreeUnder(..))
+        )),
+        "nothing of the entries is left under a directory"
+    );
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// A root's next claim goes on from the last key its last one examined in
+/// its part of the queue, and back to the part's start once it reaches
+/// the end, for what earlier claims let go.
+#[test]
+fn a_roots_claims_go_on_through_its_part_of_the_queue() {
+    const FILES: usize = 1_100;
+    let config = Config {
+        claim_ttl: 1_000,
+        ..Config::default()
+    };
+    let mut h = Harness::with(Memory::new(), config);
+    h.ops([mkdir("t"), mkdir("u")]);
+    h.ops((0..FILES).map(|n| put(&format!("t/f{n:04}"), "v")));
+    h.ops((0..FILES).map(|n| put(&format!("u/f{n:04}"), "v")));
+    let files: Vec<Ino> = (0..FILES)
+        .map(|n| ino(&mut h, &format!("t/f{n:04}")))
+        .collect();
+    h.ops((0..FILES).map(|n| unlink(&format!("t/f{n:04}"))));
+    h.ops((0..FILES).map(|n| unlink(&format!("u/f{n:04}"))));
+    let at_t = Caller::Trusted(ino(&mut h, "t"));
+    let inodes = |entries: &[inodedb_core::lease::FreeEntry]| -> Vec<Ino> {
+        entries.iter().map(ino_of_freed).collect()
+    };
+    // A claim takes the part's first entries: a page of keys, then the
+    // records of the two it names.
+    let before = h.reads;
+    let (_, first) = h.claim(at_t, 2);
+    assert_eq!(inodes(&first), files[..2]);
+    assert_eq!(h.reads - before, 2);
+    let (_, second) = h.claim(at_t, 2);
+    assert_eq!(inodes(&second), files[2..4]);
+    // Both claims run out. The next goes on from the cursor all the same,
+    // passing nothing between.
+    h.tick(1_000);
+    let (_, third) = h.claim(at_t, 10);
+    assert_eq!(inodes(&third), files[4..14]);
+    // A claim for everything reads on through the part's pages to its
+    // end, then goes back to the start for what the first two let go.
+    let (_, fourth) = h.claim(at_t, FILES);
+    assert_eq!(fourth.len(), FILES - 10);
+    assert_eq!(inodes(&fourth)[..FILES - 14], files[14..]);
+    assert_eq!(inodes(&fourth)[FILES - 14..], files[..4]);
+    assert_eq!(h.claim(at_t, 10).1, []);
+}
+
+/// A claim for more than a page of its root's part holds reads on through
+/// the part.
+#[test]
+fn a_claim_reads_on_through_its_part_until_it_has_its_fill() {
+    const FILES: usize = 1_100;
+    let mut h = Harness::new();
+    h.ops([mkdir("t")]);
+    h.ops((0..FILES).map(|n| put(&format!("t/f{n:04}"), "v")));
+    h.ops((0..FILES).map(|n| unlink(&format!("t/f{n:04}"))));
+    let at_t = Caller::Trusted(ino(&mut h, "t"));
+    let before = h.reads;
+    let (_, mine) = h.claim(at_t, 1_050);
+    assert_eq!(mine.len(), 1_050);
+    assert_eq!(
+        h.reads - before,
+        4,
+        "two pages of the part, and the records each named"
+    );
+}
+
+/// Runs the writer until it asks for the records of the entries a page of
+/// a root's part of the queue named, and returns that read unanswered.
+fn until_it_reads_records(h: &mut Harness) -> (u64, Vec<KvRead>) {
+    loop {
+        let actions = h.writer.drain();
+        assert!(!actions.is_empty(), "the writer reads the records");
+        for action in actions {
+            match action {
+                Action::Read { id, reads } if matches!(reads.get(1), Some(KvRead::Get(_))) => {
+                    return (id, reads);
+                }
+                Action::Read { id, reads } => {
+                    let results = h.storage.read_now(&reads);
+                    h.writer.read_done(id, results);
+                }
+                other => panic!("the writer asked for {other:?}"),
+            }
+        }
+    }
+}
+
+/// A claim and a listing under a directory read their entries' records
+/// after the keys that name them. An entry acknowledged in between is gone,
+/// and stays out of both.
+#[test]
+fn an_entry_acknowledged_as_a_claim_or_a_listing_reads_stays_out_of_it() {
+    let config = Config {
+        claim_ttl: 1_000,
+        ..Config::default()
+    };
+    let mut h = Harness::with(Memory::new(), config);
+    h.ops([mkdir("t"), mkdir("u")]);
+    h.ops((0..4).map(|n| put(&format!("t/f{n}"), "v")));
+    let files: Vec<Ino> = (0..4).map(|n| ino(&mut h, &format!("t/f{n}"))).collect();
+    h.ops((0..4).map(|n| unlink(&format!("t/f{n}"))));
+    let at_t = Caller::Trusted(ino(&mut h, "t"));
+    // Storage holds the release horizon before the scripted claims.
+    let at_u = Caller::Trusted(ino(&mut h, "u"));
+    assert_eq!(h.claim(at_u, 1).1, []);
+    for listing in [false, true] {
+        let token = h.token();
+        if listing {
+            h.writer.list_freed(token, at_t, None, 10);
+        } else {
+            h.writer.claim(token, at_t, 10);
+        }
+        let (id, reads) = until_it_reads_records(&mut h);
+        // The root's consumer claims the queue's first entry and
+        // acknowledges it.
+        let (claim, first) = h.claim(ADMIN, 1);
+        assert_eq!(first.len(), 1);
+        let gone = ino_of_freed(&first[0]);
+        h.ack(ADMIN, claim, &first).expect("acknowledges");
+        let results = h.storage.read_now(&reads);
+        h.writer.read_done(id, results);
+        h.run();
+        let entries = match h.answer(token) {
+            Answer::Claimed { entries, .. } | Answer::FreeQueue { entries, .. } => entries,
+            other => panic!("{other:?}"),
+        };
+        let left: Vec<Ino> = entries.iter().map(ino_of_freed).collect();
+        assert!(!left.contains(&gone), "{gone} in {left:?}");
+        assert_eq!(left.len(), if listing { 2 } else { 3 });
+        assert!(left.iter().all(|file| files.contains(file)));
+        // The claim's hold on the rest runs out before the listing's turn.
+        h.tick(1_000);
+    }
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// A claim whose named entry is acknowledged before it reads the entry's
+/// record goes on through its part of the queue for another.
+#[test]
+fn a_claim_goes_on_past_an_entry_acknowledged_as_it_read() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t"), mkdir("u")]);
+    h.ops((0..3).map(|n| put(&format!("t/f{n}"), "v")));
+    let files: Vec<Ino> = (0..3).map(|n| ino(&mut h, &format!("t/f{n}"))).collect();
+    h.ops((0..3).map(|n| unlink(&format!("t/f{n}"))));
+    let at_t = Caller::Trusted(ino(&mut h, "t"));
+    let at_u = Caller::Trusted(ino(&mut h, "u"));
+    assert_eq!(h.claim(at_u, 1).1, []);
+    let token = h.token();
+    h.writer.claim(token, at_t, 1);
+    let (id, reads) = until_it_reads_records(&mut h);
+    assert_eq!(
+        reads.len(),
+        2,
+        "the head, and the one entry the claim named"
+    );
+    let (claim, first) = h.claim(ADMIN, 1);
+    assert_eq!(
+        first.iter().map(ino_of_freed).collect::<Vec<_>>(),
+        [files[0]]
+    );
+    h.ack(ADMIN, claim, &first).expect("acknowledges");
+    let results = h.storage.read_now(&reads);
+    h.writer.read_done(id, results);
+    h.run();
+    let Answer::Claimed { entries, .. } = h.answer(token) else {
+        panic!("the claim answers")
+    };
+    assert_eq!(
+        entries.iter().map(ino_of_freed).collect::<Vec<_>>(),
+        [files[1]],
+        "the next entry of its part"
+    );
+}
+
+/// Strips a store back to what a writer from before the queue kept its
+/// parts under directories left: no key under a directory, and no record
+/// of when they began.
+fn as_an_earlier_writer_left_it(storage: &Memory) {
+    let mut writes = inodedb_core::keys::WriteSet::default();
+    for (key, _) in storage.dump() {
+        if matches!(
+            inodedb_core::keys::parse(&key),
+            Some(inodedb_core::keys::Parsed::FreeUnder(..))
+        ) {
+            writes.clear(key);
+        }
+    }
+    writes.clear(inodedb_core::keys::free_index());
+    let head = storage.head_now();
+    assert_eq!(
+        storage.commit_now(head.as_deref(), &writes),
+        CommitOutcome::Committed
+    );
+}
+
+/// A store an earlier writer filled holds entries under no directory. A
+/// consumer finds them in the whole queue until they are gone, and reads
+/// its root's own part from then on.
+#[test]
+fn a_store_from_before_the_queue_had_parts_keeps_its_entries_claimable() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t"), mkdir("u")]);
+    h.ops([put("t/old", "1"), put("u/old", "2"), put("t/new", "3")]);
+    let (old, new) = (ino(&mut h, "t/old"), ino(&mut h, "t/new"));
+    h.ops([unlink("t/old"), unlink("u/old")]);
+    as_an_earlier_writer_left_it(&h.storage);
+    let config = Config {
+        claim_ttl: 1_000,
+        ..Config::default()
+    };
+    let mut h = Harness::with(h.storage.clone(), config);
+    let at_t = Caller::Trusted(ino(&mut h, "t"));
+    assert!(!h.writer.queue_indexed(), "older entries remain");
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+    // What this writer frees lies under its directories at once.
+    h.ops([unlink("t/new")]);
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+    // A listing and a claim from the queue's start see the older entries
+    // and go on reading the whole queue.
+    assert_eq!(
+        listed(&h.list_freed(at_t, None, 10)),
+        [Freed::Inode(old), Freed::Inode(new)]
+    );
+    // A page from past the older entries says nothing of them.
+    let all = h.list_freed(ADMIN, None, 10);
+    assert_eq!(all.entries.len(), 3);
+    let rest = h.list_freed(ADMIN, Some(all.entries[1].key()), 10);
+    assert_eq!(listed(&rest), [Freed::Inode(new)]);
+    assert!(!h.writer.queue_indexed());
+    let (claim, mine) = h.claim(at_t, 1);
+    assert_eq!(mine.iter().map(ino_of_freed).collect::<Vec<_>>(), [old]);
+    assert!(!h.writer.queue_indexed());
+    h.ack(at_t, claim, &mine).expect("acknowledges");
+    // The root's consumer takes the other older entry. The next read from
+    // the queue's start finds none left.
+    let (claim, theirs) = h.claim(ADMIN, 1);
+    assert_eq!(theirs.len(), 1);
+    h.ack(ADMIN, claim, &theirs).expect("acknowledges");
+    assert!(
+        !h.writer.queue_indexed(),
+        "no read has seen the queue since"
+    );
+    assert_eq!(listed(&h.list_freed(ADMIN, None, 10)), [Freed::Inode(new)]);
+    assert!(h.writer.queue_indexed());
+    // A claim under t reads t's part from its start: t's cursor names a
+    // key of the whole queue, which says nothing of that part.
+    let before = h.reads;
+    let (_, mine) = h.claim(at_t, 1);
+    assert_eq!(mine.iter().map(ino_of_freed).collect::<Vec<_>>(), [new]);
+    assert_eq!(h.reads - before, 2);
+    // A writer that starts over the store finds the record and the queue
+    // whole.
+    let h = Harness::with(h.storage.clone(), Config::default());
+    assert!(h.writer.queue_indexed());
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn a_claim_from_the_queues_start_shows_a_store_from_before_holds_nothing_older() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t"), put("t/old", "1"), put("t/new", "2")]);
+    let new = ino(&mut h, "t/new");
+    h.ops([unlink("t/old")]);
+    as_an_earlier_writer_left_it(&h.storage);
+    let config = Config {
+        claim_ttl: 1_000,
+        ..Config::default()
+    };
+    let mut h = Harness::with(h.storage.clone(), config);
+    let at_t = Caller::Trusted(ino(&mut h, "t"));
+    h.ops([unlink("t/new")]);
+    // The root's consumer claims both entries and acknowledges the older.
+    let (claim, both) = h.claim(ADMIN, 10);
+    assert_eq!(both.len(), 2);
+    h.ack(ADMIN, claim, &both[..1]).expect("acknowledges");
+    h.tick(1_000);
+    assert!(!h.writer.queue_indexed());
+    let (_, mine) = h.claim(at_t, 10);
+    assert_eq!(mine.iter().map(ino_of_freed).collect::<Vec<_>>(), [new]);
+    assert!(h.writer.queue_indexed());
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+#[test]
+fn an_empty_listing_shows_a_store_from_before_holds_nothing_older() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t"), put("t/f", "v")]);
+    h.ops([unlink("t/f")]);
+    as_an_earlier_writer_left_it(&h.storage);
+    let mut h = Harness::with(h.storage.clone(), Config::default());
+    assert!(!h.writer.queue_indexed());
+    let (claim, entries) = h.claim(ADMIN, 10);
+    h.ack(ADMIN, claim, &entries).expect("acknowledges");
+    assert!(!h.writer.queue_indexed());
+    assert_eq!(h.list_freed(ADMIN, None, 10).entries, []);
+    assert!(h.writer.queue_indexed());
+}
+
+#[test]
+fn a_store_whose_queue_is_empty_has_nothing_older() {
+    let mut h = Harness::new();
+    h.ops([mkdir("t"), put("t/f", "v")]);
+    as_an_earlier_writer_left_it(&h.storage);
+    let mut h = Harness::with(h.storage.clone(), Config::default());
+    assert!(h.writer.queue_indexed());
+    let at_t = Caller::Trusted(ino(&mut h, "t"));
+    h.ops([unlink("t/f")]);
+    assert_eq!(h.claim(at_t, 10).1.len(), 1);
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
