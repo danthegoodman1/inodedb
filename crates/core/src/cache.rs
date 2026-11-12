@@ -263,6 +263,13 @@ pub struct Cache {
     request_ids: Option<BTreeSet<u128>>,
     /// Every key, in the writer's cache; keys are never evicted.
     keys: Keys,
+    /// Every directory that holds or lies above a key's root, once a
+    /// commit's search has found them, and until then nothing. Commits add
+    /// the directories they bring above a root and take out those they
+    /// free, so the set holds each such directory and may hold others
+    /// that held or lay above a root earlier. It is never evicted. A
+    /// cache that follows the log runs no search, so it holds none.
+    cover: Option<BTreeSet<Ino>>,
     /// Freed inodes' free-queue entries, by inode, with the version that
     /// freed each; they go with their inode's record.
     free: BTreeMap<Ino, (Version, Option<Vec<Ino>>)>,
@@ -402,6 +409,11 @@ impl Cache {
 
     pub fn keys(&self) -> &Keys {
         &self.keys
+    }
+
+    /// How many directories the cover holds, once a search has found it.
+    pub fn covered(&self) -> Option<usize> {
+        self.cover.as_ref().map(BTreeSet::len)
     }
 
     /// Forgets the tree as a cache with no room would, sparing what it
@@ -636,6 +648,19 @@ impl Cache {
         for (id, change) in &delta.keys {
             self.keys.put(*id, change.after);
         }
+        if let Some(cover) = &delta.cover {
+            self.cover = Some(cover.clone());
+        }
+        if let Some(cover) = &mut self.cover {
+            cover.extend(&delta.covers);
+            // A freed directory is empty or lies in a detached subtree, so
+            // no root lies at or beneath it again.
+            for freed in &delta.freed {
+                if let Freed::Inode(ino) = freed {
+                    cover.remove(ino);
+                }
+            }
+        }
         for acked in &delta.acked {
             if let Freed::Inode(ino) = acked.freed {
                 self.free.remove(&ino);
@@ -814,6 +839,10 @@ impl View for Cache {
 
     fn key_roots(&self) -> BTreeSet<Ino> {
         self.keys.roots()
+    }
+
+    fn covers(&self, dir: Ino) -> Option<bool> {
+        self.cover.as_ref().map(|cover| cover.contains(&dir))
     }
 }
 

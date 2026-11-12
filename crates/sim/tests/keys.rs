@@ -4,7 +4,7 @@
 use inodedb_core::Bytes;
 use inodedb_core::auth::{Caller, Denied, Grant, KeyError, KeyId, KeyOp, KeyRecord};
 use inodedb_core::exec::{self, Input};
-use inodedb_core::ops::{Batch, CommitResult, Outcome, Skip};
+use inodedb_core::ops::{Batch, CommitResult, Outcome, RenameFlag, Skip};
 use inodedb_core::query::{Query, QueryResult, Target};
 use inodedb_core::types::{Entry, Error, Ino, Inode, Name, ROOT, Version};
 use inodedb_core::view::{Lookup, View};
@@ -347,6 +347,9 @@ impl View for Counting<'_> {
             self.base.key_roots()
         }
     }
+    fn covers(&self, dir: Ino) -> Option<bool> {
+        self.base.covers(dir)
+    }
 }
 
 #[test]
@@ -380,6 +383,7 @@ fn a_detach_looks_up_each_key_root_once_however_many_directories_go() {
             now: h.now,
             version: h.writer.version() + 1,
             next_ino: h.writer.head().next_ino,
+            ahead: false,
         };
         let executed = exec::execute(input, &view).expect("the cache holds the tree");
         assert_eq!(executed.delta.detached.len(), PARTS);
@@ -418,6 +422,339 @@ fn a_detach_reads_the_key_roots_a_cold_cache_lacks_in_rounds() {
     );
     assert_eq!(h.writer.keys().len(), ROOTS);
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// Tenants `a/tN`, each a key's root, under a writer whose first detach
+/// has searched for keys and left it the directories at and above the
+/// roots.
+fn covered(tenants: usize) -> Harness {
+    let mut h = Harness::new();
+    h.ops((0..tenants).map(|n| mkdir_p(&format!("a/t{n}"))));
+    h.ops([mkdir("scrap")]);
+    for n in 0..tenants {
+        h.mint(ADMIN, &format!("a/t{n}"), Grant::Read, 0);
+    }
+    assert_eq!(h.writer.covered(), None);
+    h.ops([remove_all("scrap")]);
+    // The tenants, `a` and the tree's root.
+    assert_eq!(h.writer.covered(), Some(tenants + 2));
+    h
+}
+
+fn gone(h: &mut Harness, key: Caller) -> bool {
+    denied(&stat_as(h, key, Target::Path(p("")))) == Some(Denied::Unknown)
+}
+
+/// Once a search has found the directories at and above the key roots, a
+/// detach of directories outside them looks at no root.
+#[test]
+fn a_detach_outside_every_key_root_searches_for_no_keys() {
+    const TENANTS: usize = 200;
+    const PARTS: usize = 50;
+    let mut h = covered(TENANTS);
+    h.ops((0..PARTS).map(|n| mkdir_p(&format!("a/t0/parts/p{n}"))));
+    let batch = Batch {
+        ops: (0..PARTS)
+            .map(|n| remove_all(&format!("a/t0/parts/p{n}")))
+            .collect(),
+        ..Batch::default()
+    };
+    let lookups = |keyless: bool| {
+        let view = Counting {
+            base: h.writer.cache(),
+            keyless,
+            inodes: Cell::new(0),
+        };
+        let input = Input {
+            batch: &batch,
+            root: ROOT,
+            now: h.now,
+            version: h.writer.version() + 1,
+            next_ino: h.writer.head().next_ino,
+            ahead: false,
+        };
+        let executed = exec::execute(input, &view).expect("the cache holds the tree");
+        assert_eq!(executed.delta.detached.len(), PARTS);
+        assert!(executed.delta.keys.is_empty(), "no key lies beneath a part");
+        view.inodes.get()
+    };
+    assert_eq!(lookups(false), lookups(true));
+    // A directory beneath a root lies outside them too, and the commit
+    // leaves the keys and the cover as they were.
+    let result = h.commit(batch);
+    assert!(result.outcomes.iter().all(Outcome::applied));
+    assert!(h.key_deletions().is_empty());
+    assert_eq!(h.writer.keys().len(), TENANTS);
+    assert_eq!(h.writer.covered(), Some(TENANTS + 2));
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// A key minted after the search brings its root, and the directories
+/// above it, among those a detach searches under.
+#[test]
+fn a_detach_takes_a_key_minted_since_the_search() {
+    let mut h = covered(3);
+    h.ops([mkdir_p("b/c/d/e"), mkdir_p("a/t0/x/y")]);
+    let deep = h.mint(ADMIN, "b/c/d/e", Grant::Read, 0);
+    // `e` and the three directories above it.
+    assert_eq!(h.writer.covered(), Some(5 + 4));
+    // A key minted from a key: its root and the one directory between it
+    // and its minter's.
+    let at_t0 = h.mint(ADMIN, "a/t0", Grant::Admin, 0);
+    let inner = h.mint(at_t0, "x/y", Grant::Read, 0);
+    assert_eq!(h.writer.covered(), Some(9 + 2));
+    let result = h.ops([remove_all("b/c"), remove_all("a/t0/x")]);
+    assert!(result.outcomes.iter().all(Outcome::applied));
+    assert_eq!(h.key_deletions(), vec![(result.version, 2)]);
+    assert!(gone(&mut h, deep));
+    assert!(gone(&mut h, inner));
+    assert!(found(&stat_as(&mut h, at_t0, Target::Path(p("")))));
+    // The freeing takes what the batch detached out of the cover. `b`
+    // stays, though it lies above no root now.
+    assert_eq!(h.writer.covered(), Some(5 + 1));
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// A key's root, or a directory above one, that moves under other
+/// directories brings them above the root.
+#[test]
+fn a_detach_takes_a_key_whose_root_moved_beneath_it() {
+    for exchange in [None, Some(false), Some(true)] {
+        let mut h = covered(3);
+        h.ops([mkdir_p("b/c/x"), mkdir_p("d/e/z")]);
+        let keys: Vec<Caller> = (0..3)
+            .map(|n| h.mint(ADMIN, &format!("a/t{n}"), Grant::Read, 0))
+            .collect();
+        // A directory with no root at or beneath it covers nothing where
+        // it lands.
+        h.ops([mv("d/e/z", "b/z")]);
+        assert_eq!(h.writer.covered(), Some(5));
+        match exchange {
+            // A root moves.
+            None => h.ops([mv("a/t0", "b/c/t0")]),
+            // A root and a directory outside the cover change places,
+            // named either way round.
+            Some(false) => h.ops([rename("a/t0", "b/c/x", RenameFlag::Exchange)]),
+            Some(true) => h.ops([rename("b/c/x", "a/t0", RenameFlag::Exchange)]),
+        };
+        // `c` and `b` now lie above a root.
+        assert_eq!(h.writer.covered(), Some(5 + 2), "{exchange:?}");
+        let result = h.ops([remove_all("b")]);
+        assert_eq!(h.key_deletions(), vec![(result.version, 2)], "{exchange:?}");
+        assert!(gone(&mut h, keys[0]));
+        assert!(found(&stat_as(&mut h, keys[1], Target::Path(p("")))));
+        // A directory above the other roots moves, and takes them with it.
+        h.ops([mv("a", "d/e/a")]);
+        let result = h.ops([remove_all("d")]);
+        assert_eq!(h.key_deletions().last(), Some(&(result.version, 4)));
+        assert!(gone(&mut h, keys[1]));
+        assert!(gone(&mut h, keys[2]));
+        assert!(h.writer.keys().is_empty());
+        assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+    }
+}
+
+/// A batch that moves a key's root under a directory and then detaches the
+/// directory revokes the key.
+#[test]
+fn a_batch_that_moves_a_root_and_detaches_what_it_moved_under_revokes_the_key() {
+    let mut h = covered(3);
+    h.ops([mkdir_p("b/c")]);
+    let at_t0 = h.mint(ADMIN, "a/t0", Grant::Read, 0);
+    let result = h.ops([mv("a/t0", "b/c/t0"), remove_all("b")]);
+    assert!(result.outcomes.iter().all(Outcome::applied));
+    assert_eq!(h.key_deletions(), vec![(result.version, 2)]);
+    assert!(gone(&mut h, at_t0));
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// A detach runs against what batches not yet committed brought above a
+/// key's root: a mint, and a move.
+#[test]
+fn a_detach_takes_a_key_an_uncommitted_batch_brought_beneath_it() {
+    for moved in [false, true] {
+        let mut h = covered(3);
+        h.ops([mkdir_p("b/c/d")]);
+        let at_t0 = h.mint(ADMIN, "a/t0", Grant::Read, 0);
+        let before = h.key_deletions().len();
+        // Both arrive before either commits.
+        let (first, detach) = (h.token(), h.token());
+        if moved {
+            h.writer.submit(
+                first,
+                ADMIN,
+                Batch {
+                    ops: vec![mv("a/t0", "b/c/d/t0")],
+                    ..Batch::default()
+                },
+            );
+        } else {
+            h.writer.submit_key(
+                first,
+                ADMIN,
+                KeyOp::Mint {
+                    id: None,
+                    hash: key_hash(5),
+                    root: p("b/c/d"),
+                    grant: Grant::Read,
+                    ttl: 0,
+                },
+            );
+        }
+        h.writer.submit(
+            detach,
+            ADMIN,
+            Batch {
+                ops: vec![remove_all("b")],
+                ..Batch::default()
+            },
+        );
+        h.run();
+        let detached = committed(h.answer(detach));
+        assert!(detached.committed);
+        let expected = if moved { 2 } else { 1 };
+        assert_eq!(
+            h.key_deletions()[before..],
+            [(detached.version, expected)],
+            "moved: {moved}"
+        );
+        assert_eq!(gone(&mut h, at_t0), moved);
+        assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+    }
+}
+
+/// A key minted while the first search has yet to commit joins the cover
+/// that search leaves.
+#[test]
+fn a_key_minted_beside_the_first_search_joins_its_cover() {
+    let mut h = Harness::new();
+    h.ops([mkdir_p("a/t0"), mkdir("scrap"), mkdir_p("b/c/d")]);
+    h.mint(ADMIN, "a/t0", Grant::Read, 0);
+    let (search, mint) = (h.token(), h.token());
+    h.writer.submit(
+        search,
+        ADMIN,
+        Batch {
+            ops: vec![remove_all("scrap")],
+            ..Batch::default()
+        },
+    );
+    h.writer.submit_key(
+        mint,
+        ADMIN,
+        KeyOp::Mint {
+            id: None,
+            hash: key_hash(5),
+            root: p("b/c/d"),
+            grant: Grant::Read,
+            ttl: 0,
+        },
+    );
+    h.run();
+    let Answer::Key(Ok(id)) = h.answer(mint) else {
+        panic!("the mint commits");
+    };
+    // `t0`, `a` and the root from the search; `d`, `c` and `b` from the
+    // mint.
+    assert_eq!(h.writer.covered(), Some(3 + 3));
+    let result = h.ops([remove_all("b/c")]);
+    assert_eq!(h.key_deletions(), vec![(result.version, 1)]);
+    let minted = Caller::Key {
+        id,
+        hash: key_hash(5),
+    };
+    assert!(gone(&mut h, minted));
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// A directory freed while empty leaves the cover, and a restarted writer
+/// knows none until its first detach searches again.
+#[test]
+fn the_cover_drops_freed_directories_and_starts_over_with_its_writer() {
+    let mut h = covered(3);
+    h.ops([rmdir("a/t0")]);
+    assert_eq!(h.writer.keys().len(), 2);
+    assert_eq!(h.writer.covered(), Some(4));
+    let mut h = Harness::with(h.storage.clone(), Default::default());
+    assert_eq!(h.writer.covered(), None);
+    let result = h.ops([remove_all("a")]);
+    assert_eq!(h.key_deletions().last(), Some(&(result.version, 2)));
+    assert!(h.writer.keys().is_empty());
+    // The root alone, which no key is rooted at now.
+    assert_eq!(h.writer.covered(), Some(1));
+    assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+}
+
+/// A batch run ahead of its turn, for the reads it lacks, leaves out the
+/// search for keys beneath what it detaches: the search would run again
+/// each round the batch before it waits. Its rounds of reads then follow
+/// that batch's.
+#[test]
+fn a_batch_run_ahead_leaves_out_its_search_for_keys() {
+    const ROOTS: usize = 300;
+    let mut h = Harness::new();
+    h.ops((0..ROOTS).map(|n| mkdir_p(&format!("a/b/t{n}"))));
+    h.ops([mkdir_p("parts/p"), mkdir_p("cold/dir")]);
+    for n in 0..ROOTS {
+        h.mint(ADMIN, &format!("a/b/t{n}"), Grant::Read, 0);
+    }
+    let storage = h.storage.copy_now();
+    let write = Batch {
+        ops: vec![put("cold/dir/f", "v")],
+        ..Batch::default()
+    };
+    let detach = Batch {
+        ops: vec![remove_all("parts/p")],
+        ..Batch::default()
+    };
+    // The rounds of reads a restarted writer takes to commit batches that
+    // arrive together. It holds every key and none of the tree, and first
+    // reads what the detach itself needs.
+    let rounds = |batches: &[&Batch]| {
+        let mut h = Harness::with(storage.copy_now(), Default::default());
+        for path in ["", "parts", "parts/p"] {
+            assert!(matches!(h.stat(path), QueryResult::Stat { .. }));
+        }
+        // In its turn the detach lacks the roots' records alone.
+        let input = Input {
+            batch: &detach,
+            root: ROOT,
+            now: h.now,
+            version: h.writer.version() + 1,
+            next_ino: h.writer.head().next_ino,
+            ahead: false,
+        };
+        let Err(lacked) = exec::execute(input, h.writer.cache()) else {
+            panic!("the search lacks the roots' records");
+        };
+        assert_eq!(lacked.len(), ROOTS, "{lacked:?}");
+        let started = h.reads;
+        let tokens: Vec<u64> = batches
+            .iter()
+            .map(|batch| {
+                let token = h.token();
+                h.writer.submit(token, ADMIN, (*batch).clone());
+                token
+            })
+            .collect();
+        h.run();
+        for token in tokens {
+            assert!(committed(h.answer(token)).committed);
+        }
+        assert_eq!(h.writer.keys().len(), ROOTS);
+        assert!(h.fsck().is_empty(), "{:?}", h.fsck());
+        (h.reads - started, h.writer.read_ahead_ops())
+    };
+    let (write_alone, _) = rounds(&[&write]);
+    let (detach_alone, _) = rounds(&[&detach]);
+    // The write reads a level of its path a round. The search reads the
+    // roots, then each of the two levels above them, and the freeing that
+    // follows reads the directory it frees.
+    assert!(write_alone >= 2, "{write_alone} rounds");
+    assert_eq!(detach_alone, 4);
+    let (together, ahead) = rounds(&[&write, &detach]);
+    assert!(ahead > 0, "the detach runs ahead");
+    assert_eq!(together, write_alone + detach_alone);
 }
 
 #[test]

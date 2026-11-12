@@ -353,16 +353,18 @@ Revocation follows each key's minted keys through an index, so its cost grows wi
 cargo run --release -p inodedb-tests --example detach
 ```
 
-Tenants, each a directory with two keys rooted at it, through the harness's writer over the memory backend. One commit removes 50 empty directories under one tenant, none of them a key's root, and the freeing follows: the median of 20 such commits. The first row holds no keys, so it shows what the removal costs apart from the search for keys beneath what it removes. "Before" is commit be669f1, which checked every key against every directory the commit detached.
+Tenants, each a directory with two keys rooted at it, through the harness's writer over the memory backend, with the freeing that follows each commit: the median of 20 commits. One commit removes 50 empty directories under one tenant, none of them a key's root. The other removes one tenant, which is a key's root. The first row holds no keys.
 
-| Tenants | Keys | Before | Now |
+| Tenants | Keys | Removing 50 directories | Removing a tenant |
 | ---: | ---: | ---: | ---: |
-| 10,000 | 0 | 0.27 ms | 0.22 ms |
-| 1,000 | 2,000 | 1.81 ms | 0.34 ms |
-| 10,000 | 20,000 | 19.67 ms | 1.32 ms |
-| 50,000 | 100,000 | 106.35 ms | 6.22 ms |
+| 10,000 | 0 | 0.19 ms | 0.01 ms |
+| 1,000 | 2,000 | 0.19 ms | 0.10 ms |
+| 10,000 | 20,000 | 0.21 ms | 1.10 ms |
+| 50,000 | 100,000 | 0.21 ms | 5.99 ms |
 
-The search follows each directory a key is rooted at up to the tree's root once for the commit, about 110 ns a root, whatever the commit detaches. Before, it cost about 20 ns for each pair of a key and a detached directory. These runs kept every record cached. From a cold cache the search before read one missing record a round and ran the batch again each time; it now asks for every record it lacks in one round per level (`keys::a_detach_reads_the_key_roots_a_cold_cache_lacks_in_rounds`: 9 rounds for 300 roots).
+The 50 directories lie outside the cover, the directories that hold or lie above a key's root, so their commit looks at no key and costs the same beside any number of keys. A tenant lies inside it, so its commit searches: it follows each directory a key is rooted at up to the tree's root once, about 110 ns a root, whatever the commit detaches. A writer's first detach searches too, whatever it removes, and leaves the cover.
+
+These runs kept every record cached. From a cold cache the search asks for every record it lacks in one round per level (`keys::a_detach_reads_the_key_roots_a_cold_cache_lacks_in_rounds`: 9 rounds for 300 roots).
 
 ## Freeing a subtree
 
@@ -397,6 +399,27 @@ Tenants through the harness's writer over the memory backend, each a directory `
 | | | Now | 190 | 5.38 ms | 2 | 0.126 ms |
 
 A claim under a tenant's root reads that root's part of the queue and then the entries it names: two reads, whatever the queue holds for other tenants. Before, it read the whole queue, a page of 1,024 entries at a time. The queue's keys under directories cost the removal: each freed inode writes a key of 26 bytes under each of the six directories above it, so a queued entry takes 5.4 times the bytes, and a commit that removes 50 parts, 1,050 inodes, takes 1.8 times as long in the writer. The freeing itself went from 50 commits, one for each part, to two of at most 1,000 inodes.
+
+## A housekeeping pass over tenants' tables
+
+```console
+cargo run --release -p inodedb-server -- --config inodedb.toml --init-key admin.key
+cargo run --release -p inodedb-tests --example housekeep -- setup http://127.0.0.1:7070 admin.key keys.txt 10000 8
+cargo run --release -p inodedb-tests --example housekeep -- pass http://127.0.0.1:7070 admin.key keys.txt 32
+```
+
+10,000 tenants on one SQLite store on the Linux desktop's drive, about 4 million inodes in the shape a ClickHouse disk gives them: a tenant has a key and two tables of ten parts, a part of one table holds 11 files, and a part of the other holds 13 files and a directory of 10. `setup` ran once and each pass started from a copy of its store with a server just started. A pass housekeeps every tenant once, a fixed number at a time: each housekeep holds a lease, removes eight parts of a table and their claim files in one commit, then lists the free queue, claims and acknowledges until a round claims nothing. The pass removes 160,000 parts. "Before" is commit 1191cde. Both servers carried a stack sampler and counters of what the writer's queue spends its time on.
+
+| Housekeeps in flight | | Parts removed a second | Server cores | Runs of a freeing commit | A freeing commit holds the queue | Freeing level after the pass |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 16 | Before | 573 | 1.25 to 1.29 | 40 | 37 ms | at once |
+| | Now | 1,404 | 1.44 to 1.53 | 4 | 8 ms | 8 s |
+| 32 | Before | 307 | 1.11 to 1.16 | 53 | 220 ms | 288 s |
+| | Now | 2,639 | up to 2.08 | 2 to 3 | 12 ms | 46 s |
+
+A freeing commit runs again after each round of reads it waits for, and batches wait behind it meanwhile. Before, a part that held a directory asked for that directory's listing only once every earlier part in the commit had its records, so such parts advanced one at a time, two rounds each. While freeing kept level a commit freed about 700 inodes in 40 runs. At 32 in flight housekeeping detached more than that pace freed, every commit became a full one of 53 runs and 206 ms of CPU, and freeing fell to 4,100 inodes a second with the batches queued behind it: twice the housekeeps removed half the parts. Now the directories inside every part of a commit ask in the same rounds, and a commit takes two to four runs.
+
+A listing of the free queue reports how far freeing has reached under its root. Before, it scanned every detached subtree waiting, 0.22 ms a call with 50,000 and 0.45 ms with 100,000; with the first cost gone and 40,000 to 70,000 subtrees waiting, these listings took 15% to 42% of the writer's time. Now the writer counts the subtrees waiting under each directory and a listing takes one lookup.
 
 ## What FoundationDB charges small keys
 

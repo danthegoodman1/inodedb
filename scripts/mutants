@@ -603,7 +603,74 @@ MUTANTS = [
     ),
     (
         "a detach leaves keys rooted inside it working",
-        [(EXEC, "if !self.delta.detached.is_empty() {", "if false {")],
+        [(EXEC, "if search {", "if false {")],
+    ),
+    (
+        "a detach skips its search while the writer knows no cover",
+        [(EXEC, "let search = covered.iter().any(|covered| *covered != Some(false));",
+          "let search = covered.iter().any(|covered| *covered == Some(true));")],
+    ),
+    (
+        "a detach outside the cover searches every key root",
+        [(EXEC, "let search = covered.iter().any(|covered| *covered != Some(false));",
+          "let search = !covered.is_empty();")],
+    ),
+    (
+        "a mint leaves its root outside the cover",
+        [(EXEC, "Ok((ino, _)) => match exec.cover_from(ino) {", "Ok((ino, _)) => match exec.cover_from(ROOT) {")],
+    ),
+    (
+        "the cover takes a directory without those above it",
+        [(EXEC, "found.push(current);\n            if current == ROOT {", "found.push(current);\n            if true {")],
+    ),
+    (
+        "a moved root leaves its new parents outside the cover",
+        [(EXEC, "if from_dir != to_dir {\n            self.cover_move(source, to_dir)?;\n        }\n\n        self.put_entry(from_dir, from_name, None)?;",
+          "self.put_entry(from_dir, from_name, None)?;")],
+    ),
+    (
+        "an exchange leaves its source's new parents outside the cover",
+        [(EXEC, "self.cover_move(source, to_dir)?;\n            self.cover_move(target, from_dir)?;", "self.cover_move(target, from_dir)?;")],
+    ),
+    (
+        "an exchange leaves its target's new parents outside the cover",
+        [(EXEC, "self.cover_move(source, to_dir)?;\n            self.cover_move(target, from_dir)?;", "self.cover_move(source, to_dir)?;")],
+    ),
+    (
+        "a move covers its new parents whatever it carries",
+        [(EXEC, "if moved.kind == Kind::Dir && self.delta.covered(self.base, moved.child) == Some(true) {", "if moved.kind == Kind::Dir {")],
+    ),
+    (
+        "a batch's later ops miss what its earlier ones covered",
+        [(DELTA, "if self.covers.contains(&dir) {\n            return Some(true);\n        }\n        base.covers(dir)", "base.covers(dir)")],
+    ),
+    (
+        "a batch misses what uncommitted batches covered",
+        [(OVERLAY, "if self.overlay.covers.contains_key(&dir) {\n            return Some(true);\n        }", "")],
+    ),
+    (
+        "a batch misses the cover an uncommitted search found",
+        [(OVERLAY, "Some((_, cover)) => Some(cover.contains(&dir)),", "Some(_) => self.base.covers(dir),")],
+    ),
+    (
+        "a commit drops the directories it covers",
+        [(CACHE, "cover.extend(&delta.covers);", "")],
+    ),
+    (
+        "a search's cover never reaches the writer",
+        [(CACHE, "if let Some(cover) = &delta.cover {\n            self.cover = Some(cover.clone());\n        }", "")],
+    ),
+    (
+        "a freed directory stays in the cover",
+        [(CACHE, "if let Freed::Inode(ino) = freed {\n                    cover.remove(ino);\n                }", "")],
+    ),
+    (
+        "a batch run ahead of its turn searches for keys",
+        [(EXEC, "if needs.is_empty() && !input.ahead {", "if needs.is_empty() {")],
+    ),
+    (
+        "the writer runs batches ahead as it runs them in their turn",
+        [(WRITER, "next_ino: self.next_ino,\n                ahead: true,", "next_ino: self.next_ino,\n                ahead: false,")],
     ),
     (
         "a detach settles what lies beneath it as outside",
@@ -772,6 +839,10 @@ MUTANTS = [
     (
         "freeing reads a directory's own record in a round of its own",
         [(EXEC, "want(self.delta.inode(self.base, dir).err());", "")],
+    ),
+    (
+        "a subtree that has its records waits for the reads of those before it",
+        [(EXEC, "match lacks {", "match lacks.or_else(|| needs.first().cloned()) {")],
     ),
     (
         "a detach reads one key root's record a round",
@@ -1007,7 +1078,23 @@ MUTANTS = [
     ),
     (
         "a listing reports freeing done past a detached subtree",
-        [(WRITER, ".map_or(self.version, |(&(at, _), _)| at - 1);", ".map_or(self.version, |_| self.version);")],
+        [(WRITER, ".map_or(self.version, |at| at - 1);", ".map_or(self.version, |_| self.version);")],
+    ),
+    (
+        "a listing under a root passes a subtree detached beneath it",
+        [(WRITER, "*self.under.entry((*dir, at)).or_default() += 1;", "let _ = (dir, at);")],
+    ),
+    (
+        "a freed subtree holds back the listings under the directories above it",
+        [(WRITER, "*count -= 1;\n                if *count == 0 {", "if *count == 0 {")],
+    ),
+    (
+        "a listing under a root waits for the subtrees detached under others",
+        [(WRITER, ".range((root, 0)..=(root, Version::MAX))", ".iter()")],
+    ),
+    (
+        "a listing under a root reports the newest subtree detached beneath it",
+        [(WRITER, ".range((root, 0)..=(root, Version::MAX))\n            .next()", ".range((root, 0)..=(root, Version::MAX))\n            .next_back()")],
     ),
     (
         "a writer whose lease lapsed answers the listing it read",

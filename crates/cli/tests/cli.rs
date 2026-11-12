@@ -340,13 +340,25 @@ async fn fsck_reads_a_sqlite_store_directly() {
         .expect("commits");
     drop(db);
     server.stop().await;
+    // A child another test starts holds a copy of every descriptor this
+    // process has open until it execs, the store's lock among them, so the
+    // lock may outlast its store by a moment.
     let fsck = |path: &std::path::Path| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_idb"))
-            .args(["fsck", "--sqlite"])
-            .arg(path)
-            .env_remove("INODEDB_KEY")
-            .output()
-            .expect("idb runs")
+        let started = std::time::Instant::now();
+        loop {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_idb"))
+                .args(["fsck", "--sqlite"])
+                .arg(path)
+                .env_remove("INODEDB_KEY")
+                .output()
+                .expect("idb runs");
+            let locked =
+                String::from_utf8_lossy(&output.stderr).contains("is open in another process");
+            if !locked || started.elapsed() > std::time::Duration::from_secs(10) {
+                return output;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     };
     let sound = fsck(&path);
     assert!(

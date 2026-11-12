@@ -381,6 +381,54 @@ enum Purpose {
     Preload(Cursor),
 }
 
+/// The detached subtrees still to free.
+#[derive(Default)]
+struct Detached {
+    /// Each by the version that detached it and its top, with the
+    /// directories above the top as it detached.
+    subtrees: BTreeMap<(Version, Ino), Vec<Ino>>,
+    /// How many of them lie under each directory, by the version that
+    /// detached them, so the oldest under a directory takes one lookup
+    /// however many wait.
+    under: BTreeMap<(Ino, Version), usize>,
+}
+
+impl Detached {
+    fn insert(&mut self, at: Version, top: Ino, above: Vec<Ino>) {
+        self.remove(&(at, top));
+        for dir in &above {
+            *self.under.entry((*dir, at)).or_default() += 1;
+        }
+        self.subtrees.insert((at, top), above);
+    }
+
+    fn remove(&mut self, subtree: &(Version, Ino)) {
+        let Some(above) = self.subtrees.remove(subtree) else {
+            return;
+        };
+        for dir in above {
+            let key = (dir, subtree.0);
+            if let Some(count) = self.under.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.under.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// The version that detached the oldest subtree waiting under `root`.
+    fn oldest_under(&self, root: Ino) -> Option<Version> {
+        if root == ROOT {
+            return self.subtrees.keys().next().map(|(at, _)| *at);
+        }
+        self.under
+            .range((root, 0)..=(root, Version::MAX))
+            .next()
+            .map(|((_, at), _)| *at)
+    }
+}
+
 /// A claim scanning the free queue.
 #[derive(Debug)]
 struct WaitingClaim {
@@ -524,9 +572,7 @@ pub struct Writer {
     leases: Leases,
     claiming: BTreeMap<u64, WaitingClaim>,
     listing: BTreeMap<u64, WaitingList>,
-    /// Detached subtrees still to free, by the version that detached each
-    /// and its top, with the directories above the top as it detached.
-    detached: BTreeMap<(Version, Ino), Vec<Ino>>,
+    detached: Detached,
     reaping: bool,
     /// A deletion of expired keys is in the writer's hands.
     expiring_keys: bool,
@@ -615,7 +661,7 @@ impl Writer {
             leases,
             claiming: BTreeMap::new(),
             listing: BTreeMap::new(),
-            detached: BTreeMap::new(),
+            detached: Detached::default(),
             reaping: false,
             expiring_keys: false,
             keys_expired_at: 0,
@@ -1082,9 +1128,8 @@ impl Writer {
         let root = scope.root;
         let freed_through = self
             .detached
-            .iter()
-            .find(|(_, above)| root == ROOT || above.contains(&root))
-            .map_or(self.version, |(&(at, _), _)| at - 1);
+            .oldest_under(root)
+            .map_or(self.version, |at| at - 1);
         let id = self.id();
         let own = self.reads_own(root);
         self.listing.insert(
@@ -1408,7 +1453,7 @@ impl Writer {
 
     /// Detached subtrees still to free, for tests and metrics.
     pub fn detached(&self) -> usize {
-        self.detached.len()
+        self.detached.subtrees.len()
     }
 
     /// Whether a consumer under a directory reads that directory's own
@@ -1420,6 +1465,12 @@ impl Writer {
     /// Live request records of more than one part, for tests and metrics.
     pub fn long_records(&self) -> usize {
         self.long_records.len()
+    }
+
+    /// How many directories the writer counts as holding or lying above
+    /// a key's root, once a search has found them, for tests and metrics.
+    pub fn covered(&self) -> Option<usize> {
+        self.cache.covered()
     }
 
     /// Ops run ahead of batches waiting on reads, for tests and metrics.
@@ -1558,6 +1609,7 @@ impl Writer {
                 now: self.now,
                 version: self.next_version,
                 next_ino: self.next_ino,
+                ahead: true,
             };
             if let Err(more) = exec::execute(input, &view) {
                 needs.extend(more);
@@ -1632,7 +1684,11 @@ impl Writer {
                         .map(|key| exec::Reap {
                             top: key.1,
                             at: key.0,
-                            above: self.detached.get(key).map_or(&[][..], Vec::as_slice),
+                            above: self
+                                .detached
+                                .subtrees
+                                .get(key)
+                                .map_or(&[][..], Vec::as_slice),
                         })
                         .collect();
                     exec::execute_reap(&subtrees, self.now, self.next_version, &view)?
@@ -1796,6 +1852,7 @@ impl Writer {
                     now: self.now,
                     version: self.next_version,
                     next_ino: self.next_ino,
+                    ahead: false,
                 },
                 &view,
             )?
@@ -1903,12 +1960,13 @@ impl Writer {
             && self.groups.is_empty();
         if !self.reaping
             && (idle || self.now >= self.reaped_at + REAP_EVERY)
-            && !self.detached.is_empty()
+            && !self.detached.subtrees.is_empty()
         {
             self.reaping = true;
             self.reaped_at = self.now;
             let tops = self
                 .detached
+                .subtrees
                 .keys()
                 .take(exec::REAP_BUDGET)
                 .copied()
@@ -2210,7 +2268,7 @@ impl Writer {
             }
             for ino in &prepared.delta.detached {
                 let above = prepared.delta.above.get(ino).cloned().unwrap_or_default();
-                self.detached.insert((prepared.version, *ino), above);
+                self.detached.insert(prepared.version, *ino, above);
             }
             for record in &prepared.delta.undetached {
                 self.detached.remove(record);
@@ -2466,7 +2524,7 @@ impl Writer {
                 match keys::parse(&key) {
                     Some(Parsed::Detached(version, ino)) => {
                         let above = crate::delta::decode_ancestors(&value)?;
-                        self.detached.insert((version, ino), above);
+                        self.detached.insert(version, ino, above);
                     }
                     _ => return Err(DecodeError),
                 }
@@ -2679,7 +2737,7 @@ impl Writer {
     fn restart(&mut self) {
         self.phase = Phase::Starting;
         self.cache = Cache::with_budget(self.config.cache);
-        self.detached.clear();
+        self.detached = Detached::default();
         self.long_records.clear();
         self.expiries.clear();
         let id = self.id();
