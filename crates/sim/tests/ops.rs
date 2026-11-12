@@ -654,10 +654,9 @@ fn cold_subtrees_ask_for_their_records_in_the_same_rounds() {
     // A restarted writer frees the forty subtrees from a cold cache.
     let h = Harness::with(h.storage.clone(), Default::default());
     assert_eq!(h.writer.detached(), 0);
-    assert!(
-        h.reads <= 4,
-        "a round of reads per level, not per subtree: {}",
-        h.reads
+    assert_eq!(
+        h.reads, 3,
+        "a round for the writer's start, one for the listings and one for what freeing them reads"
     );
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
@@ -693,10 +692,9 @@ fn cold_subtrees_with_directories_inside_share_their_rounds() {
     // A restarted writer frees the forty subtrees from a cold cache.
     let h = Harness::with(h.storage.clone(), Default::default());
     assert_eq!(h.writer.detached(), 0);
-    assert!(
-        h.reads <= 6,
-        "a round of reads per level, not per subtree: {}",
-        h.reads
+    assert_eq!(
+        h.reads, 5,
+        "the three rounds flat subtrees take, then two for the directories inside"
     );
     assert!(h.fsck().is_empty(), "{:?}", h.fsck());
 }
