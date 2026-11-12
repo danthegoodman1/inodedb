@@ -6,7 +6,6 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-bytes.workspace = true
 inodedb-core.workspace = true
 inodedb-storage.workspace = true
 lionturtle.workspace = true

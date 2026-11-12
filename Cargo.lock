@@ -1029,7 +1029,6 @@ dependencies = [
 name = "inodedb-storage-lionturtle"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "inodedb-core",
  "inodedb-storage",
  "lionturtle",
@@ -1217,9 +1216,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lionturtle"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cabd1361820a94d7f1c94650314cf804d14c58bac190268fe85596ffc6cae5d2"
+checksum = "50416007f024fa96637d9c7a6a3e294e932441862f734d2a82b2e64aed0fad8a"
 dependencies = [
  "arc-swap",
  "bbtree",

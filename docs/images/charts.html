@@ -172,50 +172,50 @@ html.capture[data-theme="dark"] { --bg: #0d1117; }
 const D = {
   // BENCHMARKS.md, "Operations": operations a second at 64 clients for memory, SQLite, RocksDB, lionturtle, FoundationDB
   ops: [
-    ["Stat", "by path", 392246, 395010, 385828, 391561, 392963],
-    ["Read", "a 100-byte value", 391525, 384247, 382179, 385833, 384266],
-    ["List", "100 entries with attributes", 164491, 168794, 171567, 160286, 167933],
-    ["Put", "a new 100-byte file", 87239, 36512, 78083, 83742, 19764],
-    ["Rename", "a file", 100868, 42461, 91475, 110152, 22882],
-    ["Mixed", "nine stats for each put", 300787, 241484, 282664, 280302, 175813],
+    ["Stat", "by path", 383880, 392433, 400626, 390760, 400025],
+    ["Read", "a 100-byte value", 390314, 387962, 390105, 388694, 389710],
+    ["List", "100 entries with attributes", 168008, 173103, 168283, 165466, 169647],
+    ["Put", "a new 100-byte file", 95960, 36680, 84118, 92673, 22851],
+    ["Rename", "a file", 103663, 41603, 90673, 101991, 21894],
+    ["Mixed", "nine stats for each put", 303729, 249206, 290512, 288500, 175669],
   ],
   backends: [["memory", "memory"], ["sqlite", "SQLite"], ["rocksdb", "RocksDB"], ["lionturtle", "lionturtle"], ["fdb", "FoundationDB"]],
   // BENCHMARKS.md, "Operations": latency in ms for memory, SQLite, RocksDB, lionturtle, FoundationDB
   latency: [
     ["Reads", "one client, p50", 0.08, [0, 0.02, 0.04, 0.06, 0.08], [
-      ["Stat", 0.023, 0.023, 0.023, 0.023, 0.023],
+      ["Stat", 0.023, 0.023, 0.023, 0.023, 0.022],
       ["Read", 0.023, 0.023, 0.023, 0.023, 0.023],
-      ["List", 0.057, 0.057, 0.057, 0.058, 0.057],
+      ["List", 0.058, 0.058, 0.058, 0.058, 0.058],
     ]],
     ["Reads", "64 clients, p99", 1, [0, 0.25, 0.5, 0.75, 1], [
-      ["Stat", 0.293, 0.287, 0.287, 0.283, 0.291],
-      ["Read", 0.297, 0.293, 0.289, 0.287, 0.289],
-      ["List", 0.814, 0.783, 0.753, 0.836, 0.799],
+      ["Stat", 0.310, 0.282, 0.289, 0.282, 0.290],
+      ["Read", 0.293, 0.294, 0.290, 0.282, 0.286],
+      ["List", 0.809, 0.758, 0.780, 0.815, 0.787],
     ]],
     ["Writes", "one client, p50", 1.2, [0, 0.3, 0.6, 0.9, 1.2], [
-      ["Put", 0.049, 0.167, 0.109, 0.101, 1.004],
-      ["Rename", 0.047, 0.155, 0.108, 0.098, 1.003],
+      ["Put", 0.051, 0.164, 0.108, 0.093, 1.005],
+      ["Rename", 0.048, 0.150, 0.103, 0.094, 1.004],
     ]],
     ["Writes", "64 clients, p99", 5, [0, 1, 2, 3, 4, 5], [
-      ["Put", 1.356, 3.361, 1.308, 1.294, 3.930],
-      ["Rename", 1.037, 1.997, 0.953, 1.053, 3.674],
+      ["Put", 1.053, 3.460, 1.032, 1.143, 3.221],
+      ["Rename", 1.015, 2.053, 0.961, 1.048, 3.478],
     ]],
   ],
   // BENCHMARKS.md, "Expiring records": before records expire, then while they do, by backend
   expiry: [
     ["Batches a second", "64 clients", 50000, [0, 10000, 20000, 30000, 40000, 50000], [
-      ["memory", 44226, 40711],
-      ["SQLite", 26530, 21068],
-      ["RocksDB", 36978, 32751],
-      ["lionturtle", 37828, 33430],
-      ["FoundationDB", 19363, 16908],
+      ["memory", 44989, 41549],
+      ["SQLite", 26824, 21007],
+      ["RocksDB", 37156, 32753],
+      ["lionturtle", 40297, 36872],
+      ["FoundationDB", 19663, 16423],
     ]],
     ["Commit latency", "64 clients, p99", 30, [0, 10, 20, 30], [
-      ["memory", 2.26, 2.62],
-      ["SQLite", 4.99, 26.83],
-      ["RocksDB", 2.44, 2.79],
-      ["lionturtle", 2.44, 2.86],
-      ["FoundationDB", 3.93, 4.60],
+      ["memory", 2.22, 2.62],
+      ["SQLite", 4.81, 27.36],
+      ["RocksDB", 2.44, 2.80],
+      ["lionturtle", 2.26, 2.53],
+      ["FoundationDB", 3.97, 4.62],
     ]],
   ],
 };

@@ -4,7 +4,7 @@ Measurements that guide InodeDB's design. Each names its command, so it can be r
 
 Four machines:
 
-- **Metal,** for "Devices", "Operations", "Before and after", "Group commit", "Expiring records", "Failover" and "Path resolution": a Latitude.sh `f4.metal.medium` (AMD EPYC 4564P, 16 cores and 32 threads in two L3 groups, one NUMA node, 187 GiB) on Ubuntu 24.04 with Linux 6.8, its CPU governor at `performance`. Every store sits on one Micron NVMe drive (MTFDKCC1T9TGP), which reports no volatile write cache, under XFS. FoundationDB 7.3.79 runs one process per role on the `ssd-2` engine, with single replication and its data on the same drive: coordinator, cluster controller, master, commit proxy, GRV proxy, resolver, log, storage, ratekeeper, data distributor and consistency scan. `scripts/bench/setup` prepares the machine, and `scripts/bench/run` runs the benchmarks, checks that each role holds a process of its own, and records them in `fdb-roles.txt`. Every metal table comes from one sitting of about an hour. Each backend runs in its own process: in one process, whichever backend ran second lost up to 3%. Controls after the sitting stayed within 2% of its start on stats at 64 clients and within 4% on puts. "Sustained puts" ran in a sitting of its own on a second machine of this type, whose drive is a Micron 7450 (MTFDKCC1T9TFR) with the same 24 µs sync.
+- **Metal,** for "Devices", "Operations", "Before and after", "Group commit", "Expiring records", "Sustained puts", "Failover" and "Path resolution": a Latitude.sh `f4.metal.medium` (AMD EPYC 4564P, 16 cores and 32 threads in two L3 groups, one NUMA node, 187 GiB) on Ubuntu 24.04 with Linux 6.8, its CPU governor at `performance`. Every store sits on one Micron 7450 NVMe drive (MTFDKCC1T9TFR), which reports no volatile write cache, under XFS. FoundationDB 7.3.79 runs one process per role on the `ssd-2` engine, with single replication and its data on the same drive: coordinator, cluster controller, master, commit proxy, GRV proxy, resolver, log, storage, ratekeeper, data distributor and consistency scan. `scripts/bench/setup` prepares the machine, and `scripts/bench/run` runs the benchmarks, checks that each role holds a process of its own, and records them in `fdb-roles.txt`. Every metal table comes from one sitting of about three hours. Each backend runs in its own process: in one process, whichever backend ran second lost up to 3%. Controls after the sitting stayed within 3% of its start on stats and within 5% on puts.
 - **EC2,** for "Network storage" and "Idle states": an i7ie.6xlarge (Intel Xeon Platinum 8559C, 24 vCPUs, 192 GiB) on Ubuntu 24.04 with Linux 7.0, with a gp3 volume provisioned at gp3's maximum of 80,000 IOPS and 2,000 MiB/s. Those runs predate the lionturtle backend. Its speed varies between sittings: on the same code and kernel, two instances launched later that day ran about 15% slower across the board, and path resolution, which touches neither disk nor network, 34% slower. So compare numbers only within one sitting on one machine.
 - **A Mac** for "Footprint" and "Freeing a subtree", which measure memory and CPU, and beside metal in "Path resolution": an Apple M3 Max (16 cores, 128 GB) on macOS 26.6.
 - **A Linux desktop** for "Revocation", "Detaching beside many keys" and "Freeing and claiming across tenants", which measure CPU and count reads, "What FoundationDB charges small keys", which counts, and the key rows of "Footprint": an Intel Core Ultra 9 285 (24 cores, 125 GiB) on Ubuntu 26.04 with Linux 7.0. The Footprint rows it shares with the Mac match byte for byte.
@@ -18,11 +18,11 @@ One 4 KiB write followed by a sync, one at a time, with `fio` for 15 seconds: th
 | 4 KiB write and sync | Metal p50 | Metal p99 | EC2 NVMe p50 | EC2 NVMe p99 | gp3 p50 | gp3 p99 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Written blocks, `fdatasync` | 24 µs | 27 µs | 17 µs | 24 µs | 668 µs | 807 µs |
-| Written blocks, `fsync` | 24 µs | 53 µs | 17 µs | 44 µs | 1,352 µs | 1,630 µs |
-| Appending to a file, `fdatasync` | 59 µs | 70 µs | 46 µs | 130 µs | 1,352 µs | 1,565 µs |
-| New blocks of an allocated file, `fdatasync` | 92 µs | 127 µs | 126 µs | 167 µs | 1,466 µs | 1,761 µs |
+| Written blocks, `fsync` | 24 µs | 54 µs | 17 µs | 44 µs | 1,352 µs | 1,630 µs |
+| Appending to a file, `fdatasync` | 59 µs | 66 µs | 46 µs | 130 µs | 1,352 µs | 1,565 µs |
+| New blocks of an allocated file, `fdatasync` | 83 µs | 125 µs | 126 µs | 167 µs | 1,466 µs | 1,761 µs |
 
-- Overwriting a written block with `fdatasync` costs the device alone. Growing a file or converting an allocated extent also commits XFS's journal, which costs 2.5 to 4 times as much on the metal drive and twice as much on gp3. So SQLite and RocksDB write their logs' files when a store opens, lionturtle zero-fills each log segment ahead of its writes, and all three overwrite those blocks from then on. SQLite syncs with `fdatasync`.
+- Overwriting a written block with `fdatasync` costs the device alone. Growing a file or converting an allocated extent also commits XFS's journal, which costs 2.5 to 3.5 times as much on the metal drive and twice as much on gp3. So SQLite and RocksDB write their logs' files when a store opens, lionturtle writes each log segment whole before the segment takes writes, and all three overwrite those blocks from then on. SQLite syncs with `fdatasync`.
 - Provisioned IOPS set how many writes a gp3 volume takes at once, and each still crosses the network: its cheapest sync costs 39 times EC2 NVMe's.
 
 ## Operations
@@ -38,40 +38,40 @@ Operations a second:
 
 | Operation | Clients | memory | SQLite | RocksDB | lionturtle | FoundationDB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| stat, cold cache | 16 | 176,088 | 83,505 | 105,149 | 109,550 | 31,658 |
-| read a value, cold cache | 16 | 201,980 | 116,924 | 148,617 | 150,061 | 61,997 |
-| stat, as a preloading server starts | 16 | 243,188 | 232,307 | 232,696 | 253,169 | 220,163 |
-| stat | 64 | 392,246 | 395,010 | 385,828 | 391,561 | 392,963 |
-| read a 100-byte value | 64 | 391,525 | 384,247 | 382,179 | 385,833 | 384,266 |
-| list 100 entries | 64 | 164,491 | 168,794 | 171,567 | 160,286 | 167,933 |
-| put a new 100-byte file | 64 | 87,239 | 36,512 | 78,083 | 83,742 | 19,764 |
-| rename a file | 64 | 100,868 | 42,461 | 91,475 | 110,152 | 22,882 |
-| nine stats for each put | 64 | 300,787 | 241,484 | 282,664 | 280,302 | 175,813 |
+| stat, cold cache | 16 | 179,437 | 84,046 | 105,306 | 110,027 | 40,948 |
+| read a value, cold cache | 16 | 188,656 | 112,587 | 151,234 | 162,883 | 68,018 |
+| stat, as a preloading server starts | 16 | 248,228 | 232,035 | 236,555 | 255,144 | 223,718 |
+| stat | 64 | 383,880 | 392,433 | 400,626 | 390,760 | 400,025 |
+| read a 100-byte value | 64 | 390,314 | 387,962 | 390,105 | 388,694 | 389,710 |
+| list 100 entries | 64 | 168,008 | 173,103 | 168,283 | 165,466 | 169,647 |
+| put a new 100-byte file | 64 | 95,960 | 36,680 | 84,118 | 92,673 | 22,851 |
+| rename a file | 64 | 103,663 | 41,603 | 90,673 | 101,991 | 21,894 |
+| nine stats for each put | 64 | 303,729 | 249,206 | 290,512 | 288,500 | 175,669 |
 
 Latency in ms, p50 for one client and p99 for 64:
 
 | Operation | Latency | memory | SQLite | RocksDB | lionturtle | FoundationDB |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| stat | one client, p50 | 0.023 | 0.023 | 0.023 | 0.023 | 0.023 |
+| stat | one client, p50 | 0.023 | 0.023 | 0.023 | 0.023 | 0.022 |
 | read a 100-byte value | one client, p50 | 0.023 | 0.023 | 0.023 | 0.023 | 0.023 |
-| list 100 entries | one client, p50 | 0.057 | 0.057 | 0.057 | 0.058 | 0.057 |
-| put a new 100-byte file | one client, p50 | 0.049 | 0.167 | 0.109 | 0.101 | 1.004 |
-| rename a file | one client, p50 | 0.047 | 0.155 | 0.108 | 0.098 | 1.003 |
-| stat | 64 clients, p99 | 0.293 | 0.287 | 0.287 | 0.283 | 0.291 |
-| read a 100-byte value | 64 clients, p99 | 0.297 | 0.293 | 0.289 | 0.287 | 0.289 |
-| list 100 entries | 64 clients, p99 | 0.814 | 0.783 | 0.753 | 0.836 | 0.799 |
-| put a new 100-byte file | 64 clients, p99 | 1.356 | 3.361 | 1.308 | 1.294 | 3.930 |
-| rename a file | 64 clients, p99 | 1.037 | 1.997 | 0.953 | 1.053 | 3.674 |
-| nine stats for each put | 64 clients, p99 | 0.497 | 2.072 | 0.744 | 0.702 | 3.069 |
+| list 100 entries | one client, p50 | 0.058 | 0.058 | 0.058 | 0.058 | 0.058 |
+| put a new 100-byte file | one client, p50 | 0.051 | 0.164 | 0.108 | 0.093 | 1.005 |
+| rename a file | one client, p50 | 0.048 | 0.150 | 0.103 | 0.094 | 1.004 |
+| stat | 64 clients, p99 | 0.310 | 0.282 | 0.289 | 0.282 | 0.290 |
+| read a 100-byte value | 64 clients, p99 | 0.293 | 0.294 | 0.290 | 0.282 | 0.286 |
+| list 100 entries | 64 clients, p99 | 0.809 | 0.758 | 0.780 | 0.815 | 0.787 |
+| put a new 100-byte file | 64 clients, p99 | 1.053 | 3.460 | 1.032 | 1.143 | 3.221 |
+| rename a file | 64 clients, p99 | 1.015 | 2.053 | 0.961 | 1.048 | 3.478 |
+| nine stats for each put | 64 clients, p99 | 0.477 | 2.003 | 0.817 | 0.629 | 3.021 |
 
 - The writer answers warm reads from its cache, on the request's own task, so they cost the same on every backend: about 390,000 a second at 64 clients with p99 about 0.3 ms, and 23 µs for one client.
-- A listing of 100 entries runs at 160,000 to 172,000 a second, and one client's takes 57 µs. A listing's rate varies by up to 11% between passes on one backend, so the gaps between these medians are noise.
-- A cold read costs a storage read: 84,000 to 110,000 a second on SQLite, RocksDB and lionturtle, 176,000 on memory, and 32,000 on FoundationDB, whose reads cross to its storage process. A server that preloads the tree as it starts serves the same stats at 220,000 to 253,000 a second.
-- A write costs a durable commit, and a put first reads storage to learn its new name is absent. At one client, a put takes 0.101 ms on lionturtle, 0.109 ms on RocksDB, 0.167 ms on SQLite and 1.0 ms on FoundationDB, against 0.049 ms on memory.
-- At 64 clients, writes gather into groups. lionturtle's 84,000 puts a second come within 4% of the memory backend's, and its 110,000 renames a second pass the memory backend's 101,000.
-- lionturtle and RocksDB ran alternately in six more passes, with each going first in three. lionturtle won every pass on puts and renames: by 8% and 18% at 64 clients, and by 11% and 10% at one client. Warm reads and "nine stats for each put" ran level, within about 2% at 64 clients with no steady winner. lionturtle led the stats of a preloading server by 5%, and took five passes of six.
-- RocksDB keeps the lower p99 on writes at 64 clients: 1.27 ms against 1.34 ms on puts, and 0.94 ms against 1.08 ms on renames. lionturtle's p50 runs lower: 0.70 ms against 0.78 ms, and 0.52 ms against 0.67 ms.
-- A temporary probe timed each commit at 64 clients, over three passes. lionturtle's median commit took 220 µs against RocksDB's 265 µs on puts, and 165 µs against 255 µs on renames. Its slowest commits ran longer: p99 535 µs against 487 µs on puts, p99.9 about 600 µs against 415 µs on renames, and 6 to 9 ms against 3 to 5 ms at the longest. Under "nine stats for each put", its commits took 74 µs against 95 µs and gathered 4.5 batches against 5.2, so it made 15% more commits for the same rate.
+- A listing of 100 entries runs at 165,000 to 173,000 a second, and one client's takes 58 µs. A listing's rate varies by up to 11% between passes on one backend, so the gaps between these medians are noise.
+- A cold read costs a storage read: 84,000 to 110,000 a second on SQLite, RocksDB and lionturtle, 179,000 on memory, and 41,000 on FoundationDB, whose reads cross to its storage process. A server that preloads the tree as it starts serves the same stats at 224,000 to 255,000 a second.
+- A write costs a durable commit, and a put first reads storage to learn its new name is absent. At one client, a put takes 0.093 ms on lionturtle, 0.108 ms on RocksDB, 0.164 ms on SQLite and 1.0 ms on FoundationDB, against 0.051 ms on memory.
+- At 64 clients, writes gather into groups. lionturtle's 92,700 puts a second come within 4% of the memory backend's, and its 102,000 renames within 2%.
+- lionturtle and RocksDB ran alternately in six more passes, with each going first in three. lionturtle won every pass on puts and renames: by 10% and 15% at 64 clients, and by 11% and 13% at one client. It also led cold stats in every pass, by 4%. Warm reads, listings and "nine stats for each put" ran level, within 1% over the six passes with no steady winner, and the stats of a preloading server swung 10% either way between passes.
+- RocksDB keeps the lower p99 on writes at 64 clients: 1.06 ms against 1.15 ms on puts, and 0.94 ms against 1.02 ms on renames. lionturtle's p50 runs lower: 0.64 ms against 0.72 ms, and 0.57 ms against 0.66 ms.
+- That p99 comes from the writer's side of a group's cycle, since lionturtle's commits are the shorter at every percentile. A temporary probe timed each commit over 30 seconds of puts at 64 clients: lionturtle's took 178 to 182 µs at the median against RocksDB's 264 to 266, 275 to 280 µs at p99 against 405 to 425, and 357 to 363 µs at p99.9 against 644 to 889. lionturtle's slowest commit took 3.5 ms. RocksDB's ran 16 to 26 ms several times a run, and one waited 206 ms on RocksDB's own write delay. One client's commit took 42 to 46 µs on lionturtle against 58 to 59.
 - FoundationDB's commit takes 1.00 ms at one client. That is its commit proxy's batching window: with `knob_commit_transaction_batch_interval_min` and `knob_commit_transaction_batch_interval_from_idle` at 0.0001, one client's put took 0.58 ms, and 64 clients' 25,600 a second against 21,500 in the same pair of runs. These runs leave FoundationDB's knobs at their defaults.
 
 ## Before and after
@@ -84,19 +84,19 @@ for backend in memory sqlite rocksdb fdb; do
 done
 ```
 
-The same benchmark on commit 05703a0 and on this tree, in the same sitting, using the FoundationDB cluster `scripts/bench/run` leaves running. 05703a0 ran one pass, so small differences mean little: FoundationDB's cold stats on it read 38,241 a second here and 30,679 on another machine of this type.
+The same benchmark on commit 05703a0 and on this tree, in the same sitting, using the FoundationDB cluster `scripts/bench/run` leaves running. 05703a0 ran one pass, so small differences mean little: FoundationDB's cold stats on it read 37,362 a second here and 30,679 on another machine of this type.
 
 | Measure | memory | SQLite | RocksDB | FoundationDB |
 | --- | ---: | ---: | ---: | ---: |
-| stat, 64 clients, /s | 228,191 → 392,246 | 225,128 → 395,010 | 233,007 → 385,828 | 221,712 → 392,963 |
-| list, 64 clients, /s | 42,048 → 164,491 | 47,612 → 168,794 | 43,893 → 171,567 | 53,226 → 167,933 |
-| put, 64 clients, /s | 50,345 → 87,239 | 24,849 → 36,512 | 50,205 → 78,083 | 15,786 → 19,764 |
-| rename, 64 clients, /s | 62,616 → 100,868 | 26,475 → 42,461 | 47,823 → 91,475 | 13,683 → 22,882 |
-| cold stat, 16 clients, /s | 146,788 → 176,088 | 79,777 → 83,505 | 92,292 → 105,149 | 38,241 → 31,658 |
-| stat, one client, p50 ms | 0.041 → 0.023 | 0.045 → 0.023 | 0.043 → 0.023 | 0.045 → 0.023 |
-| list, one client, p50 ms | 0.090 → 0.057 | 0.089 → 0.057 | 0.088 → 0.057 | 0.091 → 0.057 |
-| put, one client, p50 ms | 0.088 → 0.049 | 0.274 → 0.167 | 0.194 → 0.109 | 1.005 → 1.004 |
-| put, 64 clients, p99 ms | 1.830 → 1.356 | 3.354 → 3.361 | 1.678 → 1.308 | 4.922 → 3.930 |
+| stat, 64 clients, /s | 228,009 → 383,880 | 230,926 → 392,433 | 229,794 → 400,626 | 225,341 → 400,025 |
+| list, 64 clients, /s | 50,534 → 168,008 | 45,589 → 173,103 | 44,874 → 168,283 | 55,471 → 169,647 |
+| put, 64 clients, /s | 51,669 → 95,960 | 24,397 → 36,680 | 53,478 → 84,118 | 15,007 → 22,851 |
+| rename, 64 clients, /s | 64,301 → 103,663 | 28,060 → 41,603 | 50,392 → 90,673 | 13,313 → 21,894 |
+| cold stat, 16 clients, /s | 137,785 → 179,437 | 70,852 → 84,046 | 92,937 → 105,306 | 37,362 → 40,948 |
+| stat, one client, p50 ms | 0.042 → 0.023 | 0.041 → 0.023 | 0.042 → 0.023 | 0.042 → 0.022 |
+| list, one client, p50 ms | 0.091 → 0.058 | 0.089 → 0.058 | 0.092 → 0.058 | 0.089 → 0.058 |
+| put, one client, p50 ms | 0.086 → 0.051 | 0.270 → 0.164 | 0.193 → 0.108 | 1.004 → 1.005 |
+| put, 64 clients, p99 ms | 1.749 → 1.053 | 3.386 → 3.460 | 1.569 → 1.032 | 5.421 → 3.221 |
 
 Where the time went, and what changed:
 
@@ -104,7 +104,7 @@ Where the time went, and what changed:
 - **Listings.** A page the cache holds answers on the request's task too. That, with the transport, took listings from about 45,000 a second to about 170,000.
 - **One client's commit.** On EC2 at default idle states, a commit on 05703a0 took 1.35 to 1.6 ms on RocksDB and SQLite, against a device sync of 17 µs: idle-state wake-ups at each hop, the file system's journal at each sync, and two trips to a blocking thread, one to open a transaction and one to commit it. Shallow idle states, logs written ahead of time, and `commit_group`, which commits a group from its write set in one trip, took that to 0.09 ms on RocksDB and 0.17 ms on SQLite there. The metal machine has no deep idle states to leave, so the table here shows the other changes alone.
 - **Grouped commits.** The engine takes up to 256 commands at once, with one look at the clock and one trip through the writer's actions, so everything that queued during a commit joins the next group. On RocksDB, the backend drops concurrent-memtable machinery the one writer never needs; on FoundationDB, a group after the handle's own commit reads no head, since its read version covers it.
-- **Memory.** The server and benchmarks allocate with mimalloc, and the tail decodes an entry only when a stream asks for it.
+- **Memory.** The server and benchmarks allocate with mimalloc and keep the memory they free, the server copies a put's value out of its request's buffer, and the tail decodes an entry only when a stream asks for it ("Sustained puts").
 
 ## Group commit
 
@@ -115,37 +115,37 @@ cargo run --release -p inodedb-tests --example commits --features rocksdb,fdb --
 
 Each client commits one 100-byte file per batch into its own directory, waiting for each answer before sending the next. "One per group" caps every group at one batch; "grouped" uses the default cap of 9 MB. Batches a second, with p50 and p99 in ms:
 
-| Backend | Commit | Clients | Batches/s | p50 | p99 |
+| Backend | Commit | Clients | Batches/s | p50 ms | p99 ms |
 | --- | --- | ---: | ---: | ---: | ---: |
-| SQLite | one per group | 1 | 5,951 | 0.17 | 0.23 |
-| SQLite | grouped | 1 | 6,067 | 0.16 | 0.22 |
-| SQLite | one per group | 16 | 9,163 | 1.73 | 2.28 |
-| SQLite | grouped | 16 | 29,645 | 0.52 | 0.75 |
-| SQLite | one per group | 128 | 8,958 | 14.10 | 16.77 |
-| SQLite | grouped | 128 | 30,127 | 4.45 | 6.82 |
-| RocksDB | one per group | 1 | 8,921 | 0.11 | 0.15 |
-| RocksDB | grouped | 1 | 9,061 | 0.11 | 0.13 |
-| RocksDB | one per group | 16 | 16,404 | 0.95 | 1.16 |
-| RocksDB | grouped | 16 | 52,192 | 0.30 | 0.50 |
-| RocksDB | one per group | 128 | 15,693 | 7.95 | 10.22 |
-| RocksDB | grouped | 128 | 39,407 | 3.22 | 4.78 |
-| lionturtle | one per group | 1 | 10,187 | 0.10 | 0.13 |
-| lionturtle | grouped | 1 | 10,218 | 0.10 | 0.13 |
-| lionturtle | one per group | 16 | 19,073 | 0.81 | 1.07 |
-| lionturtle | grouped | 16 | 56,794 | 0.27 | 0.56 |
-| lionturtle | one per group | 128 | 17,080 | 7.40 | 10.21 |
-| lionturtle | grouped | 128 | 41,133 | 3.08 | 4.62 |
-| FoundationDB | one per group | 1 | 994 | 1.00 | 1.09 |
-| FoundationDB | grouped | 1 | 993 | 1.01 | 1.08 |
-| FoundationDB | one per group | 16 | 997 | 16.05 | 16.41 |
-| FoundationDB | grouped | 16 | 7,947 | 2.01 | 2.23 |
-| FoundationDB | one per group | 128 | 994 | 128.73 | 129.61 |
-| FoundationDB | grouped | 128 | 27,521 | 4.36 | 7.58 |
+| SQLite | one per group | 1 | 6,333 | 0.16 | 0.21 |
+| SQLite | grouped | 1 | 6,043 | 0.16 | 0.22 |
+| SQLite | one per group | 16 | 9,187 | 1.71 | 2.36 |
+| SQLite | grouped | 16 | 30,259 | 0.51 | 0.70 |
+| SQLite | one per group | 128 | 9,016 | 14.09 | 16.03 |
+| SQLite | grouped | 128 | 29,797 | 4.46 | 6.50 |
+| RocksDB | one per group | 1 | 10,291 | 0.09 | 0.12 |
+| RocksDB | grouped | 1 | 9,274 | 0.11 | 0.14 |
+| RocksDB | one per group | 16 | 17,193 | 0.90 | 1.13 |
+| RocksDB | grouped | 16 | 54,336 | 0.28 | 0.54 |
+| RocksDB | one per group | 128 | 16,810 | 7.57 | 9.32 |
+| RocksDB | grouped | 128 | 40,013 | 3.17 | 4.62 |
+| lionturtle | one per group | 1 | 11,144 | 0.09 | 0.11 |
+| lionturtle | grouped | 1 | 11,092 | 0.09 | 0.12 |
+| lionturtle | one per group | 16 | 19,967 | 0.79 | 1.11 |
+| lionturtle | grouped | 16 | 60,542 | 0.25 | 0.52 |
+| lionturtle | one per group | 128 | 18,653 | 6.94 | 8.39 |
+| lionturtle | grouped | 128 | 45,098 | 2.84 | 4.30 |
+| FoundationDB | one per group | 1 | 995 | 1.00 | 1.08 |
+| FoundationDB | grouped | 1 | 994 | 1.00 | 1.08 |
+| FoundationDB | one per group | 16 | 996 | 16.07 | 16.44 |
+| FoundationDB | grouped | 16 | 7,954 | 2.01 | 2.14 |
+| FoundationDB | one per group | 128 | 995 | 128.65 | 129.82 |
+| FoundationDB | grouped | 128 | 29,427 | 4.28 | 6.91 |
 
 - Grouping changes little for one client, which never has a second batch waiting.
-- With one batch per group, every batch waits for its own durable commit, so 128 clients get at most 1.8 times one client's throughput.
-- At 128 clients, grouping multiplies FoundationDB's throughput by 28, SQLite's by 3.4, and RocksDB's and lionturtle's by 2.5 and 2.4, since a sync there takes 24 µs and the device no longer sets the pace.
-- At 128 clients, grouped commits reach 41,000 batches a second on lionturtle, 39,000 on RocksDB, 30,000 on SQLite and 28,000 on FoundationDB.
+- With one batch per group, every batch waits for its own durable commit, so 128 clients get at most 1.7 times one client's throughput.
+- At 128 clients, grouping multiplies FoundationDB's throughput by 30, SQLite's by 3.3, and RocksDB's and lionturtle's by 2.4, since a sync there takes 24 µs and the device no longer sets the pace.
+- At 128 clients, grouped commits reach 45,000 batches a second on lionturtle, 40,000 on RocksDB, 30,000 on SQLite and 29,000 on FoundationDB.
 
 ## Expiring records
 
@@ -158,15 +158,15 @@ Every batch leaves a request record, which lasts `request_ttl`: 10 minutes by de
 
 | Backend | Before, /s | p50 ms | p99 ms | While expiring, /s | p50 ms | p99 ms | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| memory | 44,226 | 1.45 | 2.26 | 40,711 | 1.59 | 2.62 | −8% |
-| SQLite | 26,530 | 2.31 | 4.99 | 21,068 | 2.64 | 26.83 | −21% |
-| RocksDB | 36,978 | 1.73 | 2.44 | 32,751 | 1.94 | 2.79 | −11% |
-| lionturtle | 37,828 | 1.68 | 2.44 | 33,430 | 1.90 | 2.86 | −12% |
-| FoundationDB | 19,363 | 3.32 | 3.93 | 16,908 | 3.76 | 4.60 | −13% |
+| memory | 44,989 | 1.42 | 2.22 | 41,549 | 1.54 | 2.62 | −8% |
+| SQLite | 26,824 | 2.37 | 4.81 | 21,007 | 2.68 | 27.36 | −22% |
+| RocksDB | 37,156 | 1.71 | 2.44 | 32,753 | 1.95 | 2.80 | −12% |
+| lionturtle | 40,297 | 1.58 | 2.26 | 36,872 | 1.72 | 2.53 | −8% |
+| FoundationDB | 19,663 | 3.31 | 3.97 | 16,423 | 3.88 | 4.62 | −16% |
 
-- RocksDB falls 11% and lionturtle 12%, each to about 33,000 batches a second with p99 under 3 ms. Each group names every key it deletes, so it reads nothing and leaves no range tombstones.
+- RocksDB falls 12% and lionturtle 8%, to 32,800 and 36,900 batches a second with p99 under 3 ms. Each group names every key it deletes, so it reads nothing and leaves no range tombstones.
 - Range deletes would cost far more here. With one per record, RocksDB fell 94%, with p99 at 130 ms, and a profile put over 40% of its CPU in the fragmented range tombstones each read rebuilds. lionturtle, which reads a range to clear it, fell 32%.
-- SQLite falls 21%, with p99 at 27 ms, FoundationDB 13% and memory 8%.
+- SQLite falls 22%, with p99 at 27 ms, FoundationDB 16% and memory 8%.
 - A 10-minute lifetime leaves more records to delete, and older ones, which these 60 seconds don't measure.
 
 ## Sustained puts
@@ -175,20 +175,26 @@ Every batch leaves a request record, which lasts `request_ttl`: 10 minutes by de
 /usr/bin/time -v target/release/examples/ops 120 lionturtle put
 ```
 
-Two minutes of puts from one client, then two from 64, each backend in its own process, on commit eeca4a0 and on this tree in one sitting. Peak memory is the whole process's: the server and the benchmark's clients. At 64 clients:
+Two minutes of puts from one client, then two from 64, each backend in its own process, on commit eeca4a0 and on this tree. Peak memory is the whole process's: the server and the benchmark's clients. At 64 clients:
 
 | Backend | Puts/s at eeca4a0 | Puts/s now | p99 ms at eeca4a0 | p99 ms now | Peak GiB at eeca4a0 | Peak GiB now |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| memory | 72,927 | 74,702 | 1.281 | 1.262 | 21.9 | 15.6 |
-| SQLite | 29,756 | 30,072 | 2.866 | 2.879 | 8.9 | 2.2 |
-| RocksDB | 67,945 | 69,504 | 1.237 | 1.248 | 10.3 | 3.7 |
-| lionturtle | 65,947 | 72,148 | 1.509 | 1.405 | 10.3 | 5.5 |
+| memory | 72,927 | 74,763 | 1.281 | 1.249 | 21.9 | 15.6 |
+| SQLite | 29,756 | 30,154 | 2.866 | 2.809 | 8.9 | 2.2 |
+| RocksDB | 67,945 | 68,976 | 1.237 | 1.245 | 10.3 | 3.7 |
+| lionturtle | 65,947 | 75,581 | 1.509 | 1.430 | 10.3 | 5.6 |
+
+Three changes separate the columns:
 
 - **A cached value held its request's buffer.** The decoder hands a put's value over as a slice of the request's buffer, 8 KiB or more, and the cache kept the slice: 300 bytes charged and 8 KiB held, about 7 GiB at the default 256 MiB of values. The server now copies the value out. Peak memory fell by 5 to 7 GiB on every backend. Each request's buffer had also come from a fresh page, which the kernel zeroes: 3.4% of all CPU samples in a profile of puts on lionturtle, beside 2.6% in the allocator beneath the decoder.
-- **The server keeps the memory it frees.** mimalloc returned it to the kernel a second after it came free, on whichever thread allocated next. lionturtle's memtable is millions of allocations, all freed at each checkpoint, every four seconds under this load. `perf` found commits after a checkpoint inside `madvise` for 4 to 40 ms, splitting huge pages, and the commits after them took 3 to 6 page faults each to map the memory again. With purging off and nothing else changed, on another machine of this type, lionturtle ran these two minutes at 74,109 puts a second against 67,001, and its slowest commit took 4.0 ms against 27.0. RocksDB's memtable sits in an arena of its own, outside the allocator, and moved from 68,324 to 68,905. A 10-second delay recovered a third of the gain, and turning huge pages off alone none.
-- **lionturtle leads RocksDB by 4% over two minutes,** where it trailed by 3%.
-- **The writer's task bounds these rates, on every backend.** A probe timed each commit at 64 clients, where a group of 32 puts carries 257 writes and 13 KB. lionturtle's commit takes 205 to 250 µs at the median, 46 to 50 of it the log's write and 115 to 145 one thread's inserts into the memtable; RocksDB's takes 270 to 280, 160 to 175 of it inserts. A commit is in flight 52% to 58% of the time on lionturtle while the writer's task is busy 77% to 80%. A prototype that ran lionturtle's inserts on other threads beside the log's write cut its commit from 229 to 148 µs, and the rate rose not at all. In a profile of the run, lionturtle's commits took 8.6% of the process's CPU samples and the writer's task 13.3%; HTTP/2, the codec and the runtime's scheduling took 62.6%, clients included.
-- **A new lionturtle store zero-fills its first log segments as it goes.** The first rotation holds a commit 6 to 9 ms while it fills 16 MiB, and a log write that overlaps a later fill takes 219 µs at the median against 46. A segment is reused once a checkpoint has covered it, and these two minutes see no fill after their first seconds; the 5-second runs of "Operations" see them throughout.
+- **The server keeps the memory it frees.** mimalloc returned it to the kernel a second after it came free, on whichever thread allocated next. lionturtle 0.5.3 kept its memtable in millions of allocations and freed them all at each checkpoint, every four seconds under this load. `perf` found commits after a checkpoint inside `madvise` for 4 to 40 ms, splitting huge pages, and the commits after them took 3 to 6 page faults each to map the memory again. With purging off and nothing else changed, on another machine of this type, lionturtle ran these two minutes at 74,109 puts a second against 67,001, and its slowest commit took 4.0 ms against 27.0. RocksDB's memtable sits in an arena of its own, outside the allocator, and moved from 68,324 to 68,905. A 10-second delay recovered a third of the gain, and turning huge pages off alone none.
+- **lionturtle 0.6.0.** It keeps a memtable's memory to itself and reuses it for the next, writes each log segment whole before the segment takes writes, and copies what a write gives it, so InodeDB passes a group's keys and values where they lie. With the two changes above and lionturtle 0.5.3, these two minutes ran at 72,148 puts a second. Over 30 seconds of puts, the mean commit fell from 214 µs on 0.5.3 to 175 to 180, its p99 from 330 to 341 µs to 275 to 280, and its p99.9 from 484 to 514 µs to 357 to 363. A new store on 0.5.3 also zero-filled its log as it went: its first rotation held a commit 6 to 9 ms, and a log write that overlapped a fill took 219 µs at the median against 46.
+
+What they leave:
+
+- **lionturtle leads RocksDB by 10% over two minutes,** where it trailed by 3%, and matches the memory backend, whose own maps grow through the run.
+- **The writer's task bounds these rates, on every backend.** At 64 clients a group of 32 puts carries 257 writes and 13 KB. lionturtle commits it in 178 to 182 µs at the median and RocksDB in 264 to 266, of which about 160 is one thread's inserts into its memtable. A commit is in flight 48% of the time on lionturtle while the writer's task is busy 79%. On 0.5.3, a prototype that ran lionturtle's inserts on other threads beside the log's write cut its commit from 229 to 148 µs, and the rate rose not at all. In a profile of that run, lionturtle's commits took 8.6% of the process's CPU samples and the writer's task 13.3%; HTTP/2, the codec and the runtime's scheduling took 62.6%, clients included.
+- **A thread of the store's own for commits** shortens lionturtle's mean commit from 175 to 180 µs to 154 to 160 and one client's put by 2% to 4%, and leaves 64 clients' rate where it was. InodeDB runs commits on the runtime's blocking pool.
 
 ## Network storage
 
@@ -283,10 +289,10 @@ A writer and a standby share a store. Eight clients that know only the standby's
 
 | Backend | Lease | Takeover wait ms | Fastest s | Median s | Longest client gap s |
 | --- | --- | ---: | ---: | ---: | ---: |
-| memory | default | 6,000 | 6.08 | 6.30 | 9.80 |
-| memory | 600 ms | 800 | 0.81 | 0.83 | 3.72 |
-| FoundationDB | default | 6,000 | 6.09 | 6.17 | 9.75 |
-| FoundationDB | 600 ms | 800 | 0.85 | 0.93 | 4.01 |
+| memory | default | 6,000 | 6.01 | 6.13 | 9.28 |
+| memory | 600 ms | 800 | 0.85 | 0.92 | 3.88 |
+| FoundationDB | default | 6,000 | 6.12 | 6.29 | 9.56 |
+| FoundationDB | 600 ms | 800 | 0.90 | 0.92 | 3.67 |
 
 - Failover is the takeover wait, the lease plus the margin, and about 200 ms more: the standby reads the head every 100 ms, then reads the store and commits its claim. Its cache is warm, so the first batches after the takeover read little.
 - A client's gap runs about 3 seconds past failover, since it backs off between tries, up to 2 seconds a try, while the standby still sends it to the dead writer.
@@ -343,10 +349,10 @@ A six-level path, every level a directory of 1,001 cached entries, resolved thro
 
 | Operation | Mac, at 05703a0 | Metal |
 | --- | ---: | ---: |
-| Resolve the path to its inode | 197 ns | 161 ns |
-| `Stat` through the query engine | 194 ns | 167 ns |
+| Resolve the path to its inode | 197 ns | 149 ns |
+| `Stat` through the query engine | 194 ns | 155 ns |
 | `Stat` by handle under a key rooted five levels up | 75 ns | 66 ns |
-| Make a handle's MAC and check it | 30 ns | 111 ns |
+| Make a handle's MAC and check it | 30 ns | 109 ns |
 
 Resolution walks one map per level, so its cost grows with depth and the logarithm of each directory's size, and a rename costs the same whatever lies beneath. A read by handle skips resolution and follows the file's back-pointer and its directories' parents up to the key's root instead, well under the design's estimate of a microsecond. The server makes a MAC for each handle it sends and checks one for each it receives: one AES-256 block.
 

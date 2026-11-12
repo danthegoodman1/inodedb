@@ -358,6 +358,7 @@ message Freed {
 }
 
 message ClaimRequest {
+  // The most entries to claim; the server returns 60 at most.
   uint32 limit = 1;
 }
 
