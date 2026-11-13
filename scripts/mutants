@@ -39,6 +39,7 @@ MEMORY = "crates/storage/src/memory.rs"
 OCC = "crates/storage/src/occ.rs"
 STORAGE = "crates/storage/src/lib.rs"
 SQLITE = "crates/storage-sqlite/src/lib.rs"
+SQLITE_SYNC = "crates/storage-sqlite/src/sync.rs"
 SERVICE = "crates/server/src/service.rs"
 CLIENT = "crates/client/src/lib.rs"
 VIEW = "crates/core/src/view.rs"
@@ -1330,6 +1331,10 @@ MUTANTS = [
     (
         "the server asks for no particular idle latency",
         [(SERVER, "file.write_all(&1i32.to_ne_bytes())?;", "file.write_all(&[])?;")],
+    ),
+    (
+        "a build without the flag keeps SQLite's fsync",
+        [(SQLITE_SYNC, ".unwrap_or(false)", ".unwrap_or(true)")],
     ),
     (
         "a cached value holds its request's buffer",

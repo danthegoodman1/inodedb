@@ -28,6 +28,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets --features rocksdb -- -D warnings
       # Memory, SQLite and RocksDB, for storage and API conformance alike.
       - run: cargo test --workspace --features rocksdb
+      # Cargo reads the repository's configuration only from inside it, so a
+      # build started elsewhere lacks the flag that selects fdatasync.
+      - name: A build from outside the repository is refused
+        run: |
+          cd "$RUNNER_TEMP"
+          if cargo check -p inodedb-storage-sqlite --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" 2> refused.log; then
+            echo "the build went through without the fdatasync flag"
+            exit 1
+          fi
+          grep -q "would compile SQLite to sync with fsync" refused.log
+          cargo check -p inodedb-storage-sqlite --config "$GITHUB_WORKSPACE/.cargo/config.toml" --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
 
   foundationdb:
     runs-on: ubuntu-latest

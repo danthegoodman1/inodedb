@@ -1,4 +1,6 @@
 [env]
 # SQLite syncs its WAL with fdatasync rather than fsync, which on gp3 costs half
 # as much (`BENCHMARKS.md`, "Devices"). Apple's builds of it ignore this.
+# Cargo reads this file only when it runs inside the repository, so
+# `crates/storage-sqlite/build.rs` refuses a build that arrives without the flag.
 LIBSQLITE3_FLAGS = "-DHAVE_FDATASYNC=1"
