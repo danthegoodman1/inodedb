@@ -11,7 +11,11 @@
 //! when the store opens, and the thread sends commits back to its start before
 //! they pass its end, so they overwrite written blocks. `.cargo/config.toml`
 //! builds SQLite to sync its WAL with `fdatasync`, which leaves timestamps to
-//! the journal's own time.
+//! the journal's own time, and the build script refuses a build that would
+//! lose that flag.
+
+#[cfg(test)]
+mod sync;
 
 use inodedb_core::keys::{self, KeyRange, KvRead, KvResult, KvWrite, Pairs, WriteSet};
 use inodedb_core::types::Version;

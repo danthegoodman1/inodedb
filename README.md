@@ -201,6 +201,12 @@ The server reads one TOML file. Fields, with defaults:
 
 Building `crates/proto` needs `protoc` (`brew install protobuf` or `apt-get install protobuf-compiler`).
 
+Run cargo inside the repository. Its `.cargo/config.toml` builds SQLite to sync with `fdatasync`, and cargo reads that file only from there, so a build started elsewhere stops and says so. To build from another directory, pass the file along:
+
+```console
+cargo build --release --config inodedb/.cargo/config.toml --manifest-path inodedb/Cargo.toml -p inodedb-server
+```
+
 ```console
 cargo test --workspace                                   # unit, scenario and API tests on memory, SQLite and lionturtle
 cargo test --workspace --features rocksdb                # and on RocksDB
