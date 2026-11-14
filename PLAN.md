@@ -196,6 +196,7 @@ Scope:
 - 3F Restart: the writer resumes from the head record's version and the id counter.
 - 3G Simulator faults: unknown outcomes, latency and crashes in storage; delay, loss, duplication, reordering and partitions on the network; writer crashes mid-group; clients retrying with request ids.
 - 3H Server: group commit over SQLite and RocksDB; the client retries `Unavailable` and lost responses with the same request id.
+- 3I A different batch under a kept request id refused, by a digest of the batch kept with its answer.
 
 Out of scope:
 - Takeover by another server (S2).
@@ -221,6 +222,7 @@ Status ledger:
 | Complete | Work | 3F: Restart | `groups.rs::a_restarted_writer_answers_retries_from_records`; simulated writer crashes. |
 | Complete | Work | 3G: Simulator faults | `crates/sim/src/lib.rs`: failed and unknown commits, stalls, loss, duplication, partitions, writer crashes, client retries; property 2 checked on every seed. |
 | Complete | Work | 3H: Server group commit and client retries | `engine.rs` commit backoff; `client::Retry`; API checks `lost_answers_apply_once`, `retries_answer_once`, `concurrent_commits_all_apply`. |
+| Complete | Work | 3I: Reused request ids | BigHouse's clients repeated request ids across processes, and the writer answered each repeat with an earlier batch's result without applying it. `Batch::digest` hashes a batch's ops, conditions and flags with XXH3-128; each request record and each answer kept in memory carries it (`ops::Recorded`, with a record that has none answering any batch), and a batch under a kept id with another digest is refused with `BatchError::Reused`, which the server sends as `AlreadyExists` tagged `reused-request-id` and the client as `Rejection::Reused` (`core/ops::{a_digest_tells_batches_apart, records_keep_their_batchs_digest}`, `ops::another_batch_under_a_recorded_id_is_refused`, `groups::{a_restarted_writer_refuses_another_batch_under_a_recorded_id, another_batch_under_the_id_of_one_that_changed_nothing_is_refused}`, `api::reused_request_ids_are_refused`; four planted bugs, each failing those tests in a debug build). The check found the same bug in `sim/tests/fsck.rs`: its fixture committed under `1 << 64 \| 1`, the first id the harness's counter gives out, so in some test orders its `set_mtime` heard an earlier batch's answer and never applied; it now uses an id outside the counter's range. |
 | Complete | Test | Group commit measurement | `BENCHMARKS.md`, "Group commit". |
 | Complete | Test | Planted bugs for Phase 3 | The testing plan's six plus five for request records and resolves: all caught. |
 | Complete | Gate | 10,000-seed sweep | `cargo run --release -p inodedb-sim -- --seeds 10000`, with faults and crashes: 0 failures. |

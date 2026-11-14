@@ -4,7 +4,7 @@
 use inodedb_core::Bytes;
 use inodedb_core::auth::{Caller, Denied, Grant, KeyError, KeyId, KeyOp, KeyRecord};
 use inodedb_core::exec::{self, Input};
-use inodedb_core::ops::{Batch, CommitResult, Outcome, RenameFlag, Skip};
+use inodedb_core::ops::{Batch, CommitResult, Outcome, Recorded, RenameFlag, Skip};
 use inodedb_core::query::{Query, QueryResult, Target};
 use inodedb_core::types::{Entry, Error, Ino, Inode, Name, ROOT, Version};
 use inodedb_core::view::{Lookup, View};
@@ -316,7 +316,7 @@ impl View for Counting<'_> {
     fn value(&self, ino: Ino, version: Version) -> Lookup<Option<Bytes>> {
         self.base.value(ino, version)
     }
-    fn request(&self, id: u128) -> Lookup<Option<CommitResult>> {
+    fn request(&self, id: u128) -> Lookup<Option<Recorded>> {
         self.base.request(id)
     }
     fn listing(&self, dir: Ino, start: Bound<&[u8]>, limit: usize) -> Lookup<Vec<(Name, Entry)>> {

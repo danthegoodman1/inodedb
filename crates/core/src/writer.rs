@@ -27,7 +27,7 @@ use crate::lease::{
     StoredLease,
 };
 use crate::log::{Chains, LogEntry};
-use crate::ops::{Batch, BatchError, CommitResult};
+use crate::ops::{Batch, BatchError, CommitResult, Recorded};
 use crate::overlay::{Overlaid, Overlay};
 use crate::preload::Cursor;
 use crate::query::{self, Query, QueryResult};
@@ -563,7 +563,7 @@ pub struct Writer {
     /// Answers of batches with request ids that changed nothing, with when
     /// each expires, so a retry gets the first answer while this writer
     /// runs. They write no record, so a restarted writer runs them again.
-    unchanged: BTreeMap<u128, (Millis, CommitResult)>,
+    unchanged: BTreeMap<u128, (Millis, Recorded)>,
     unchanged_expiries: BTreeSet<(Millis, u128)>,
     /// The secret handles' MACs are made under, and whether storage holds
     /// it yet.
@@ -1820,11 +1820,12 @@ impl Writer {
             return Ok(());
         }
         let id = scoped_request(batch.request_id, scope.key);
+        let digest = if id != 0 { batch.digest() } else { 0 };
         if id != 0 {
             self.prune_unchanged();
-            if let Some((_, result)) = self.unchanged.get(&id) {
-                let result = result.clone();
-                self.hold(result.version, sub.clone(), Answer::Commit(result));
+            if let Some((_, recorded)) = self.unchanged.get(&id) {
+                let recorded = recorded.clone();
+                self.answer_recorded(sub, recorded, digest);
                 return Ok(());
             }
             let view = Overlaid {
@@ -1832,8 +1833,8 @@ impl Writer {
                 base: &self.cache,
             };
             match view.request(id) {
-                Ok(Some(result)) => {
-                    self.hold(result.version, sub.clone(), Answer::Commit(result));
+                Ok(Some(recorded)) => {
+                    self.answer_recorded(sub, recorded, digest);
                     return Ok(());
                 }
                 Ok(None) => {}
@@ -1866,7 +1867,11 @@ impl Writer {
             };
             if id != 0 {
                 let at = self.now + self.config.request_ttl;
-                self.unchanged.insert(id, (at, result.clone()));
+                let recorded = Recorded {
+                    result: result.clone(),
+                    digest: Some(digest),
+                };
+                self.unchanged.insert(id, (at, recorded));
                 self.unchanged_expiries.insert((at, id));
             }
             self.hold(seen, sub.clone(), Answer::Commit(result));
@@ -1883,8 +1888,12 @@ impl Writer {
         let mut writes = delta.write_set();
         let mut expires = None;
         if id != 0 {
-            delta.request = Some((id, result.clone()));
-            let bytes = result.encode();
+            let recorded = Recorded {
+                result: result.clone(),
+                digest: Some(digest),
+            };
+            let bytes = recorded.encode();
+            delta.request = Some((id, recorded));
             let mut parts = 0;
             for (part, chunk) in bytes.chunks(REQUEST_PART).enumerate() {
                 writes.set(keys::request(id, part as u16), chunk.to_vec());
@@ -1905,6 +1914,19 @@ impl Writer {
         self.next_ino = executed.next_ino;
         self.add(sub, delta, version, Answer::Commit(result), writes, expires);
         Ok(())
+    }
+
+    /// Answers a batch under an id already recorded: a retry of the batch
+    /// that earned the record hears its answer, and a different batch is
+    /// refused, each once the record is durable.
+    fn answer_recorded(&mut self, sub: &Submitted, recorded: Recorded, digest: u128) {
+        let version = recorded.result.version;
+        let answer = if recorded.answers(digest) {
+            Answer::Commit(recorded.result)
+        } else {
+            Answer::Rejected(BatchError::Reused)
+        };
+        self.hold(version, sub.clone(), answer);
     }
 
     /// A group's size cap, below what one storage transaction holds.
@@ -2315,7 +2337,7 @@ impl Writer {
         // again.
         let version = self.version;
         self.unchanged
-            .retain(|_, (_, result)| result.version <= version);
+            .retain(|_, (_, recorded)| recorded.result.version <= version);
         self.next_version = self.version + 1;
         self.next_ino = self.head.next_ino;
         self.blocked = None;

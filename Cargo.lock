@@ -945,6 +945,7 @@ name = "inodedb-core"
 version = "0.1.1"
 dependencies = [
  "bytes",
+ "xxhash-rust",
 ]
 
 [[package]]
