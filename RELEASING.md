@@ -8,9 +8,10 @@ workspace's version in `Cargo.toml`'s `[workspace.package]`:
 
 The server, CLI, storage backends, simulator and tests stay unpublished. On
 every push to `main`, `.github/workflows/bump.yml` ("Auto Release") decides a
-version, tags it, creates a GitHub release, and calls
+version, commits it to `main` and tags it. The tag starts
 `.github/workflows/release.yml`, which publishes the crates over **Trusted
-Publishing** (OIDC, with no long-lived token secret).
+Publishing** (OIDC, with no long-lived token secret) and creates the GitHub
+release.
 
 ## Day-to-day
 
@@ -45,40 +46,48 @@ the generated file and fails once, and the next run passes. Commit both files.
 
 Trusted Publishing lets GitHub Actions publish with a short-lived OIDC token.
 It is configured per crate, once the crate exists on crates.io, so the first
-release goes out by hand from a machine logged in with `cargo login`:
+release went out by hand from a machine logged in with `cargo login`:
 
 ```console
 cargo publish -p inodedb-core -p inodedb-proto -p inodedb-transport -p inodedb-client
 ```
 
-Then, for each of the four crates, open **crates.io → the crate → Settings →
-Trusted Publishing** and add two GitHub publishers:
-
-- Repository owner `danthegoodman1`, repository name `inodedb`, workflow
-  filename `release.yml`, environment blank.
-- The same with workflow filename `bump.yml`. The OIDC claim names the
-  **top-level** workflow, and the auto-release path starts in `bump.yml`,
-  which calls `release.yml` as a reusable workflow.
-
-Add no `CARGO_REGISTRY_TOKEN` secret: the workflow mints a token per run with
-`rust-lang/crates-io-auth-action`.
+Each of the four crates lists one GitHub publisher under **crates.io → the
+crate → Settings → Trusted Publishing**: repository owner `danthegoodman1`,
+repository name `inodedb`, workflow filename `release.yml`, environment
+blank. The OIDC claim names the workflow a run started in, and every publish
+starts in `release.yml`. Add no `CARGO_REGISTRY_TOKEN` secret: the workflow
+mints a token per run with `rust-lang/crates-io-auth-action`.
 
 ### 2. Repository settings
 
-The bump job pushes the `chore(release): vX.Y.Z` commit, the tag and the
-GitHub release with the built-in `GITHUB_TOKEN`, under the `contents: write`
-permission its workflow asks for. If `main` becomes protected, allow
-`github-actions[bot]` to push to it.
+- **The `main` ruleset** (Settings → Rules → Rulesets) blocks deleting `main`
+  and force pushes to it, and takes changes only through pull requests,
+  merged or squashed, whose `test`, `foundationdb` and `simulate` checks
+  pass. Squash and merge commits keep the pull request's title in the head
+  commit message, where the bump reads its controls. Only deploy keys
+  bypass it.
+- **The `Auto Release` deploy key** (Settings → Deploy keys) has write
+  access, and its private half is the `RELEASE_DEPLOY_KEY` secret. `bump.yml`
+  checks out with it and pushes the `chore(release): vX.Y.Z` commit and the
+  tag over SSH, past the ruleset. A push with a deploy key starts workflows,
+  where one with `GITHUB_TOKEN` would not: the tag starts `release.yml`, and
+  the commit starts `bump.yml` again, which skips it by its message. To
+  replace the key, add a new one with write access, set the secret to its
+  private half, and delete the old key.
+- **Fork pull requests** (Settings → Actions → General) from anyone who
+  isn't a collaborator wait for a maintainer's approval before their
+  workflows run. Workflows on fork pull requests never see the secret.
 
 ## What runs where
 
 - **bump.yml** (push to `main`): decide the bump level → check that the crates
   exist on crates.io → `cargo test` → escalate the version with
-  `cargo-semver-checks` → commit, tag and GitHub release → call `release.yml`.
-- **release.yml** (tag push, called, or manual): `fmt`, `clippy` and
-  `cargo test` on Linux x86_64 → check the tag against
-  `Cargo.toml`'s version → find the crates missing at that version → OIDC
-  auth → `cargo publish` of those crates, in dependency order.
+  `cargo-semver-checks` → commit and tag, pushed with the deploy key.
+- **release.yml** (tag push, or manual): `fmt`, `clippy` and `cargo test` on
+  Linux x86_64 → check the tag against `Cargo.toml`'s version → find the
+  crates missing at that version → OIDC auth → `cargo publish` of those
+  crates, in dependency order → create the tag's GitHub release.
 - **ci.yml** (every pull request and push): among its checks, `cargo package`
   of the four crates, which builds each from its package alone as crates.io
   would.
