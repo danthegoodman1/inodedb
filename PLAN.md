@@ -565,6 +565,32 @@ Status ledger:
 | Complete | Gate | Metal benchmarks after S4Y and S4Z | One sitting of about three hours on a Latitude.sh `f4.metal.medium`: `scripts/bench/run`, two more passes of "Operations" for its medians, six alternating passes of RocksDB and lionturtle, 05703a0, failover, path resolution and the two-minute puts, with each backend in its own process. lionturtle won every alternating pass on puts and renames, by 10% and 15% at 64 clients and by 11% and 13% at one. Its commit takes 178 to 182 us at the median against RocksDB's 264 to 266, and 357 to 363 us at p99.9 against 644 to 889; RocksDB keeps the lower p99 at 64 clients, 1.06 ms against 1.15 ms on puts, which the probe places on the writer's side of a group's cycle. Two minutes of puts run at 75,581 a second against RocksDB's 68,976, where eeca4a0 ran 65,947 against 67,945. A thread of the store's own for commits cut lionturtle's mean commit from 175 to 180 us to 154 to 160 and one client's put by 2% to 4%, and left the rate at 64 clients where it was, so commits stay on the blocking pool. Controls after the sitting stayed within 3% of its start on stats and within 5% on puts. `README.md` and its three charts, drawn from `docs/images/charts.html`, carry the sitting's figures. |
 | Complete | Work | S4AA: A build that keeps SQLite's `fdatasync` | libch found BigHouse's server syncing with `fsync`. BigHouse builds its pinned InodeDB with `--manifest-path` from its own root, and cargo reads `.cargo/config.toml`, which carries `-DHAVE_FDATASYNC=1` for SQLite, only when it runs inside the repository. Counted with `strace` on eeca4a0 over a 60-tenant libch setup, that build made 1,166 `fsync` calls and no `fdatasync`, where a build inside the checkout made 1,309 `fdatasync` and one `fsync`. On one libch commit, each run alone on the machine, the `fsync` build answered 135 inserts a second in the 1,000-tenant gate against 151, and took 830.5 s to set up 10,000 tenants against 573.8 s and 2,254 s for that whole run against 1,951 s; on tmpfs the two builds agree. `crates/storage-sqlite/build.rs` reads the same `LIBSQLITE3_FLAGS` and stops a build that lacks the flag, naming three ways to carry it (`sqlite/sync::{only_the_defined_flag_selects_fdatasync, this_build_syncs_with_fdatasync}`; M"a build without the flag keeps SQLite's fsync"). CI builds the crate from outside the repository, expects the refusal, and builds it again with `--config`. |
 
+## Phase S5: Releases
+
+Goal:
+libch, BigHouse and other Rust programs depend on InodeDB's client by version from crates.io, and each merge to `main` releases it.
+
+Scope:
+- S5A `inodedb-client`, `inodedb-core`, `inodedb-proto` and `inodedb-transport` packaged under Apache-2.0, building from their packages without `protoc`.
+- S5B `bump.yml` and `release.yml` as lionturtle runs them: a version escalated until `cargo-semver-checks` accepts it, published over Trusted Publishing.
+
+Out of scope:
+- Publishing the server, CLI, backends or simulator.
+
+Completion gate:
+The four crates are on crates.io, and a merge to `main` publishes the next version through Trusted Publishing.
+
+Testing plan:
+- `cargo package` of the four crates in CI; the first release by hand; the Auto Release run of the next merge.
+
+Status ledger:
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Complete | Work | S5A: Packaged crates | The four crates take the workspace's version, license and repository, and the workspace names a version for each beside its path. `crates/proto` holds its generated code in `src/inodedb.v1.rs` in place of a build script, so a consumer needs no `protoc`; `proto/tests/generated.rs::the_checked_in_code_matches_the_proto_file` regenerates it with `protoc`, rewrites the file when it differs and fails, and failed on a file with a line appended. `cargo package` of the four builds each from its package against the others' packages, and CI runs it. |
+| Complete | Work | S5B: Release workflows | `.github/workflows/{bump,release}.yml` and `RELEASING.md`, from lionturtle's: the four crates release together at one version, the bump rewrites the workspace's version and the four requirements on it and stops unless it finds all five, `cargo-semver-checks` runs over the four, and `release.yml` publishes each crate crates.io lacks at that version. |
+| Incomplete | Gate | First release and Trusted Publishing | Missing: 0.1.0 of the four crates on crates.io, both Trusted Publishers on each, and an Auto Release run that publishes the next version. |
+
 ## Phase 8: ClickHouse Metadata Type
 
 Goal:

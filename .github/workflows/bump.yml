@@ -1,0 +1,217 @@
+name: Auto Release
+
+# Releases on every push to main: decides a version, tags it, creates a GitHub
+# release and calls release.yml, which publishes the client's crates to
+# crates.io over Trusted Publishing.
+#
+# inodedb-core, inodedb-proto, inodedb-transport and inodedb-client share the
+# workspace's version (`[workspace.package]` in Cargo.toml) and release
+# together. The bump starts at patch and escalates (patch -> minor -> major)
+# until cargo-semver-checks agrees the level covers every crate's public-API
+# diff since its last release. Before the crates exist on crates.io there is
+# no baseline, so the current version releases as it stands.
+#
+# This triggers on push, where chaining off CI with workflow_run would be
+# rejected by crates.io's Trusted Publishing; the bump job runs the tests
+# itself, and release.yml runs them again before it publishes.
+#
+# Controls, through the head commit message (a merge commit carries the pull
+# request's title):
+#   "#minor" / "#major"  force a bump level (fails if it can't cover the diff)
+#   "[skip release]"     skip releasing this push
+# Manual runs (Actions -> Auto Release -> Run workflow) can also force a level.
+#
+# The chore(release) commit and tag go out with GITHUB_TOKEN, which starts no
+# workflows, so this can't loop. Publishing happens in the called release.yml,
+# and the OIDC claim names the top-level workflow, so crates.io's Trusted
+# Publishing lists this file for each crate as well as release.yml.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump (auto = patch, escalated if the API diff demands more)
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CRATES: inodedb-core inodedb-proto inodedb-transport inodedb-client
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - name: Decide bump level
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            level="$INPUT_BUMP"
+          else
+            case "$HEAD_MSG" in
+              "chore(release):"*)
+                echo "Release commit; skipping"
+                echo "release=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+            if grep -qF '[skip release]' <<< "$HEAD_MSG"; then
+              echo "[skip release] marker; skipping"
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            level=auto
+            grep -qF '#minor' <<< "$HEAD_MSG" && level=minor
+            grep -qF '#major' <<< "$HEAD_MSG" && level=major
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+          echo "Bump level: $level"
+      - uses: dtolnay/rust-toolchain@1.98.0
+        if: steps.decide.outputs.release == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.decide.outputs.release == 'true'
+      # crates/proto's test checks its generated code with protoc.
+      - run: sudo apt-get install -y protobuf-compiler
+        if: steps.decide.outputs.release == 'true'
+      - uses: taiki-e/install-action@v2
+        if: steps.decide.outputs.release == 'true'
+        with:
+          tool: cargo-semver-checks
+      - name: First-publish check (are the crates on crates.io yet?)
+        id: exists
+        if: steps.decide.outputs.release == 'true'
+        run: |
+          found=0 total=0
+          for crate in $CRATES; do
+            total=$((total + 1))
+            status=$(curl -s -o /dev/null -w "%{http_code}" -A "inodedb-release-workflow" "https://crates.io/api/v1/crates/${crate}")
+            if [ "$status" = "200" ]; then
+              found=$((found + 1))
+            else
+              echo "${crate} not found on crates.io (HTTP $status)"
+            fi
+          done
+          if [ "$found" = 0 ]; then
+            echo "first_publish=true" >> "$GITHUB_OUTPUT"
+            echo "First publish; semver-checks skipped"
+          elif [ "$found" = "$total" ]; then
+            echo "first_publish=false" >> "$GITHUB_OUTPUT"
+            echo "Every crate is on crates.io; semver-checks will run against them"
+          else
+            echo "::error::Only $found of $total crates are on crates.io. Run Release on the latest tag to publish the rest." >&2
+            exit 1
+          fi
+      - name: Test before tagging (release.yml runs the tests again before publish)
+        if: steps.decide.outputs.release == 'true'
+        timeout-minutes: 40
+        run: cargo test --workspace
+      - name: Bump version, escalating until the level covers the API diff
+        id: version
+        if: steps.decide.outputs.release == 'true'
+        run: |
+          current=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          IFS=. read -r major minor patch <<< "$current"
+          next() {
+            case "$1" in
+              major) echo "$((major + 1)).0.0" ;;
+              minor) echo "${major}.$((minor + 1)).0" ;;
+              patch) echo "${major}.${minor}.$((patch + 1))" ;;
+            esac
+          }
+          # The workspace's version, and the version each published crate
+          # requires of its siblings.
+          set_version() {
+            sed -i -e "s/^version = \"${current}\"$/version = \"$1\"/" \
+              -e "/^inodedb-/s/version = \"${current}\"/version = \"$1\"/" Cargo.toml
+            count=$(grep -cF "version = \"$1\"" Cargo.toml)
+            if [ "$count" != 5 ]; then
+              echo "::error::Cargo.toml names $1 $count times; the workspace and its four published crates make 5" >&2
+              exit 1
+            fi
+          }
+          packages=$(printf -- '-p %s ' $CRATES)
+          if [ "${{ steps.exists.outputs.first_publish }}" = "true" ]; then
+            new="$current"
+            echo "First publish: releasing $current as it stands (no version bump, no semver-checks)"
+            echo "commit=false" >> "$GITHUB_OUTPUT"
+          else
+            case "${{ steps.decide.outputs.level }}" in
+              auto) candidates="patch minor major" ;;
+              *) candidates="${{ steps.decide.outputs.level }}" ;;
+            esac
+            chosen=""
+            for level in $candidates; do
+              new=$(next "$level")
+              echo "::group::Trying $level: $current -> $new"
+              set_version "$new"
+              cargo update --workspace
+              if cargo semver-checks check-release $packages; then
+                chosen="$level"
+                echo "::endgroup::"
+                break
+              fi
+              echo "::endgroup::"
+              git checkout -- Cargo.toml Cargo.lock
+            done
+            if [ -z "$chosen" ]; then
+              echo "::error::None of [$candidates] covers the public-API diff since the last published release" >&2
+              exit 1
+            fi
+            echo "commit=true" >> "$GITHUB_OUTPUT"
+            echo "Releasing $current -> $new ($chosen)"
+          fi
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "tag=v$new" >> "$GITHUB_OUTPUT"
+      - name: Commit, tag, and create the GitHub release
+        if: steps.decide.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ steps.version.outputs.commit }}" = "true" ]; then
+            git commit -am "chore(release): ${{ steps.version.outputs.tag }}"
+            git push origin main
+          fi
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "refs/tags/${{ steps.version.outputs.tag }}"
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes
+
+  release:
+    needs: bump
+    if: needs.bump.outputs.release == 'true'
+    permissions:
+      id-token: write
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      ref: ${{ needs.bump.outputs.tag }}

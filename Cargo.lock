@@ -952,6 +952,7 @@ name = "inodedb-proto"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "tempfile",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
