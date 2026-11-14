@@ -29,7 +29,7 @@ use inodedb_core::fsck;
 use inodedb_core::keys::{self, KvRead, KvResult, Parsed, WriteSet};
 use inodedb_core::lease::{ClaimId, FreeEntry, LeaseError, LeaseId, LeaseRecord};
 use inodedb_core::log::LogEntry;
-use inodedb_core::ops::{Batch, BatchError, CommitResult, Outcome};
+use inodedb_core::ops::{Batch, BatchError, CommitResult, Outcome, Recorded};
 use inodedb_core::query::{self as core_query, Query, QueryResult, Target};
 use inodedb_core::snapshot::Miss;
 use inodedb_core::standby::Follower;
@@ -2759,8 +2759,9 @@ impl Simulator {
         let mut by_version: BTreeMap<Version, (u128, CommitResult)> = BTreeMap::new();
         for (id, chunks) in parts {
             let bytes: Vec<u8> = chunks.into_values().flatten().collect();
-            let result = CommitResult::decode(&bytes)
-                .map_err(|_| self.fail("a request record doesn't decode"))?;
+            let result = Recorded::decode(&bytes)
+                .map_err(|_| self.fail("a request record doesn't decode"))?
+                .result;
             let version = result.version;
             if by_version.insert(version, (id, result)).is_some() {
                 return Err(self.fail(format!("two requests committed at version {version}")));

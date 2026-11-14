@@ -156,6 +156,7 @@ fn rejection(error: Error) -> Error {
         Some("malformed") => Error::Rejected(Rejection::Malformed),
         Some("too-many-ops") => Error::Rejected(Rejection::TooManyOps),
         Some("too-large") => Error::Rejected(Rejection::TooLarge),
+        Some("reused-request-id") => Error::Rejected(Rejection::Reused),
         _ => error,
     }
 }

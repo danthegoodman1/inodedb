@@ -23,9 +23,11 @@ fn store() -> Store {
     h.ops([mkdir_p("a/b"), put("a/f", "value")]);
     h.ops([link("a/f", "a/b/g")]);
     h.mint(Caller::Trusted(ROOT), "a", Grant::Write, u64::MAX);
+    // The harness's own ids are its counter with bit 64 set; bit 65 keeps
+    // this one apart from every id it gave an earlier batch.
     h.commit(inodedb_core::ops::Batch {
         ops: vec![set_mtime("a", 5)],
-        request_id: 1 << 64 | 1,
+        request_id: 2 << 64,
         ..Default::default()
     });
     let ino = |h: &mut Harness, path| match h.stat(path) {

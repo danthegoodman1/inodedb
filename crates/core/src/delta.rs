@@ -3,7 +3,7 @@
 use crate::auth::{self, KeyId, KeyRecord};
 use crate::codec::{Dec, DecodeError, Enc};
 use crate::keys::{self, WriteSet};
-use crate::ops::CommitResult;
+use crate::ops::Recorded;
 use crate::types::{Entry, Ino, Inode, Name, ROOT, Version};
 use crate::view::{Lookup, View, layered_listing};
 use bytes::Bytes;
@@ -97,7 +97,7 @@ pub struct Delta {
     pub acked: Vec<Acked>,
     /// Values deleted with their acknowledged entries.
     pub dropped: BTreeSet<(Ino, Version)>,
-    pub request: Option<(u128, CommitResult)>,
+    pub request: Option<(u128, Recorded)>,
     pub keys: BTreeMap<KeyId, Change<KeyRecord>>,
     /// Directories that come to hold or lie above a key's root: where the
     /// commit roots a key, and where it moves a directory that held or lay
@@ -231,7 +231,7 @@ impl Delta {
         base.detach_entry(version, ino)
     }
 
-    pub fn request(&self, base: &dyn View, id: u128) -> Lookup<Option<CommitResult>> {
+    pub fn request(&self, base: &dyn View, id: u128) -> Lookup<Option<Recorded>> {
         match &self.request {
             Some((recorded, result)) if *recorded == id => Ok(Some(result.clone())),
             _ => base.request(id),
@@ -499,7 +499,7 @@ impl View for After<'_> {
         self.delta.value(self.base, ino, version)
     }
 
-    fn request(&self, id: u128) -> Lookup<Option<CommitResult>> {
+    fn request(&self, id: u128) -> Lookup<Option<Recorded>> {
         self.delta.request(self.base, id)
     }
 

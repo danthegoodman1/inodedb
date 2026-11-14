@@ -1,9 +1,12 @@
 //! Scripted scenarios for each op's rules, conditions and cascades.
 
 use inodedb_core::Bytes;
-use inodedb_core::ops::{Batch, Op, OpSpec, Outcome, Pred, PredSource, PutMode, RenameFlag, Skip};
+use inodedb_core::ops::{
+    Batch, BatchError, Op, OpSpec, Outcome, Pred, PredSource, PutMode, RenameFlag, Skip,
+};
 use inodedb_core::query::{Query, QueryResult, Target};
 use inodedb_core::types::{Error, Kind, Life, MAX_VALUE};
+use inodedb_core::writer::Answer;
 use inodedb_sim::harness::*;
 
 fn applied(result: &inodedb_core::ops::CommitResult) -> Vec<bool> {
@@ -369,6 +372,33 @@ fn a_retried_request_gets_its_first_answer() {
     assert!(first.committed);
     let retried = h.commit(batch);
     assert_eq!(retried, first);
+}
+
+#[test]
+fn another_batch_under_a_recorded_id_is_refused() {
+    let mut h = Harness::new();
+    let batch = Batch {
+        ops: vec![mv("a", "b")],
+        request_id: 78,
+        ..Batch::default()
+    };
+    h.ops([mkdir("a")]);
+    let first = h.commit(batch.clone());
+    assert!(first.committed);
+    let other = Batch {
+        ops: vec![mkdir("c")],
+        ..batch.clone()
+    };
+    assert_eq!(h.submit(other), Answer::Rejected(BatchError::Reused));
+    assert!(
+        matches!(h.stat("c"), QueryResult::Failed(Error::NotFound)),
+        "the refused batch applied nothing"
+    );
+    assert_eq!(
+        h.commit(batch),
+        first,
+        "a retry still hears its first answer"
+    );
 }
 
 #[test]

@@ -17,7 +17,7 @@
 
 use crate::auth::{KeyId, KeyRecord};
 use crate::cache::Cache;
-use crate::ops::CommitResult;
+use crate::ops::Recorded;
 use crate::types::{Entry, Ino, Inode, Name, Version};
 use crate::view::{Lookup, Read, View, layered_listing};
 use bytes::Bytes;
@@ -395,7 +395,7 @@ impl View for Current<'_> {
             .or_else(|_| self.cache.value(ino, version))
     }
 
-    fn request(&self, id: u128) -> Lookup<Option<CommitResult>> {
+    fn request(&self, id: u128) -> Lookup<Option<Recorded>> {
         self.cache.request(id)
     }
 
@@ -558,7 +558,7 @@ impl View for SnapshotView<'_> {
         self.current.value(ino, version)
     }
 
-    fn request(&self, id: u128) -> Lookup<Option<CommitResult>> {
+    fn request(&self, id: u128) -> Lookup<Option<Recorded>> {
         self.current.request(id)
     }
 

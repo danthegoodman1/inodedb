@@ -2,7 +2,7 @@
 
 use crate::auth::{KeyId, KeyRecord, Keys};
 use crate::delta::{Delta, Freed, Links};
-use crate::ops::CommitResult;
+use crate::ops::Recorded;
 use crate::snapshot::Kept;
 use crate::types::{Entry, Ino, Inode, Kind, Name, Version};
 use crate::view::{Fact, Lookup, Read, View};
@@ -257,7 +257,7 @@ pub struct Cache {
     dirs: BTreeMap<Ino, Held<Dir>>,
     backptrs: BTreeMap<Ino, Held<Links>>,
     values: BTreeMap<(Ino, Version), Held<Option<Bytes>>>,
-    requests: BTreeMap<u128, Option<CommitResult>>,
+    requests: BTreeMap<u128, Option<Recorded>>,
     /// Every request id with a live record, once loaded, so a new id needs
     /// no read.
     request_ids: Option<BTreeSet<u128>>,
@@ -785,7 +785,7 @@ impl View for Cache {
             .ok_or(Read::Value(ino, version))
     }
 
-    fn request(&self, id: u128) -> Lookup<Option<CommitResult>> {
+    fn request(&self, id: u128) -> Lookup<Option<Recorded>> {
         if let Some(result) = self.requests.get(&id) {
             return Ok(result.clone());
         }

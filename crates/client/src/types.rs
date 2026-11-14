@@ -55,6 +55,10 @@ pub enum Rejection {
     TooManyOps,
     /// The batch writes more than 8 MiB.
     TooLarge,
+    /// Its request id answered a different batch within the last
+    /// `request_ttl`. The client draws a fresh id for every batch, so this
+    /// comes from a caller that sets ids itself and repeats one.
+    Reused,
 }
 
 #[derive(Debug)]

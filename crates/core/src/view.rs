@@ -3,7 +3,7 @@
 use crate::auth::{KeyId, KeyRecord};
 use crate::codec::{Dec, DecodeError};
 use crate::keys::{self, KeyRange, KvRead, KvResult};
-use crate::ops::CommitResult;
+use crate::ops::Recorded;
 use crate::types::{Entry, Ino, Inode, Name, Version};
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,7 +101,7 @@ impl Read {
                     for (_, part) in pairs {
                         bytes.extend_from_slice(&part);
                     }
-                    Fact::Request(*id, Some(CommitResult::decode(&bytes)?))
+                    Fact::Request(*id, Some(Recorded::decode(&bytes)?))
                 }
             }
             (Read::Free(version, ino), KvResult::Get(value)) => Fact::Free(
@@ -137,7 +137,7 @@ pub enum Fact {
     },
     Backptrs(Ino, BTreeSet<(Ino, Name)>),
     Value(Ino, Version, Option<Bytes>),
-    Request(u128, Option<CommitResult>),
+    Request(u128, Option<Recorded>),
     Free(Version, Ino, Option<Vec<Ino>>),
     Detached(Version, Ino, Option<Vec<Ino>>),
 }
@@ -155,7 +155,7 @@ pub trait View {
     /// Every `(parent, name)` that links to a file.
     fn backptrs(&self, ino: Ino) -> Lookup<BTreeSet<(Ino, Name)>>;
     fn value(&self, ino: Ino, version: Version) -> Lookup<Option<Bytes>>;
-    fn request(&self, id: u128) -> Lookup<Option<CommitResult>>;
+    fn request(&self, id: u128) -> Lookup<Option<Recorded>>;
     /// Up to `limit` of a directory's present entries in name order, from
     /// `start`, when the view holds them all.
     fn listing(&self, dir: Ino, start: Bound<&[u8]>, limit: usize) -> Lookup<Vec<(Name, Entry)>>;
@@ -246,7 +246,7 @@ mod tests {
         fn value(&self, _: Ino, _: Version) -> Lookup<Option<Bytes>> {
             unreachable!()
         }
-        fn request(&self, _: u128) -> Lookup<Option<CommitResult>> {
+        fn request(&self, _: u128) -> Lookup<Option<Recorded>> {
             unreachable!()
         }
         fn listing(&self, _: Ino, start: Bound<&[u8]>, limit: usize) -> Lookup<Vec<(Name, Entry)>> {
