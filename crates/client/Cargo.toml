@@ -3,7 +3,11 @@ name = "inodedb-client"
 description = "InodeDB's Rust client."
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords = ["metadata", "filesystem", "inode", "grpc", "transactional"]
+categories = ["database", "filesystem"]
 
 [lib]
 name = "inodedb"

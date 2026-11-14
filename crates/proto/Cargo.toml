@@ -3,12 +3,17 @@ name = "inodedb-proto"
 description = "InodeDB's gRPC protocol."
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+# The test reads `proto/inodedb.proto` from the repository's root.
+exclude = ["tests"]
 
 [dependencies]
 prost.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 
-[build-dependencies]
+[dev-dependencies]
+tempfile.workspace = true
 tonic-prost-build.workspace = true

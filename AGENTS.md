@@ -21,7 +21,7 @@
 
 ## Commands
 
-Building `crates/proto` needs `protoc` (`brew install protobuf` or `apt-get install protobuf-compiler`).
+The tests need `protoc` (`brew install protobuf` or `apt-get install protobuf-compiler`): `crates/proto` holds the code generated from `proto/inodedb.proto`, and its test checks that code and rewrites it when the proto file changes.
 
 ```console
 cargo test --workspace

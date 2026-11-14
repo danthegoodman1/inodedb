@@ -28,6 +28,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --features rocksdb -- -D warnings
       # Memory, SQLite and RocksDB, for storage and API conformance alike.
       - run: cargo test --workspace --features rocksdb
+      # The crates release.yml publishes build from their packages alone, as
+      # they will from crates.io.
+      - run: cargo package -p inodedb-core -p inodedb-proto -p inodedb-transport -p inodedb-client
       # Cargo reads the repository's configuration only from inside it, so a
       # build started elsewhere lacks the flag that selects fdatasync.
       - name: A build from outside the repository is refused
@@ -55,7 +58,6 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get install -y protobuf-compiler
       - name: Simulate with the commit hash as the seed
         run: cargo run --release -p inodedb-sim -- ${{ github.sha }}
       - name: Sweep 2,000 seeds from the commit hash

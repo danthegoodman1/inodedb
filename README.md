@@ -137,7 +137,7 @@ cargo run -p inodedb-cli -- ls -l tables/t1
 cargo run -p inodedb-cli -- watch tables/t1
 ```
 
-From Rust:
+From Rust, with the client from crates.io (`cargo add inodedb-client`, imported as `inodedb`):
 
 ```rust
 use inodedb::{Client, Cond, Op};
@@ -196,10 +196,11 @@ The server reads one TOML file. Fields, with defaults:
 - [BENCHMARKS.md](BENCHMARKS.md): every benchmark result, how each ran, and the commands to reproduce it.
 - [EVIDENCE.md](EVIDENCE.md): the tests, simulator properties and planted bugs that check each behavior the design names, and the gaps.
 - [PLAN.md](PLAN.md): the development plan, with the evidence for each finished item and the work that remains.
+- [RELEASING.md](RELEASING.md): how each merge to `main` publishes the client's crates to crates.io.
 
 ## Development
 
-Building `crates/proto` needs `protoc` (`brew install protobuf` or `apt-get install protobuf-compiler`).
+The tests need `protoc` (`brew install protobuf` or `apt-get install protobuf-compiler`): `crates/proto` holds the code generated from `proto/inodedb.proto`, and its test checks that code and rewrites it when the proto file changes.
 
 Run cargo inside the repository. Its `.cargo/config.toml` builds SQLite to sync with `fdatasync`, and cargo reads that file only from there, so a build started elsewhere stops and says so. To build from another directory, pass the file along:
 
