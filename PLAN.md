@@ -589,7 +589,7 @@ Status ledger:
 | --- | --- | --- | --- |
 | Complete | Work | S5A: Packaged crates | The four crates take the workspace's version, license and repository, and the workspace names a version for each beside its path. `crates/proto` holds its generated code in `src/inodedb.v1.rs` in place of a build script, so a consumer needs no `protoc`; `proto/tests/generated.rs::the_checked_in_code_matches_the_proto_file` regenerates it with `protoc`, rewrites the file when it differs and fails, and failed on a file with a line appended. `cargo package` of the four builds each from its package against the others' packages, and CI runs it. |
 | Complete | Work | S5B: Release workflows | `.github/workflows/{bump,release}.yml` and `RELEASING.md`, from lionturtle's: the four crates release together at one version, the bump rewrites the workspace's version and the four requirements on it and stops unless it finds all five, `cargo-semver-checks` runs over the four, and `release.yml` publishes each crate crates.io lacks at that version. |
-| Incomplete | Gate | First release and Trusted Publishing | Missing: 0.1.0 of the four crates on crates.io, both Trusted Publishers on each, and an Auto Release run that publishes the next version. |
+| Incomplete | Gate | First release and Trusted Publishing | 0.1.0 of the four crates went to crates.io by hand from 718d394 on 2026-11-14, tagged `v0.1.0`, and each crate lists `release.yml` and `bump.yml` as Trusted Publishers, added through crates.io's API. A crate outside the repository builds against `inodedb-client` 0.1 from crates.io. Missing: an Auto Release run that publishes the next version. |
 
 ## Phase 8: ClickHouse Metadata Type
 

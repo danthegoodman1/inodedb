@@ -73,12 +73,16 @@ permission its workflow asks for. If `main` becomes protected, allow
 ## What runs where
 
 - **bump.yml** (push to `main`): decide the bump level → check that the crates
-  exist on crates.io → `cargo test --workspace` → escalate the version with
+  exist on crates.io → `cargo test` → escalate the version with
   `cargo-semver-checks` → commit, tag and GitHub release → call `release.yml`.
 - **release.yml** (tag push, called, or manual): `fmt`, `clippy` and
-  `cargo test --workspace` on Linux x86_64 → check the tag against
+  `cargo test` on Linux x86_64 → check the tag against
   `Cargo.toml`'s version → find the crates missing at that version → OIDC
   auth → `cargo publish` of those crates, in dependency order.
 - **ci.yml** (every pull request and push): among its checks, `cargo package`
   of the four crates, which builds each from its package alone as crates.io
   would.
+
+The release workflows test the workspace's default members: the published
+crates, the server, and the API tests on memory, SQLite and lionturtle. CI
+tests RocksDB and FoundationDB on every pull request.

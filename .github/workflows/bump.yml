@@ -126,10 +126,11 @@ jobs:
             echo "::error::Only $found of $total crates are on crates.io. Run Release on the latest tag to publish the rest." >&2
             exit 1
           fi
+      # The default members, as release.yml tests them.
       - name: Test before tagging (release.yml runs the tests again before publish)
         if: steps.decide.outputs.release == 'true'
         timeout-minutes: 40
-        run: cargo test --workspace
+        run: cargo test
       - name: Bump version, escalating until the level covers the API diff
         id: version
         if: steps.decide.outputs.release == 'true'

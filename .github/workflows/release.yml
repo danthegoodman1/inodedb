@@ -50,10 +50,13 @@ jobs:
       - run: sudo apt-get install -y protobuf-compiler
       - name: Format
         run: cargo fmt --all --check
+      # The default members: the published crates, the server, and the API
+      # tests on memory, SQLite and lionturtle. CI covers RocksDB, whose
+      # bindings need libclang, and FoundationDB.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test
 
   publish:
     needs: test
