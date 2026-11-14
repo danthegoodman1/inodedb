@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "fuser",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -942,14 +942,14 @@ dependencies = [
 
 [[package]]
 name = "inodedb-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
 ]
 
 [[package]]
 name = "inodedb-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost",
  "tempfile",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "getrandom 0.4.3",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-sim"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inodedb-core",
  "inodedb-storage",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inodedb-core",
  "tokio",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-storage-conformance"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inodedb-core",
  "inodedb-storage",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-storage-fdb"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "foundationdb",
  "futures-util",
@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-storage-lionturtle"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inodedb-core",
  "inodedb-storage",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-storage-rocksdb"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inodedb-core",
  "inodedb-storage",
@@ -1050,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-storage-sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "inodedb-core",
  "inodedb-storage",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-tests"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "inodedb-client",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "inodedb-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "h2",

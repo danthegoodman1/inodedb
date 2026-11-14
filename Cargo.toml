@@ -32,7 +32,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/danthegoodman1/inodedb"
@@ -41,9 +41,9 @@ readme = "README.md"
 publish = false
 
 [workspace.dependencies]
-inodedb-client = { path = "crates/client", version = "0.1.0" }
-inodedb-core = { path = "crates/core", version = "0.1.0" }
-inodedb-proto = { path = "crates/proto", version = "0.1.0" }
+inodedb-client = { path = "crates/client", version = "0.1.1" }
+inodedb-core = { path = "crates/core", version = "0.1.1" }
+inodedb-proto = { path = "crates/proto", version = "0.1.1" }
 inodedb-server = { path = "crates/server" }
 inodedb-storage = { path = "crates/storage" }
 inodedb-storage-lionturtle = { path = "crates/storage-lionturtle" }
@@ -51,7 +51,7 @@ inodedb-storage-rocksdb = { path = "crates/storage-rocksdb" }
 inodedb-storage-conformance = { path = "crates/storage-conformance" }
 inodedb-storage-fdb = { path = "crates/storage-fdb" }
 inodedb-storage-sqlite = { path = "crates/storage-sqlite" }
-inodedb-transport = { path = "crates/transport", version = "0.1.0" }
+inodedb-transport = { path = "crates/transport", version = "0.1.1" }
 aes = "0.9.0"
 bytes = "1.10.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
