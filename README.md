@@ -37,7 +37,7 @@ Every commit goes through the writer's in-memory cache, so the writer answers re
 
 **A warm start.** A starting writer or standby reads the tree into its cache while it serves, directories first and up to its budget, so 16 clients stat 224,000 to 255,000 files a second as a server starts.
 
-**Checked by deterministic simulation.** Each seed runs random batches from several clients through writer crashes, storage faults and stalls, network loss and reordering, drifting clocks, and standby takeovers, and checks every answer against a naive path model. A failing seed replays exactly, and each of 279 planted bugs must be caught by some test.
+**Checked by deterministic simulation.** Each seed runs random batches from several clients through writer crashes, storage faults and stalls, network loss and reordering, drifting clocks, and standby takeovers, and checks every answer against a naive path model. A failing seed replays exactly, and each of 284 planted bugs must be caught by some test.
 
 ## Performance
 

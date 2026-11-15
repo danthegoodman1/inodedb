@@ -66,6 +66,7 @@ TRANSPORT = "crates/transport/src/lib.rs"
 FDB = "crates/storage-fdb/src/lib.rs"
 ROCKSDB = "crates/storage-rocksdb/src/lib.rs"
 LIONTURTLE = "crates/storage-lionturtle/src/lib.rs"
+OPS = "crates/core/src/ops.rs"
 STEP_TIMEOUT = 900
 
 MUTANTS = [
@@ -121,7 +122,7 @@ MUTANTS = [
     ),
     (
         "a retry runs again although its record exists",
-        [(WRITER, "Ok(Some(result)) => {\n                    self.hold(result.version, sub.clone(), Answer::Commit(result));\n                    return Ok(());\n                }",
+        [(WRITER, "Ok(Some(recorded)) => {\n                    self.answer_recorded(sub, recorded, digest);\n                    return Ok(());\n                }",
           "Ok(Some(_)) => {}")],
     ),
     (
@@ -131,8 +132,26 @@ MUTANTS = [
     ),
     (
         "a retry of a batch that changed nothing runs again",
-        [(WRITER, "if let Some((_, result)) = self.unchanged.get(&id) {",
-          "if let Some((_, result)) = None::<&(Millis, CommitResult)> {")],
+        [(WRITER, "if let Some((_, recorded)) = self.unchanged.get(&id) {",
+          "if let Some((_, recorded)) = None::<&(Millis, Recorded)> {")],
+    ),
+    (
+        "a different batch under a recorded id hears the earlier answer",
+        [(WRITER, "let answer = if recorded.answers(digest) {", "let answer = if true {")],
+    ),
+    (
+        "a request record leaves out its batch's digest",
+        [(OPS, "if let Some(digest) = self.digest {\n            bytes.extend_from_slice(&digest.to_be_bytes());",
+          "if let Some(digest) = None::<u128> {\n            bytes.extend_from_slice(&digest.to_be_bytes());")],
+    ),
+    (
+        "an answer kept in memory leaves out its batch's digest",
+        [(WRITER, "digest: Some(digest),\n                };\n                self.unchanged.insert(id, (at, recorded));",
+          "digest: None,\n                };\n                self.unchanged.insert(id, (at, recorded));")],
+    ),
+    (
+        "a batch's digest leaves out its values",
+        [(OPS, "self.path(path);\n                self.bytes(value);", "self.path(path);")],
     ),
     (
         "an unknown outcome counts as a failure",

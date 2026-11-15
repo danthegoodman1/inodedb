@@ -140,15 +140,25 @@ impl Service {
 }
 
 fn rejected(error: BatchError) -> Status {
-    let (code, message) = match error {
+    let (status, code) = match error {
         BatchError::Malformed => (
+            Status::invalid_argument("an Applied predicate names an op at or after its own"),
             "malformed",
-            "an Applied predicate names an op at or after its own",
         ),
-        BatchError::TooManyOps => ("too-many-ops", "a batch holds at most 10,000 ops"),
-        BatchError::TooLarge => ("too-large", "the batch writes more than 8 MiB"),
+        BatchError::TooManyOps => (
+            Status::invalid_argument("a batch holds at most 10,000 ops"),
+            "too-many-ops",
+        ),
+        BatchError::TooLarge => (
+            Status::invalid_argument("the batch writes more than 8 MiB"),
+            "too-large",
+        ),
+        BatchError::Reused => (
+            Status::already_exists("the request id answered a different batch"),
+            "reused-request-id",
+        ),
     };
-    tagged(Status::invalid_argument(message), code)
+    tagged(status, code)
 }
 
 /// Whether a status is a standby's `NotWriter`.

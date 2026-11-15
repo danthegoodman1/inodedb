@@ -4,7 +4,7 @@
 
 use inodedb_core::Bytes;
 use inodedb_core::keys::{self, KvWrite, Parsed, WriteSet};
-use inodedb_core::ops::{Batch, CommitResult, Op, OpSpec, Outcome, PutMode, Skip};
+use inodedb_core::ops::{Batch, BatchError, CommitResult, Op, OpSpec, Outcome, PutMode, Skip};
 use inodedb_core::query::{Query, QueryResult, Target};
 use inodedb_core::types::{Error, Ino, Millis, ROOT};
 use inodedb_core::writer::{Action, Answer, CommitOutcome, Config, Head, Token, Writer};
@@ -333,6 +333,52 @@ fn a_restarted_writer_answers_retries_from_records() {
     assert_eq!(restarted.commit(batch), first, "the record answers");
     let next = restarted.ops([mkdir("s")]);
     assert_eq!(next.version, first.version + 1, "the retry took no version");
+}
+
+#[test]
+fn a_restarted_writer_refuses_another_batch_under_a_recorded_id() {
+    let mut h = Harness::new();
+    let batch = Batch {
+        ops: vec![mkdir("r")],
+        request_id: 43,
+        ..Batch::default()
+    };
+    let first = h.commit(batch.clone());
+    assert!(first.committed);
+    let mut restarted = Harness::with(h.storage.clone(), Config::default());
+    let other = Batch {
+        ops: vec![mkdir("q")],
+        ..batch.clone()
+    };
+    assert_eq!(
+        restarted.submit(other),
+        Answer::Rejected(BatchError::Reused),
+        "the record keeps its batch's digest"
+    );
+    assert_eq!(restarted.commit(batch), first, "and answers its retry");
+}
+
+#[test]
+fn another_batch_under_the_id_of_one_that_changed_nothing_is_refused() {
+    let mut h = Harness::new();
+    h.ops([mkdir("a")]);
+    let batch = Batch {
+        ops: vec![mkdir("a")],
+        request_id: 53,
+        ..Batch::default()
+    };
+    let first = h.commit(batch.clone());
+    assert!(!first.committed);
+    let other = Batch {
+        ops: vec![mkdir("b")],
+        ..batch.clone()
+    };
+    assert_eq!(h.submit(other), Answer::Rejected(BatchError::Reused));
+    assert!(
+        matches!(h.stat("b"), QueryResult::Failed(Error::NotFound)),
+        "the refused batch applied nothing"
+    );
+    assert_eq!(h.commit(batch), first);
 }
 
 #[test]

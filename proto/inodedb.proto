@@ -163,7 +163,9 @@ message CommitRequest {
   // Predicates joined to every op's condition.
   repeated Pred when = 2;
   bool all_or_nothing = 3;
-  // 16 bytes; a retry with the same id gets the first answer.
+  // 16 bytes; a retry with the same id gets the first answer. A different
+  // batch under an id that answered one fails with ALREADY_EXISTS, tagged
+  // `reused-request-id`.
   bytes request_id = 4;
 }
 

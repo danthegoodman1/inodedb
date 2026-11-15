@@ -183,7 +183,9 @@ pub struct CommitRequest {
     pub when: ::prost::alloc::vec::Vec<Pred>,
     #[prost(bool, tag = "3")]
     pub all_or_nothing: bool,
-    /// 16 bytes; a retry with the same id gets the first answer.
+    /// 16 bytes; a retry with the same id gets the first answer. A different
+    /// batch under an id that answered one fails with ALREADY_EXISTS, tagged
+    /// `reused-request-id`.
     #[prost(bytes = "bytes", tag = "4")]
     pub request_id: ::prost::bytes::Bytes,
 }

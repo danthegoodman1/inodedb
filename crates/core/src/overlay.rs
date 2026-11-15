@@ -4,7 +4,7 @@
 
 use crate::auth::{KeyId, KeyRecord};
 use crate::delta::{Delta, Freed, Links};
-use crate::ops::CommitResult;
+use crate::ops::Recorded;
 use crate::types::{Entry, Ino, Inode, Name, Version};
 use crate::view::{Lookup, View, layered_listing};
 use bytes::Bytes;
@@ -22,7 +22,7 @@ pub struct Overlay {
     links: BTreeMap<Ino, (Version, Links)>,
     created: BTreeMap<Ino, Version>,
     values: BTreeMap<(Ino, Version), Bytes>,
-    requests: BTreeMap<u128, (Version, CommitResult)>,
+    requests: BTreeMap<u128, (Version, Recorded)>,
     keys: BTreeMap<KeyId, (Version, Option<KeyRecord>)>,
     /// The keys minted in the overlay, by minter and by root; a lookup
     /// checks each still stands.
@@ -250,7 +250,7 @@ impl View for Overlaid<'_> {
         }
     }
 
-    fn request(&self, id: u128) -> Lookup<Option<CommitResult>> {
+    fn request(&self, id: u128) -> Lookup<Option<Recorded>> {
         match self.overlay.requests.get(&id) {
             Some((_, result)) => Ok(Some(result.clone())),
             None => self.base.request(id),

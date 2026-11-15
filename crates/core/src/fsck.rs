@@ -3,7 +3,7 @@
 use crate::auth::{KeyId, KeyRecord};
 use crate::keys::{self, Parsed};
 use crate::log::LogEntry;
-use crate::ops::CommitResult;
+use crate::ops::Recorded;
 use crate::types::{Entry, Ino, Inode, Kind, Life, ROOT, Version};
 use crate::writer::Head;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -312,9 +312,12 @@ impl Tree {
                 continue;
             }
             let bytes: Vec<u8> = parts.values().flatten().copied().collect();
-            match CommitResult::decode(&bytes) {
-                Ok(result) if result.committed && result.version <= head.version => {}
-                Ok(result) => problems.push(format!("request {id:x} records {result:?}")),
+            match Recorded::decode(&bytes) {
+                Ok(Recorded { result, .. })
+                    if result.committed && result.version <= head.version => {}
+                Ok(Recorded { result, .. }) => {
+                    problems.push(format!("request {id:x} records {result:?}"))
+                }
                 Err(_) => problems.push(format!("request {id:x} doesn't decode")),
             }
             match self.expiries.get(id).map(Vec::as_slice) {

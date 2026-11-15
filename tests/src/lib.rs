@@ -26,7 +26,7 @@ macro_rules! api_conformance {
             puts_and_reads, every_op, every_condition, conditions_skip_and_cascade, all_or_nothing_aborts,
             when_fences_the_batch, renaming_moves_a_subtree, listings_page_by_count,
             listings_page_by_bytes, listings_filter, many_reads_chunk, refuses_bad_requests,
-            retries_answer_once, versions_advance, concurrent_commits_all_apply,
+            retries_answer_once, reused_request_ids_are_refused, versions_advance, concurrent_commits_all_apply,
             durable_across_restart, hard_links_count, values_hold_to_the_limit,
             responses_fit_default_limits, lost_answers_apply_once, cut_listings_resume,
             floors_past_the_store_fail_fast, watch_streams_a_subtree, watch_replays_from_a_version,
@@ -833,6 +833,55 @@ pub async fn retries_answer_once<B: Backend>(backend: &mut B) {
             reason: Some(pb::skipped::Reason::Error(code))
         })) if code == pb::Error::Exists as i32
     ));
+}
+
+/// A different batch under a request id that answered one fails, and
+/// applies nothing.
+pub async fn reused_request_ids_are_refused<B: Backend>(backend: &mut B) {
+    let Fixture { server, db, .. } = fresh(backend).await;
+    let mut rpc = pb::inode_db_client::InodeDbClient::connect(server.endpoint())
+        .await
+        .expect("connects");
+    let request = |op: Op| {
+        let mut request = tonic::Request::new(pb::CommitRequest {
+            ops: vec![op.into_pb()],
+            request_id: Bytes::from(vec![9; 16]),
+            ..pb::CommitRequest::default()
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {KEY}").parse().expect("a header"),
+        );
+        request
+    };
+    let first = rpc
+        .commit(request(Op::mkdir("first")))
+        .await
+        .expect("commits")
+        .into_inner();
+    let status = rpc
+        .commit(request(Op::mkdir("second")))
+        .await
+        .expect_err("a different batch under the id");
+    assert_eq!(status.code(), Code::AlreadyExists);
+    assert_eq!(
+        status
+            .metadata()
+            .get("inodedb-error")
+            .and_then(|code| code.to_str().ok()),
+        Some("reused-request-id")
+    );
+    assert_eq!(
+        fs(db.stat("second").await),
+        FsError::NotFound,
+        "the refused batch applied nothing"
+    );
+    let again = rpc
+        .commit(request(Op::mkdir("first")))
+        .await
+        .expect("commits")
+        .into_inner();
+    assert_eq!(again, first, "a retry still gets the first answer");
 }
 
 pub async fn versions_advance<B: Backend>(backend: &mut B) {
